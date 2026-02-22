@@ -561,9 +561,10 @@ async def post_init(app: Application):
     asyncio.create_task(scanner_loop())
 
 
-async def main():
+if __name__ == "__main__":
     global _app
 
+    # python-telegram-bot v21: ใช้ run_polling() โดยตรง ไม่ต้องใช้ asyncio.run()
     _app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -575,9 +576,4 @@ async def main():
     _app.add_handler(CommandHandler("status", cmd_status))
     _app.add_handler(CommandHandler("now",    cmd_now))
 
-    # v21: run_polling() จัดการ init/start/idle ให้ครบในตัว
-    await _app.run_polling()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    _app.run_polling(drop_pending_updates=True)
