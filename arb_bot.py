@@ -562,8 +562,6 @@ async def post_init(app: Application):
 
 
 if __name__ == "__main__":
-    global _app
-
     # python-telegram-bot v21: ใช้ run_polling() โดยตรง ไม่ต้องใช้ asyncio.run()
     _app = (
         Application.builder()
