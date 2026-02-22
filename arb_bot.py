@@ -538,18 +538,9 @@ async def scanner_loop():
 # ══════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════
-async def main():
-    global _app
-
-    _app = Application.builder().token(TELEGRAM_TOKEN).build()
-    _app.add_handler(CallbackQueryHandler(button_handler))
-    _app.add_handler(CommandHandler("scan",   cmd_scan))
-    _app.add_handler(CommandHandler("status", cmd_status))
-    _app.add_handler(CommandHandler("now",    cmd_now))
-
-    await _app.initialize()
-    await _app.start()
-    await _app.bot.send_message(
+async def post_init(app: Application):
+    """รันหลัง bot เริ่มต้น — ส่ง startup msg + เริ่ม scanner"""
+    await app.bot.send_message(
         chat_id    = CHAT_ID,
         parse_mode = "Markdown",
         text       = (
@@ -567,10 +558,25 @@ async def main():
             f"/status   — ดูสถานะทั้งหมด"
         ),
     )
-
     asyncio.create_task(scanner_loop())
-    await _app.updater.start_polling()
-    await _app.updater.idle()
+
+
+async def main():
+    global _app
+
+    _app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    _app.add_handler(CallbackQueryHandler(button_handler))
+    _app.add_handler(CommandHandler("scan",   cmd_scan))
+    _app.add_handler(CommandHandler("status", cmd_status))
+    _app.add_handler(CommandHandler("now",    cmd_now))
+
+    # v21: run_polling() จัดการ init/start/idle ให้ครบในตัว
+    await _app.run_polling()
 
 
 if __name__ == "__main__":
