@@ -1,26 +1,36 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║            ARB BOT v4.0  —  Polymarket vs Betting Sites         ║
-║  Sports : NBA 🏀 | Tennis 🎾 | MLB ⚾ | UFC 🥊 | CS2/Dota2 🎮  ║
-║  NEW    : Fuzzy Match + Async Fetch + Slippage Calculator       ║
-║  Mode   : Semi-auto  —  Telegram ✅ Confirm / ❌ Reject          ║
+║            ARB BOT v5.0  —  Polymarket vs Betting Sites         ║
+║  NEW v5: Web Dashboard + API Quota Alert + Railway Variables    ║
+║  v4.0 : Fuzzy Match + Async Fetch + Slippage Calculator        ║
 ╚══════════════════════════════════════════════════════════════════╝
-คำสั่ง Telegram:
-  /scan on   — เปิด auto scan
-  /scan off  — ปิด auto scan
-  /now       — สแกนทันที 1 รอบ
-  /status    — ดูสถานะทั้งหมด
+Railway Variables ที่ต้องตั้ง:
+  ODDS_API_KEY      = your_key
+  TELEGRAM_TOKEN    = your_token
+  CHAT_ID           = your_chat_id
+  TOTAL_STAKE_THB   = 10000
+  USD_TO_THB        = 35
+  MIN_PROFIT_PCT    = 0.015
+  SCAN_INTERVAL     = 300
+  AUTO_SCAN_START   = true
+  SPORTS            = basketball_nba,baseball_mlb,mma_mixed_martial_arts
+  BOOKMAKERS        = pinnacle,onexbet,dafabet
+  QUOTA_WARN_AT     = 50        (แจ้งเตือนเมื่อ credits เหลือน้อยกว่านี้)
+  PORT              = 8080      (Web dashboard port)
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_DOWN
+from dataclasses import dataclass, field, asdict
 from typing import Optional
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
 from dotenv import load_dotenv
@@ -37,15 +47,16 @@ log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ⚙️  CONFIG
+#  ⚙️  CONFIG — ทุก param อ่านจาก Railway Variables / .env
 # ══════════════════════════════════════════════════════════════════
 def _d(k, v): return Decimal(os.getenv(k, v))
 def _s(k, v): return os.getenv(k, v)
 def _i(k, v): return int(os.getenv(k, str(v)))
 
-ODDS_API_KEY    = _s("ODDS_API_KEY",    "0205bd80de0af87de624e134b8c38db3")
+ODDS_API_KEY    = _s("ODDS_API_KEY",    "3eb65e34745253e9240627121408823c")
 TELEGRAM_TOKEN  = _s("TELEGRAM_TOKEN",  "8517689298:AAEgHOYN-zAOwsJ4LMYGQkLeZPTComJP4A8")
 CHAT_ID         = _s("CHAT_ID",         "6415456688")
+PORT            = _i("PORT",            8080)
 
 TOTAL_STAKE_THB = _d("TOTAL_STAKE_THB", "10000")
 USD_TO_THB      = _d("USD_TO_THB",      "35")
@@ -54,9 +65,10 @@ TOTAL_STAKE     = TOTAL_STAKE_THB / USD_TO_THB
 MIN_PROFIT_PCT  = _d("MIN_PROFIT_PCT",  "0.015")
 SCAN_INTERVAL   = _i("SCAN_INTERVAL",   300)
 AUTO_SCAN_START = _s("AUTO_SCAN_START", "true").lower() == "true"
+QUOTA_WARN_AT   = _i("QUOTA_WARN_AT",   50)   # แจ้งเตือนเมื่อ credits เหลือน้อยกว่านี้
 
-_SPORTS_DEFAULT = "basketball_nba,baseball_mlb,mma_mixed_martial_arts,esports_csgo,esports_dota2"
-SPORTS = [s.strip() for s in _s("SPORTS", _SPORTS_DEFAULT).split(",") if s.strip()]
+_SPORTS_DEFAULT = "basketball_nba,baseball_mlb,mma_mixed_martial_arts"
+SPORTS     = [s.strip() for s in _s("SPORTS", _SPORTS_DEFAULT).split(",") if s.strip()]
 BOOKMAKERS = _s("BOOKMAKERS", "pinnacle,onexbet,dafabet")
 
 SPORT_EMOJI = {
@@ -71,11 +83,9 @@ SPORT_EMOJI = {
     "esports_lol":            "🎮",
 }
 
-# ── ค่าคอมมิชชั่น / slippage แต่ละเว็บ ───────────────────────────
-# ใส่เป็น Decimal เช่น 0.02 = 2%
 COMMISSION = {
-    "polymarket": Decimal("0.02"),   # Polymarket ค่า fee 2%
-    "pinnacle":   Decimal("0.00"),   # Pinnacle ไม่มีคอม (margin ใน odds อยู่แล้ว)
+    "polymarket": Decimal("0.02"),
+    "pinnacle":   Decimal("0.00"),
     "1xbet":      Decimal("0.00"),
     "onexbet":    Decimal("0.00"),
     "dafabet":    Decimal("0.00"),
@@ -89,8 +99,8 @@ COMMISSION = {
 class OddsLine:
     bookmaker:  str
     outcome:    str
-    odds:       Decimal          # decimal odds หลัง slippage
-    odds_raw:   Decimal          # decimal odds ก่อน slippage
+    odds:       Decimal
+    odds_raw:   Decimal
     market_url: str  = ""
     raw:        dict = field(default_factory=dict)
 
@@ -105,177 +115,135 @@ class ArbOpportunity:
     profit_pct:  Decimal
     stake1:      Decimal
     stake2:      Decimal
+    created_at:  str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status:      str = "pending"   # pending | confirmed | rejected
 
 
 # ══════════════════════════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════════════════════════
-pending:        dict[str, ArbOpportunity] = {}
-seen_signals:   set[str]                  = set()
-auto_scan:      bool                      = AUTO_SCAN_START
-scan_count:     int                       = 0
-last_scan_time: str                       = "ยังไม่ได้สแกน"
-_app:           Optional[Application]     = None
+pending:          dict[str, ArbOpportunity] = {}
+seen_signals:     set[str]                  = set()
+auto_scan:        bool                      = AUTO_SCAN_START
+scan_count:       int                       = 0
+last_scan_time:   str                       = "ยังไม่ได้สแกน"
+api_remaining:    int                       = 500      # credits คงเหลือ
+api_used_session: int                       = 0        # ใช้ไปใน session นี้
+quota_warned:     bool                      = False    # ส่งเตือนแล้วหรือยัง
+opportunity_log:  list[dict]               = []        # ประวัติ opportunity ทั้งหมด
+_app:             Optional[Application]    = None
 
 
 # ══════════════════════════════════════════════════════════════════
-#  🆕 UPGRADE 1: FUZZY NAME MATCHING
+#  🆕 QUOTA TRACKER
 # ══════════════════════════════════════════════════════════════════
+async def update_quota(remaining: int):
+    """อัพเดท quota และส่งเตือนถ้าใกล้หมด"""
+    global api_remaining, api_used_session, quota_warned
 
-# Alias dictionary — ชื่อย่อ → ชื่อเต็ม
+    api_remaining     = remaining
+    api_used_session += 1
+
+    # แจ้งเตือนตามเกณฑ์
+    thresholds = [200, 100, QUOTA_WARN_AT, 20, 10, 5, 1]
+    for t in thresholds:
+        if remaining <= t and api_remaining > t:
+            break
+    
+    should_warn = remaining <= QUOTA_WARN_AT and not quota_warned
+    critical    = remaining <= 10
+
+    if should_warn or critical:
+        quota_warned = True
+        level  = "🔴 *CRITICAL*" if critical else "⚠️ *WARNING*"
+        msg = (
+            f"{level} — Odds API Quota\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Credits เหลือ : *{remaining}*\n"
+            f"ใช้ไปแล้ว    : {api_used_session} (session นี้)\n"
+            f"ตั้งเตือนที่  : {QUOTA_WARN_AT}\n\n"
+            f"{'🛑 หยุด scan ชั่วคราว!' if critical else '💡 พิจารณา /scan off หรืออัพเกรด plan'}\n"
+            f"อัพเกรดที่ : https://the-odds-api.com"
+        )
+        if _app:
+            try:
+                await _app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                log.error(f"[Quota] ส่ง alert ไม่ได้: {e}")
+
+        if critical and auto_scan:
+            global auto_scan
+            auto_scan = False
+            log.warning("[Quota] Credits เหลือน้อยมาก — หยุด auto scan อัตโนมัติ")
+            if _app:
+                await _app.bot.send_message(
+                    chat_id    = CHAT_ID,
+                    text       = "🛑 *Auto scan ถูกหยุดอัตโนมัติ* เพราะ credits เหลือ ≤10\nใช้ /scan on เพื่อเปิดใหม่",
+                    parse_mode = "Markdown",
+                )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FUZZY NAME MATCHING
+# ══════════════════════════════════════════════════════════════════
 TEAM_ALIASES: dict[str, str] = {
-    # NBA
-    "lakers":       "Los Angeles Lakers",
-    "la lakers":    "Los Angeles Lakers",
-    "lal":          "Los Angeles Lakers",
-    "clippers":     "LA Clippers",
-    "la clippers":  "LA Clippers",
-    "warriors":     "Golden State Warriors",
-    "gsw":          "Golden State Warriors",
-    "celtics":      "Boston Celtics",
-    "bos":          "Boston Celtics",
-    "heat":         "Miami Heat",
-    "mia":          "Miami Heat",
-    "nets":         "Brooklyn Nets",
-    "bkn":          "Brooklyn Nets",
-    "bulls":        "Chicago Bulls",
-    "chi":          "Chicago Bulls",
-    "spurs":        "San Antonio Spurs",
-    "sas":          "San Antonio Spurs",
-    "kings":        "Sacramento Kings",
-    "sac":          "Sacramento Kings",
-    "nuggets":      "Denver Nuggets",
-    "den":          "Denver Nuggets",
-    "suns":         "Phoenix Suns",
-    "phx":          "Phoenix Suns",
-    "bucks":        "Milwaukee Bucks",
-    "mil":          "Milwaukee Bucks",
-    "sixers":       "Philadelphia 76ers",
-    "76ers":        "Philadelphia 76ers",
-    "phi":          "Philadelphia 76ers",
-    "knicks":       "New York Knicks",
-    "nyk":          "New York Knicks",
-    "mavs":         "Dallas Mavericks",
-    "dal":          "Dallas Mavericks",
-    "rockets":      "Houston Rockets",
-    "hou":          "Houston Rockets",
-    "raptors":      "Toronto Raptors",
-    "tor":          "Toronto Raptors",
-    # MLB
-    "yankees":      "New York Yankees",
-    "ny yankees":   "New York Yankees",
-    "red sox":      "Boston Red Sox",
-    "bos red sox":  "Boston Red Sox",
-    "dodgers":      "Los Angeles Dodgers",
-    "la dodgers":   "Los Angeles Dodgers",
-    "cubs":         "Chicago Cubs",
-    "chi cubs":     "Chicago Cubs",
-    "astros":       "Houston Astros",
-    "hou astros":   "Houston Astros",
-    # Esports
-    "navi":         "Natus Vincere",
-    "na`vi":        "Natus Vincere",
-    "faze":         "FaZe Clan",
-    "faze clan":    "FaZe Clan",
-    "g2":           "G2 Esports",
-    "liquid":       "Team Liquid",
-    "t1":           "T1",
-    "eg":           "Evil Geniuses",
-    "og":           "OG",
-    "secret":       "Team Secret",
-    "lgd":          "PSG.LGD",
+    "lakers": "Los Angeles Lakers", "la lakers": "Los Angeles Lakers",
+    "clippers": "LA Clippers", "warriors": "Golden State Warriors",
+    "celtics": "Boston Celtics", "heat": "Miami Heat",
+    "nets": "Brooklyn Nets", "bulls": "Chicago Bulls",
+    "spurs": "San Antonio Spurs", "kings": "Sacramento Kings",
+    "nuggets": "Denver Nuggets", "suns": "Phoenix Suns",
+    "bucks": "Milwaukee Bucks", "sixers": "Philadelphia 76ers",
+    "76ers": "Philadelphia 76ers", "knicks": "New York Knicks",
+    "mavs": "Dallas Mavericks", "rockets": "Houston Rockets",
+    "raptors": "Toronto Raptors", "yankees": "New York Yankees",
+    "red sox": "Boston Red Sox", "dodgers": "Los Angeles Dodgers",
+    "cubs": "Chicago Cubs", "astros": "Houston Astros",
+    "navi": "Natus Vincere", "na`vi": "Natus Vincere",
+    "faze": "FaZe Clan", "g2": "G2 Esports",
+    "liquid": "Team Liquid", "og": "OG", "secret": "Team Secret",
 }
 
-
 def normalize_team(name: str) -> str:
-    """แปลงชื่อทีมให้เป็นมาตรฐาน lowercase ไม่มี punctuation"""
     n = name.lower().strip()
-    n = re.sub(r"[^\w\s]", "", n)   # ลบ punctuation
-    n = re.sub(r"\s+", " ", n)      # ลด whitespace
-    return n
+    n = re.sub(r"[^\w\s]", "", n)
+    return re.sub(r"\s+", " ", n)
 
-
-def resolve_alias(name: str) -> str:
-    """ค้นหา alias → ชื่อเต็ม"""
-    key = normalize_team(name)
-    return TEAM_ALIASES.get(key, name)
-
-
-def fuzzy_match(name_a: str, name_b: str, threshold: float = 0.6) -> bool:
-    """
-    เช็คว่า 2 ชื่อทีมคือทีมเดียวกันไหม
-    วิธี: token overlap + alias resolution
-    """
-    # Resolve aliases ก่อน
-    a = normalize_team(resolve_alias(name_a))
-    b = normalize_team(resolve_alias(name_b))
-
-    if a == b:
-        return True
-
-    # Token overlap score
-    tokens_a = set(a.split())
-    tokens_b = set(b.split())
-
-    # ลบ stopwords
-    stopwords = {"the", "fc", "cf", "sc", "ac", "de", "city", "united", "of", "and"}
-    tokens_a -= stopwords
-    tokens_b -= stopwords
-
-    if not tokens_a or not tokens_b:
-        return False
-
-    intersection = tokens_a & tokens_b
-    union        = tokens_a | tokens_b
-    jaccard      = len(intersection) / len(union)
-
-    # Substring check (เช่น "Lakers" อยู่ใน "Los Angeles Lakers")
-    substring = (a in b) or (b in a)
-
-    # ตัวอักษรแรก 5 ตัวตรงกัน
-    prefix = a[:5] == b[:5] and len(a) >= 5
-
-    return jaccard >= threshold or substring or prefix
-
-
-def match_team_to_outcome(poly_team: str, bm_outcomes: list[str]) -> Optional[str]:
-    """หา outcome ใน betting site ที่ตรงกับ poly_team"""
-    for out in bm_outcomes:
-        if fuzzy_match(poly_team, out):
-            return out
-    return None
+def fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
+    na = normalize_team(TEAM_ALIASES.get(normalize_team(a), a))
+    nb = normalize_team(TEAM_ALIASES.get(normalize_team(b), b))
+    if na == nb: return True
+    ta = set(na.split()) - {"the","fc","cf","sc","ac","de","city","united","of","and"}
+    tb = set(nb.split()) - {"the","fc","cf","sc","ac","de","city","united","of","and"}
+    if not ta or not tb: return False
+    jaccard = len(ta & tb) / len(ta | tb)
+    return jaccard >= threshold or (na in nb) or (nb in na) or (na[:5] == nb[:5] and len(na) >= 5)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  🆕 UPGRADE 2: ASYNC FETCH
+#  ASYNC FETCH
 # ══════════════════════════════════════════════════════════════════
-
 async def async_fetch_odds(session: aiohttp.ClientSession, sport_key: str) -> list[dict]:
-    """ดึง Odds API แบบ async"""
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
-        "apiKey":     ODDS_API_KEY,
-        "regions":    "eu,uk,au",
-        "markets":    "h2h",
-        "oddsFormat": "decimal",
-        "bookmakers": BOOKMAKERS,
+        "apiKey": ODDS_API_KEY, "regions": "eu,uk,au",
+        "markets": "h2h", "oddsFormat": "decimal", "bookmakers": BOOKMAKERS,
     }
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            remaining = r.headers.get("x-requests-remaining", "?")
+            remaining = int(r.headers.get("x-requests-remaining", api_remaining))
             data = await r.json(content_type=None)
+            await update_quota(remaining)
             if isinstance(data, list):
                 log.info(f"[OddsAPI] {sport_key} | events={len(data)} | remaining={remaining}")
                 return data
-            log.warning(f"[OddsAPI] {sport_key} unexpected: {data}")
+            log.warning(f"[OddsAPI] {sport_key}: {data.get('message','?')}")
             return []
     except Exception as e:
         log.error(f"[OddsAPI] {sport_key}: {e}")
         return []
 
-
 async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
-    """ดึง Polymarket markets แบบ async"""
     try:
         async with session.get(
             "https://clob.polymarket.com/markets",
@@ -285,318 +253,201 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
             data = await r.json(content_type=None)
             return data.get("data", [])
     except Exception as e:
-        log.debug(f"[Polymarket] fetch: {e}")
+        log.debug(f"[Polymarket] {e}")
         return []
 
-
-async def fetch_all_async(sports: list[str]) -> tuple[dict[str, list], list[dict]]:
-    """
-    🚀 ดึงข้อมูลทุกแหล่งพร้อมกัน (parallel)
-    return: (odds_by_sport, poly_markets)
-    """
+async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
     async with aiohttp.ClientSession() as session:
-        # สร้าง tasks ทั้งหมดพร้อมกัน
-        odds_tasks  = [async_fetch_odds(session, sport) for sport in sports]
-        poly_task   = async_fetch_polymarket(session)
-
-        # รันพร้อมกัน!
-        results = await asyncio.gather(*odds_tasks, poly_task)
-
-    poly_markets = results[-1]
-    odds_by_sport = {sport: results[i] for i, sport in enumerate(sports)}
-
-    return odds_by_sport, poly_markets
+        results = await asyncio.gather(
+            *[async_fetch_odds(session, s) for s in sports],
+            async_fetch_polymarket(session),
+        )
+    return {s: results[i] for i, s in enumerate(sports)}, results[-1]
 
 
 # ══════════════════════════════════════════════════════════════════
-#  🆕 UPGRADE 3: SLIPPAGE CALCULATOR
+#  SLIPPAGE + ARB CALC
 # ══════════════════════════════════════════════════════════════════
-
 def apply_slippage(odds: Decimal, bookmaker: str) -> Decimal:
-    """
-    หักค่า commission/slippage ออกจาก odds จริง
-    effective_odds = odds * (1 - commission)
-    เช่น odds=2.00, commission=2% → effective=1.96
-    """
-    bm_key = bookmaker.lower()
-    # หา commission
-    commission = Decimal("0")
-    for key, val in COMMISSION.items():
-        if key in bm_key:
-            commission = val
-            break
-    return (odds * (Decimal("1") - commission)).quantize(Decimal("0.001"))
+    bm  = bookmaker.lower()
+    com = next((v for k, v in COMMISSION.items() if k in bm), Decimal("0"))
+    return (odds * (Decimal("1") - com)).quantize(Decimal("0.001"))
 
-
-def calc_arb(odds_a: Decimal, odds_b: Decimal) -> tuple[Decimal, Decimal, Decimal]:
-    """คำนวณ arb หลัง slippage"""
-    inv_a  = Decimal("1") / odds_a
-    inv_b  = Decimal("1") / odds_b
+def calc_arb(odds_a: Decimal, odds_b: Decimal):
+    inv_a, inv_b = Decimal("1")/odds_a, Decimal("1")/odds_b
     margin = inv_a + inv_b
-    if margin >= Decimal("1"):
-        return Decimal("0"), Decimal("0"), Decimal("0")
-    profit_pct = (Decimal("1") - margin) / margin
-    stake_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    stake_b = (TOTAL_STAKE - stake_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    return profit_pct, stake_a, stake_b
+    if margin >= 1: return Decimal("0"), Decimal("0"), Decimal("0")
+    profit = (Decimal("1") - margin) / margin
+    s_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return profit, s_a, (TOTAL_STAKE - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SCAN ALL SPORTS (ใช้ async fetch + fuzzy match + slippage)
+#  SCAN
 # ══════════════════════════════════════════════════════════════════
-
-def find_polymarket(event_name: str, poly_markets: list[dict]) -> Optional[dict]:
-    """
-    Match event กับ Polymarket โดยใช้ fuzzy matching
-    """
+def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     parts = [p.strip() for p in event_name.replace(" vs ", "|").split("|")]
-    if len(parts) < 2:
-        return None
-    team_a, team_b = parts[0], parts[1]
-
-    best_match = None
-    best_score = 0.0
-
+    if len(parts) < 2: return None
+    ta, tb = parts[0], parts[1]
+    best, best_score = None, 0
     for m in poly_markets:
-        title  = m.get("question", "")
         tokens = m.get("tokens", [])
-        if len(tokens) < 2:
-            continue
-
-        # fuzzy match ชื่อทีมทั้งสองกับ title
-        match_a = fuzzy_match(team_a, title, threshold=0.3)
-        match_b = fuzzy_match(team_b, title, threshold=0.3)
-
-        if match_a and match_b:
-            # คำนวณ score จาก token overlap
-            ta = normalize_team(team_a)
-            tb = normalize_team(team_b)
-            tl = normalize_team(title)
-            score = sum(1 for tok in (ta.split() + tb.split()) if tok in tl)
+        if len(tokens) < 2: continue
+        title = m.get("question", "")
+        if fuzzy_match(ta, title, 0.3) and fuzzy_match(tb, title, 0.3):
+            score = sum(1 for t in (normalize_team(ta).split() + normalize_team(tb).split()) if t in title.lower())
             if score > best_score:
-                best_score = score
-                best_match = m
-
-    if not best_match:
-        return None
-
-    tokens = best_match.get("tokens", [])
-    prob_a = Decimal(str(tokens[0].get("price", 0)))
-    prob_b = Decimal(str(tokens[1].get("price", 0)))
-    if prob_a <= 0 or prob_b <= 0:
-        return None
-
+                best_score, best = score, m
+    if not best: return None
+    tokens = best.get("tokens", [])
+    pa = Decimal(str(tokens[0].get("price", 0)))
+    pb = Decimal(str(tokens[1].get("price", 0)))
+    if pa <= 0 or pb <= 0: return None
+    slug = best.get("slug", "")
     return {
-        "market_url": f"https://polymarket.com/event/{best_match.get('slug','')}",
-        "team_a": {
-            "name":     tokens[0].get("outcome", team_a),
-            "odds_raw": (Decimal("1") / prob_a).quantize(Decimal("0.001")),
-            "odds":     apply_slippage((Decimal("1") / prob_a).quantize(Decimal("0.001")), "polymarket"),
-            "token_id": tokens[0].get("token_id", ""),
-        },
-        "team_b": {
-            "name":     tokens[1].get("outcome", team_b),
-            "odds_raw": (Decimal("1") / prob_b).quantize(Decimal("0.001")),
-            "odds":     apply_slippage((Decimal("1") / prob_b).quantize(Decimal("0.001")), "polymarket"),
-            "token_id": tokens[1].get("token_id", ""),
-        },
+        "market_url": f"https://polymarket.com/event/{slug}",
+        "team_a": {"name": tokens[0].get("outcome", ta),
+                   "odds_raw": (Decimal("1")/pa).quantize(Decimal("0.001")),
+                   "odds": apply_slippage((Decimal("1")/pa).quantize(Decimal("0.001")), "polymarket"),
+                   "token_id": tokens[0].get("token_id","")},
+        "team_b": {"name": tokens[1].get("outcome", tb),
+                   "odds_raw": (Decimal("1")/pb).quantize(Decimal("0.001")),
+                   "odds": apply_slippage((Decimal("1")/pb).quantize(Decimal("0.001")), "polymarket"),
+                   "token_id": tokens[1].get("token_id","")},
     }
 
-
-def scan_all(odds_by_sport: dict[str, list], poly_markets: list[dict]) -> list[ArbOpportunity]:
-    """สแกนหา arb จากข้อมูลที่ดึงมาแล้ว"""
-    found: list[ArbOpportunity] = []
-
+def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
+    found = []
     for sport_key, events in odds_by_sport.items():
         for event in events:
             home       = event.get("home_team", "")
             away       = event.get("away_team", "")
             event_name = f"{home} vs {away}"
             commence   = event.get("commence_time", "")[:16].replace("T", " ")
-
-            # ── รวบรวม best odds จาก betting sites + apply slippage ──
             best: dict[str, OddsLine] = {}
-            for bm in event.get("bookmakers", []):
-                bm_key  = bm.get("key", "")
-                bm_name = bm.get("title", bm_key)
-                for mkt in bm.get("markets", []):
-                    if mkt.get("key") != "h2h":
-                        continue
-                    for out in mkt.get("outcomes", []):
-                        name      = out.get("name", "")
-                        odds_raw  = Decimal(str(out.get("price", 1)))
-                        odds_eff  = apply_slippage(odds_raw, bm_key)
-                        if name not in best or odds_eff > best[name].odds:
-                            best[name] = OddsLine(
-                                bookmaker = bm_name,
-                                outcome   = name,
-                                odds      = odds_eff,
-                                odds_raw  = odds_raw,
-                                raw       = {"bm_key": bm_key, "event_id": event.get("id", "")},
-                            )
 
-            # ── Polymarket fuzzy match + slippage ──
+            for bm in event.get("bookmakers", []):
+                bk, bn = bm.get("key",""), bm.get("title", bm.get("key",""))
+                for mkt in bm.get("markets", []):
+                    if mkt.get("key") != "h2h": continue
+                    for out in mkt.get("outcomes", []):
+                        name     = out.get("name","")
+                        odds_raw = Decimal(str(out.get("price", 1)))
+                        odds_eff = apply_slippage(odds_raw, bk)
+                        if name not in best or odds_eff > best[name].odds:
+                            best[name] = OddsLine(bookmaker=bn, outcome=name,
+                                                  odds=odds_eff, odds_raw=odds_raw,
+                                                  raw={"bm_key": bk, "event_id": event.get("id","")})
+
             poly = find_polymarket(event_name, poly_markets)
             if poly:
-                for side, team_name in [("team_a", home), ("team_b", away)]:
-                    p     = poly[side]
-                    # fuzzy match ชื่อ outcome
-                    matched = match_team_to_outcome(p["name"], list(best.keys()))
-                    key     = matched if matched else team_name
-                    if key not in best or p["odds"] > best[key].odds:
-                        best[key] = OddsLine(
-                            bookmaker  = "Polymarket",
-                            outcome    = key,
-                            odds       = p["odds"],
-                            odds_raw   = p["odds_raw"],
-                            market_url = poly["market_url"],
-                            raw        = {"token_id": p["token_id"]},
-                        )
+                for side, team in [("team_a", home), ("team_b", away)]:
+                    p = poly[side]
+                    matched = next((k for k in best if fuzzy_match(p["name"], k)), team)
+                    if matched not in best or p["odds"] > best[matched].odds:
+                        best[matched] = OddsLine(bookmaker="Polymarket", outcome=matched,
+                                                 odds=p["odds"], odds_raw=p["odds_raw"],
+                                                 market_url=poly["market_url"],
+                                                 raw={"token_id": p["token_id"]})
 
-            # ── เช็ค arb ทุก pair ──
             outcomes = list(best.keys())
             for i in range(len(outcomes)):
-                for j in range(i + 1, len(outcomes)):
-                    oc_a, oc_b = outcomes[i], outcomes[j]
-                    if best[oc_a].bookmaker == best[oc_b].bookmaker:
-                        continue
-                    profit_pct, s_a, s_b = calc_arb(best[oc_a].odds, best[oc_b].odds)
-                    if profit_pct >= MIN_PROFIT_PCT:
-                        found.append(ArbOpportunity(
-                            signal_id  = str(uuid.uuid4())[:8],
-                            sport      = sport_key,
-                            event      = event_name,
-                            commence   = commence,
-                            leg1       = best[oc_a],
-                            leg2       = best[oc_b],
-                            profit_pct = profit_pct,
-                            stake1     = s_a,
-                            stake2     = s_b,
-                        ))
-                        log.info(
-                            f"[ARB] {event_name} | "
-                            f"{best[oc_a].bookmaker}({oc_a}@{best[oc_a].odds_raw}→{best[oc_a].odds}) vs "
-                            f"{best[oc_b].bookmaker}({oc_b}@{best[oc_b].odds_raw}→{best[oc_b].odds}) | "
-                            f"profit={profit_pct:.2%}"
+                for j in range(i+1, len(outcomes)):
+                    a, b = outcomes[i], outcomes[j]
+                    if best[a].bookmaker == best[b].bookmaker: continue
+                    profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
+                    if profit >= MIN_PROFIT_PCT:
+                        opp = ArbOpportunity(
+                            signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                            event=event_name, commence=commence,
+                            leg1=best[a], leg2=best[b],
+                            profit_pct=profit, stake1=s_a, stake2=s_b,
                         )
+                        found.append(opp)
+                        log.info(f"[ARB] {event_name} | profit={profit:.2%}")
     return found
 
 
 # ══════════════════════════════════════════════════════════════════
-#  SEND TELEGRAM ALERT
+#  TELEGRAM ALERT
 # ══════════════════════════════════════════════════════════════════
 async def send_alert(opp: ArbOpportunity):
     pending[opp.signal_id] = opp
+    # เก็บใน log
+    opportunity_log.append({
+        "id": opp.signal_id, "event": opp.event, "sport": opp.sport,
+        "profit_pct": float(opp.profit_pct),
+        "leg1_bm": opp.leg1.bookmaker, "leg1_odds": float(opp.leg1.odds),
+        "leg2_bm": opp.leg2.bookmaker, "leg2_odds": float(opp.leg2.odds),
+        "stake1_thb": int(opp.stake1 * USD_TO_THB),
+        "stake2_thb": int(opp.stake2 * USD_TO_THB),
+        "created_at": opp.created_at, "status": "pending",
+    })
+    if len(opportunity_log) > 100:
+        opportunity_log.pop(0)
+
     emoji = SPORT_EMOJI.get(opp.sport, "🏆")
-
-    stake1_thb = (opp.stake1 * USD_TO_THB).quantize(Decimal("1"))
-    stake2_thb = (opp.stake2 * USD_TO_THB).quantize(Decimal("1"))
-    win1_thb   = (opp.stake1 * opp.leg1.odds * USD_TO_THB).quantize(Decimal("1"))
-    win2_thb   = (opp.stake2 * opp.leg2.odds * USD_TO_THB).quantize(Decimal("1"))
-    total_thb  = TOTAL_STAKE_THB.quantize(Decimal("1"))
-    profit1    = win1_thb - total_thb
-    profit2    = win2_thb - total_thb
-
-    # แสดง slippage ถ้ามี
-    def slip_note(leg: OddsLine) -> str:
-        if leg.odds != leg.odds_raw:
-            return f" (raw {leg.odds_raw} → after fee {leg.odds})"
-        return ""
+    s1 = (opp.stake1 * USD_TO_THB).quantize(Decimal("1"))
+    s2 = (opp.stake2 * USD_TO_THB).quantize(Decimal("1"))
+    w1 = (opp.stake1 * opp.leg1.odds * USD_TO_THB).quantize(Decimal("1"))
+    w2 = (opp.stake2 * opp.leg2.odds * USD_TO_THB).quantize(Decimal("1"))
+    tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
 
     msg = (
-        f"{emoji} *ARB FOUND — {opp.profit_pct:.2%} profit* _(หลังหัก fee แล้ว)_\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} *ARB FOUND — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 {opp.commence} UTC\n"
         f"🏆 `{opp.event}`\n"
-        f"💵 ทุนรวม: *฿{int(total_thb):,}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 ทุน: *฿{int(tt):,}*  |  API credits: {api_remaining}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"```\n"
-        f"{'ช่องทาง':<12} {'ฝั่ง':<16} {'Odds':>5} {'วาง':>8} {'ได้คืน':>9}\n"
-        f"{'─'*53}\n"
-        f"{'🔵 '+opp.leg1.bookmaker:<12} {opp.leg1.outcome:<16} "
-        f"{float(opp.leg1.odds):>5.3f} "
-        f"{'฿'+str(int(stake1_thb)):>8} {'฿'+str(int(win1_thb)):>9}\n"
-        f"{'🟠 '+opp.leg2.bookmaker:<12} {opp.leg2.outcome:<16} "
-        f"{float(opp.leg2.odds):>5.3f} "
-        f"{'฿'+str(int(stake2_thb)):>8} {'฿'+str(int(win2_thb)):>9}\n"
-        f"{'─'*53}\n"
-        f"{'รวม':<35} {'฿'+str(int(total_thb)):>8}\n"
+        f"{'ช่องทาง':<12} {'ฝั่ง':<15} {'Odds':>5} {'วาง':>8} {'ได้':>8}\n"
+        f"{'─'*51}\n"
+        f"{'🔵 '+opp.leg1.bookmaker:<12} {opp.leg1.outcome:<15} {float(opp.leg1.odds):>5.3f} {'฿'+str(int(s1)):>8} {'฿'+str(int(w1)):>8}\n"
+        f"{'🟠 '+opp.leg2.bookmaker:<12} {opp.leg2.outcome:<15} {float(opp.leg2.odds):>5.3f} {'฿'+str(int(s2)):>8} {'฿'+str(int(w2)):>8}\n"
+        f"{'─'*51}\n"
+        f"{'รวม':<34} {'฿'+str(int(tt)):>8}\n"
         f"```\n"
-        f"📊 *ไม่ว่าใครชนะ (หลัง fee)*\n"
-        f"   {opp.leg1.outcome} ชนะ → ฿{int(win1_thb):,} *(+฿{int(profit1):,})*"
-        f"{slip_note(opp.leg1)}\n"
-        f"   {opp.leg2.outcome} ชนะ → ฿{int(win2_thb):,} *(+฿{int(profit2):,})*"
-        f"{slip_note(opp.leg2)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *ไม่ว่าใครชนะ*\n"
+        f"   {opp.leg1.outcome} ชนะ → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
+        f"   {opp.leg2.outcome} ชนะ → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
         f"🔗 {opp.leg1.market_url or '—'}\n"
         f"🆔 `{opp.signal_id}`"
     )
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅  Confirm & Execute", callback_data=f"confirm:{opp.signal_id}"),
-        InlineKeyboardButton("❌  Reject",            callback_data=f"reject:{opp.signal_id}"),
-    ]])
-
     await _app.bot.send_message(
-        chat_id      = CHAT_ID,
-        text         = msg,
-        parse_mode   = "Markdown",
-        reply_markup = keyboard,
+        chat_id=CHAT_ID, text=msg, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{opp.signal_id}"),
+            InlineKeyboardButton("❌ Reject",  callback_data=f"reject:{opp.signal_id}"),
+        ]])
     )
-    log.info(f"[Telegram] Alert: {opp.signal_id} {opp.event} profit={opp.profit_pct:.2%}")
 
 
 # ══════════════════════════════════════════════════════════════════
-#  EXECUTE  (Manual steps หลังกด Confirm)
+#  EXECUTE
 # ══════════════════════════════════════════════════════════════════
-def manual_steps(leg: OddsLine, stake_thb: Decimal) -> str:
-    bm = leg.bookmaker.lower()
-    commission = Decimal("0")
-    for key, val in COMMISSION.items():
-        if key in bm:
-            commission = val
-            break
-    fee_note = f"\n  ⚠️ Fee {commission:.1%} หักแล้วใน odds" if commission > 0 else ""
-
-    if bm == "polymarket":
-        return (
-            f"  1. เปิด: {leg.market_url}\n"
-            f"  2. เลือก: *{leg.outcome}*\n"
-            f"  3. วาง: ฿{int(stake_thb)} USDC\n"
-            f"  4. Token: `{leg.raw.get('token_id','—')}`{fee_note}"
-        )
-    elif "pinnacle" in bm:
-        return (
-            f"  1. เปิด Pinnacle → ค้นหา event\n"
-            f"  2. เลือก: *{leg.outcome}* @ {leg.odds_raw}{fee_note}\n"
-            f"  3. วาง: ฿{int(stake_thb)}"
-        )
-    else:
-        return (
-            f"  1. เปิด {leg.bookmaker} → ค้นหา event\n"
-            f"  2. เลือก: *{leg.outcome}* @ {leg.odds_raw}{fee_note}\n"
-            f"  3. วาง: ฿{int(stake_thb)}"
-        )
-
-
 async def execute_both(opp: ArbOpportunity) -> str:
-    stake1_thb = (opp.stake1 * USD_TO_THB).quantize(Decimal("1"))
-    stake2_thb = (opp.stake2 * USD_TO_THB).quantize(Decimal("1"))
-    win1_thb   = (opp.stake1 * opp.leg1.odds * USD_TO_THB).quantize(Decimal("1"))
-    win2_thb   = (opp.stake2 * opp.leg2.odds * USD_TO_THB).quantize(Decimal("1"))
-    total_thb  = TOTAL_STAKE_THB.quantize(Decimal("1"))
+    s1 = (opp.stake1 * USD_TO_THB).quantize(Decimal("1"))
+    s2 = (opp.stake2 * USD_TO_THB).quantize(Decimal("1"))
+    w1 = (opp.stake1 * opp.leg1.odds * USD_TO_THB).quantize(Decimal("1"))
+    w2 = (opp.stake2 * opp.leg2.odds * USD_TO_THB).quantize(Decimal("1"))
+    tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
+
+    def steps(leg, stake):
+        bm = leg.bookmaker.lower()
+        if bm == "polymarket":
+            return f"  1. {leg.market_url}\n  2. เลือก {leg.outcome}\n  3. วาง ฿{int(stake)} USDC\n  4. Token: `{leg.raw.get('token_id','—')}`"
+        return f"  1. เปิด {leg.bookmaker}\n  2. เลือก {leg.outcome} @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}"
 
     return (
-        f"📋 *วิธีวางเงิน — {opp.event}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔵 *LEG 1 — {opp.leg1.bookmaker}*\n"
-        f"{manual_steps(opp.leg1, stake1_thb)}\n\n"
-        f"🟠 *LEG 2 — {opp.leg2.bookmaker}*\n"
-        f"{manual_steps(opp.leg2, stake2_thb)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 ทุนรวม : ฿{int(total_thb):,}\n"
-        f"   {opp.leg1.outcome} ชนะ → ฿{int(win1_thb):,} (+฿{int(win1_thb-total_thb):,})\n"
-        f"   {opp.leg2.outcome} ชนะ → ฿{int(win2_thb):,} (+฿{int(win2_thb-total_thb):,})"
+        f"📋 *วางเงิน — {opp.event}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔵 *{opp.leg1.bookmaker}*\n{steps(opp.leg1, s1)}\n\n"
+        f"🟠 *{opp.leg2.bookmaker}*\n{steps(opp.leg2, s2)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 ทุน ฿{int(tt):,}\n"
+        f"   {opp.leg1.outcome} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
+        f"   {opp.leg2.outcome} ชนะ → ฿{int(w2):,} (+฿{int(w2-tt):,})"
     )
 
 
@@ -606,68 +457,68 @@ async def execute_both(opp: ArbOpportunity) -> str:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    try:
-        action, signal_id = query.data.split(":", 1)
-    except ValueError:
+    try: action, sid = query.data.split(":", 1)
+    except: return
+    opp = pending.pop(sid, None)
+    if not opp:
+        await query.edit_message_text(query.message.text + "\n\n⚠️ หมดอายุแล้ว")
         return
-    opp = pending.pop(signal_id, None)
-    if opp is None:
-        await query.edit_message_text(query.message.text + "\n\n⚠️ Signal หมดอายุแล้ว")
-        return
-    original = query.message.text
+    # อัพเดท log
+    for entry in opportunity_log:
+        if entry["id"] == sid:
+            entry["status"] = action
+    orig = query.message.text
     if action == "reject":
-        await query.edit_message_text(original + "\n\n❌ *REJECTED*", parse_mode="Markdown")
+        await query.edit_message_text(orig + "\n\n❌ *REJECTED*", parse_mode="Markdown")
         return
-    await query.edit_message_text(original + "\n\n⏳ *กำลังเตรียม...*", parse_mode="Markdown")
+    await query.edit_message_text(orig + "\n\n⏳ *กำลังเตรียม...*", parse_mode="Markdown")
     result = await execute_both(opp)
-    await query.edit_message_text(original + "\n\n✅ *CONFIRMED*\n\n" + result, parse_mode="Markdown")
+    await query.edit_message_text(orig + "\n\n✅ *CONFIRMED*\n\n" + result, parse_mode="Markdown")
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global auto_scan
+    global auto_scan, quota_warned
     args = context.args
     if not args:
-        state = "🟢 เปิดอยู่" if auto_scan else "🔴 ปิดอยู่"
-        await update.message.reply_text(f"Auto scan: {state}\nใช้ /scan on หรือ /scan off")
+        s = "🟢 เปิด" if auto_scan else "🔴 ปิด"
+        await update.message.reply_text(f"Auto scan: {s}\nใช้ /scan on หรือ /scan off")
         return
     if args[0].lower() == "on":
-        auto_scan = True
-        seen_signals.clear()
-        await update.message.reply_text(f"🟢 *Auto scan เปิดแล้ว* — ทุก {SCAN_INTERVAL}s", parse_mode="Markdown")
+        auto_scan = True; quota_warned = False; seen_signals.clear()
+        await update.message.reply_text(f"🟢 *Auto scan เปิด* — ทุก {SCAN_INTERVAL}s", parse_mode="Markdown")
     elif args[0].lower() == "off":
         auto_scan = False
-        await update.message.reply_text("🔴 *Auto scan ปิดแล้ว*\nใช้ /now เพื่อสแกน manual", parse_mode="Markdown")
+        await update.message.reply_text("🔴 *Auto scan ปิด*", parse_mode="Markdown")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = "🟢 เปิด" if auto_scan else "🔴 ปิด"
-    fee_summary = " | ".join([f"{k}={v:.0%}" for k, v in COMMISSION.items() if v > 0]) or "ไม่มี"
+    s = "🟢 เปิด" if auto_scan else "🔴 ปิด"
+    quota_bar = "█" * min(20, int(api_remaining / 25)) + "░" * max(0, 20 - int(api_remaining / 25))
     await update.message.reply_text(
-        f"📊 *ARB BOT v4.0 Status*\n"
+        f"📊 *ARB BOT v5.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Auto scan   : {state}\n"
-        f"Interval    : {SCAN_INTERVAL}s\n"
+        f"Auto scan   : {s}  ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
-        f"สแกนล่าสุด  : {last_scan_time}\n"
+        f"ล่าสุด      : {last_scan_time}\n"
         f"รอ confirm  : {len(pending)} รายการ\n"
-        f"Min profit  : {MIN_PROFIT_PCT:.1%} _(หลัง fee)_\n"
+        f"Min profit  : {MIN_PROFIT_PCT:.1%}\n"
         f"ทุน/trade   : ฿{int(TOTAL_STAKE_THB):,}\n"
-        f"Sports      : {len(SPORTS)} รายการ\n"
-        f"Fees        : {fee_summary}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✨ v4.0: Fuzzy Match + Async + Slippage\n"
+        f"📡 API Credits\n"
+        f"  เหลือ  : *{api_remaining}* / 500\n"
+        f"  [{quota_bar}]\n"
+        f"  แจ้งเตือนที่ : {QUOTA_WARN_AT}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"/scan on · /scan off · /now · /status",
         parse_mode="Markdown",
     )
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 *กำลังสแกน (async)...*", parse_mode="Markdown")
+    await update.message.reply_text("🔍 *สแกน...*", parse_mode="Markdown")
     count = await do_scan()
-    if count == 0:
-        await update.message.reply_text(f"✅ สแกนเสร็จ — ไม่พบ opportunity > {MIN_PROFIT_PCT:.1%} (หลัง fee)")
-    else:
-        await update.message.reply_text(f"✅ พบ *{count}* opportunity ดูด้านบนครับ", parse_mode="Markdown")
+    msg = f"✅ พบ *{count}* opportunity" if count else f"✅ ไม่พบ opportunity > {MIN_PROFIT_PCT:.1%}"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -675,13 +526,9 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════
 async def do_scan() -> int:
     global scan_count, last_scan_time
-
-    # 🚀 ดึงทุกแหล่งพร้อมกัน
     odds_by_sport, poly_markets = await fetch_all_async(SPORTS)
-    log.info(f"[Scanner] Polymarket markets={len(poly_markets)}")
-
+    log.info(f"[Scanner] Polymarket={len(poly_markets)}")
     all_opps = scan_all(odds_by_sport, poly_markets)
-
     sent = 0
     for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
         key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
@@ -690,45 +537,190 @@ async def do_scan() -> int:
             await send_alert(opp)
             await asyncio.sleep(1)
             sent += 1
-
-    if len(seen_signals) > 500:
-        seen_signals.clear()
-
+    if len(seen_signals) > 500: seen_signals.clear()
     scan_count    += 1
     last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
-    log.info(f"[Scanner] #{scan_count} done | found={len(all_opps)} | sent={sent}")
     return sent
 
 
 async def scanner_loop():
     await asyncio.sleep(3)
-    log.info(f"[Scanner] v4.0 started | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
+    log.info(f"[Scanner] v5.0 started | interval={SCAN_INTERVAL}s")
     while True:
         if auto_scan:
-            try:
-                await do_scan()
-            except Exception as e:
-                log.error(f"[Scanner] {e}")
-        else:
-            log.info("[Scanner] Paused")
+            try: await do_scan()
+            except Exception as e: log.error(f"[Scanner] {e}")
         await asyncio.sleep(SCAN_INTERVAL)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  🆕 WEB DASHBOARD  (built-in HTTP server ไม่ต้องลง Flask)
+# ══════════════════════════════════════════════════════════════════
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="30">
+<title>ARB BOT v5.0</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0d1117; color:#e6edf3; font-family:'Segoe UI',sans-serif; padding:20px; }
+  h1 { color:#58a6ff; font-size:1.5rem; margin-bottom:4px; }
+  .sub { color:#8b949e; font-size:.85rem; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:24px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:16px; }
+  .card .label { color:#8b949e; font-size:.75rem; text-transform:uppercase; letter-spacing:.5px; }
+  .card .value { font-size:1.6rem; font-weight:700; margin-top:4px; }
+  .green { color:#3fb950; } .red { color:#f85149; } .yellow { color:#d29922; } .blue { color:#58a6ff; }
+  .quota-bar { background:#21262d; border-radius:4px; height:8px; margin-top:8px; overflow:hidden; }
+  .quota-fill { height:100%; border-radius:4px; transition:width .3s; }
+  table { width:100%; border-collapse:collapse; background:#161b22; border-radius:10px; overflow:hidden; }
+  th { background:#21262d; color:#8b949e; font-size:.75rem; text-transform:uppercase; padding:10px 14px; text-align:left; }
+  td { padding:10px 14px; border-top:1px solid #21262d; font-size:.85rem; }
+  tr:hover td { background:#1c2128; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:.7rem; font-weight:600; }
+  .badge-pending  { background:#1f3d5c; color:#58a6ff; }
+  .badge-confirm  { background:#1a3a2a; color:#3fb950; }
+  .badge-rejected { background:#3d1f1f; color:#f85149; }
+  .profit { color:#3fb950; font-weight:700; }
+  .section-title { color:#8b949e; font-size:.8rem; text-transform:uppercase; letter-spacing:.5px; margin:20px 0 10px; }
+</style>
+</head>
+<body>
+<h1>🤖 ARB BOT v5.0</h1>
+<div class="sub">Real-time arbitrage scanner — รีเฟรชทุก 30 วินาที</div>
+
+<div class="grid" id="stats"></div>
+<div class="quota-bar"><div class="quota-fill" id="quotaFill"></div></div>
+<div style="color:#8b949e;font-size:.75rem;margin-top:4px;" id="quotaText"></div>
+
+<div class="section-title">📋 Opportunity Log (ล่าสุด 20 รายการ)</div>
+<table>
+  <thead><tr>
+    <th>Event</th><th>Sport</th><th>Leg 1</th><th>Leg 2</th>
+    <th>Profit</th><th>ทุน</th><th>เวลา</th><th>Status</th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+
+<script>
+async function load() {
+  const r = await fetch('/api/state');
+  const d = await r.json();
+
+  // Stats cards
+  const scanColor = d.auto_scan ? 'green' : 'red';
+  const qPct = Math.round((d.api_remaining / 500) * 100);
+  const qColor = qPct > 30 ? 'green' : qPct > 10 ? 'yellow' : 'red';
+  document.getElementById('stats').innerHTML = `
+    <div class="card"><div class="label">Auto Scan</div>
+      <div class="value ${scanColor}">${d.auto_scan ? '🟢 ON' : '🔴 OFF'}</div></div>
+    <div class="card"><div class="label">สแกนไปแล้ว</div>
+      <div class="value blue">${d.scan_count}</div></div>
+    <div class="card"><div class="label">รอ Confirm</div>
+      <div class="value yellow">${d.pending_count}</div></div>
+    <div class="card"><div class="label">API Credits</div>
+      <div class="value ${qColor}">${d.api_remaining}</div></div>
+    <div class="card"><div class="label">ทุน/trade</div>
+      <div class="value">฿${d.total_stake_thb.toLocaleString()}</div></div>
+    <div class="card"><div class="label">Min Profit</div>
+      <div class="value green">${(d.min_profit_pct * 100).toFixed(1)}%</div></div>
+  `;
+  document.getElementById('quotaFill').style.width = qPct + '%';
+  document.getElementById('quotaFill').style.background = qPct > 30 ? '#3fb950' : qPct > 10 ? '#d29922' : '#f85149';
+  document.getElementById('quotaText').textContent = `API Credits: ${d.api_remaining}/500 (${qPct}%) — แจ้งเตือนที่ ${d.quota_warn_at} | สแกนล่าสุด: ${d.last_scan_time}`;
+
+  // Table
+  const rows = (d.opportunities || []).slice(-20).reverse().map(o => {
+    const badge = o.status === 'pending' ? 'badge-pending' : o.status === 'confirm' ? 'badge-confirm' : 'badge-rejected';
+    const label = o.status === 'pending' ? 'รอ' : o.status === 'confirm' ? 'ยืนยัน' : 'ปฏิเสธ';
+    const t = new Date(o.created_at).toLocaleTimeString('th-TH', {hour:'2-digit',minute:'2-digit'});
+    return `<tr>
+      <td>${o.event}</td>
+      <td>${o.sport.split('_').pop().toUpperCase()}</td>
+      <td>${o.leg1_bm} @${o.leg1_odds.toFixed(2)}</td>
+      <td>${o.leg2_bm} @${o.leg2_odds.toFixed(2)}</td>
+      <td class="profit">+${(o.profit_pct*100).toFixed(2)}%</td>
+      <td>฿${o.stake1_thb.toLocaleString()} / ฿${o.stake2_thb.toLocaleString()}</td>
+      <td>${t}</td>
+      <td><span class="badge ${badge}">${label}</span></td>
+    </tr>`;
+  }).join('');
+  document.getElementById('tbody').innerHTML = rows || '<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:30px">ยังไม่พบ opportunity</td></tr>';
+}
+load();
+</script>
+</body>
+</html>"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass  # ปิด access log
+
+    def do_GET(self):
+        if self.path == "/api/state":
+            data = {
+                "auto_scan":       auto_scan,
+                "scan_count":      scan_count,
+                "last_scan_time":  last_scan_time,
+                "pending_count":   len(pending),
+                "api_remaining":   api_remaining,
+                "api_used":        api_used_session,
+                "quota_warn_at":   QUOTA_WARN_AT,
+                "total_stake_thb": int(TOTAL_STAKE_THB),
+                "min_profit_pct":  float(MIN_PROFIT_PCT),
+                "scan_interval":   SCAN_INTERVAL,
+                "sports":          SPORTS,
+                "opportunities":   opportunity_log[-50:],
+            }
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = DASHBOARD_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+
+
+def start_dashboard():
+    server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
+    log.info(f"[Dashboard] http://0.0.0.0:{PORT}")
+    server.serve_forever()
 
 
 # ══════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = str(context.error)
+    if "Conflict" in err:
+        log.warning("[Bot] Conflict — รอ instance เก่าหายไป")
+        return
+    log.error(f"[Bot] {context.error}")
+
+
 async def post_init(app: Application):
+    app.add_error_handler(error_handler)
+    # เริ่ม dashboard thread
+    t = threading.Thread(target=start_dashboard, daemon=True)
+    t.start()
     await app.bot.send_message(
-        chat_id    = CHAT_ID,
-        parse_mode = "Markdown",
-        text       = (
-            "🤖 *ARB BOT v4.0 — Started!*\n"
+        chat_id=CHAT_ID, parse_mode="Markdown",
+        text=(
+            "🤖 *ARB BOT v5.0 — Started!*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"✨ Fuzzy Match + Async Fetch + Slippage Calc\n"
-            f"Sports    : {' | '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
-            f"Min profit: {MIN_PROFIT_PCT:.1%} _(หลัง fee)_\n"
-            f"ทุน/trade : ฿{int(TOTAL_STAKE_THB):,}\n"
+            f"✨ Dashboard + Quota Alert + Fuzzy + Async\n"
+            f"Sports    : {' '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
+            f"Min profit: {MIN_PROFIT_PCT:.1%}  |  ทุน: ฿{int(TOTAL_STAKE_THB):,}\n"
             f"Auto scan : {'🟢 เปิด' if auto_scan else '🔴 ปิด'} (ทุก {SCAN_INTERVAL}s)\n"
+            f"Dashboard : port {PORT}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"/scan on · /scan off · /now · /status"
         ),
@@ -747,6 +739,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("scan",   cmd_scan))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("now",    cmd_now))
-
     _app = app
     app.run_polling(drop_pending_updates=True)
