@@ -344,6 +344,75 @@ def fetch_1xbet_odds(sport_key: str) -> list[dict]:
         return []
 
 
+def fetch_dafabet_odds(sport_key: str) -> list[dict]:
+    """
+    ดึง odds จาก Dafabet API (unofficial)
+    """
+    SPORT_MAP = {
+        "basketball_nba":         "basketball",
+        "baseball_mlb":           "baseball",
+        "mma_mixed_martial_arts": "mma",
+        "esports_csgo":           "esports",
+        "esports_dota2":          "esports",
+    }
+    sport = SPORT_MAP.get(sport_key)
+    if not sport:
+        return []
+    try:
+        r = requests.get(
+            f"https://www.dafabet.com/en/odds-api/sport/{sport}/events",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.warning(f"[Dafabet] status={r.status_code}")
+            return []
+        data = r.json()
+        results = []
+        for ev in data.get("events", data if isinstance(data, list) else []):
+            home = ev.get("homeTeam") or ev.get("home_team", "")
+            away = ev.get("awayTeam") or ev.get("away_team", "")
+            if not home or not away:
+                continue
+            markets = ev.get("markets", ev.get("odds", []))
+            home_odds = away_odds = None
+            for m in markets:
+                mtype = str(m.get("type", m.get("marketType", ""))).lower()
+                if "moneyline" in mtype or "1x2" in mtype or "winner" in mtype or mtype in ["1", "ml"]:
+                    for sel in m.get("selections", m.get("outcomes", [])):
+                        name  = str(sel.get("name", sel.get("type", ""))).lower()
+                        price = sel.get("odds") or sel.get("price") or sel.get("value")
+                        if price:
+                            price = Decimal(str(price))
+                            if "home" in name or name == "1":
+                                home_odds = price
+                            elif "away" in name or name == "2":
+                                away_odds = price
+            if home_odds and away_odds and home_odds > 1 and away_odds > 1:
+                results.append({
+                    "id":            str(ev.get("id", "")),
+                    "home_team":     home,
+                    "away_team":     away,
+                    "commence_time": str(ev.get("startTime", ev.get("start", "")))[:16],
+                    "bookmakers": [{
+                        "key":   "dafabet",
+                        "title": "Dafabet",
+                        "markets": [{
+                            "key": "h2h",
+                            "outcomes": [
+                                {"name": home, "price": float(home_odds)},
+                                {"name": away, "price": float(away_odds)},
+                            ]
+                        }]
+                    }]
+                })
+        log.info(f"[Dafabet] sport={sport_key} | events={len(results)}")
+        return results
+    except Exception as e:
+        log.error(f"[Dafabet] error: {e}")
+        return []
+
+
 def merge_events(pinnacle_events: list, xbet_events: list) -> list[dict]:
     """
     รวม events จากหลายแหล่ง โดย match ชื่อทีม
@@ -368,7 +437,7 @@ def merge_events(pinnacle_events: list, xbet_events: list) -> list[dict]:
 
 def fetch_odds(sport_key: str) -> list[dict]:
     """
-    ดึง odds จาก Pinnacle + 1xBet โดยตรง (ฟรี ไม่ใช้ Odds API)
+    ดึง odds จาก Pinnacle + 1xBet + Dafabet โดยตรง (ฟรี ไม่ใช้ Odds API)
     """
     sport_id = PINNACLE_SPORT_IDS.get(sport_key)
     if not sport_id:
@@ -377,9 +446,14 @@ def fetch_odds(sport_key: str) -> list[dict]:
 
     pinnacle = fetch_pinnacle_odds(sport_id)
     xbet     = fetch_1xbet_odds(sport_key)
-    merged   = merge_events(pinnacle, xbet)
+    dafabet  = fetch_dafabet_odds(sport_key)
+    merged   = merge_events(pinnacle, xbet + dafabet)
 
-    log.info(f"[fetch_odds] {sport_key} | pinnacle={len(pinnacle)} | 1xbet={len(xbet)} | merged={len(merged)}")
+    log.info(
+        f"[fetch_odds] {sport_key} | "
+        f"pinnacle={len(pinnacle)} | 1xbet={len(xbet)} | "
+        f"dafabet={len(dafabet)} | merged={len(merged)}"
+    )
     return merged
 
 
