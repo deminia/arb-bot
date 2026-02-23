@@ -331,6 +331,9 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     if mkt.get("key") != "h2h": continue
                     for out in mkt.get("outcomes", []):
                         name     = out.get("name","")
+                        # กรอง Draw/Tie ออก — ใช้แค่ 2 ฝั่งหลัก
+                        if name.lower() in ("draw", "tie", "no contest", "nc"):
+                            continue
                         odds_raw = Decimal(str(out.get("price", 1)))
                         odds_eff = apply_slippage(odds_raw, bk)
                         if name not in best or odds_eff > best[name].odds:
