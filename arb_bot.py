@@ -436,10 +436,55 @@ async def execute_both(opp: ArbOpportunity) -> str:
     tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
 
     def steps(leg, stake):
-        bm = leg.bookmaker.lower()
-        if bm == "polymarket":
-            return f"  1. {leg.market_url}\n  2. เลือก {leg.outcome}\n  3. วาง ฿{int(stake)} USDC\n  4. Token: `{leg.raw.get('token_id','—')}`"
-        return f"  1. เปิด {leg.bookmaker}\n  2. เลือก {leg.outcome} @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}"
+        bm  = leg.bookmaker.lower()
+        eid = leg.raw.get("event_id", "")
+        bk  = leg.raw.get("bm_key", bm)
+
+        # สร้าง deep link แต่ละเว็บ
+        if "polymarket" in bm:
+            link = leg.market_url or "https://polymarket.com"
+            return (f"  🔗 [เปิด Polymarket ตรงนี้เลย]({link})\n"
+                    f"  2. เลือก *{leg.outcome}*\n"
+                    f"  3. วาง ฿{int(stake)} USDC")
+
+        elif "pinnacle" in bk:
+            # Pinnacle deep link ไปหน้า sport
+            sport_path = {
+                "basketball_nba":         "basketball/nba",
+                "baseball_mlb":           "baseball/mlb",
+                "mma_mixed_martial_arts": "mixed-martial-arts",
+                "esports_csgo":           "esports/cs2",
+                "esports_dota2":          "esports/dota-2",
+            }
+            # ถ้ามี event_id ใช้ลิงค์ตรง ถ้าไม่มีใช้ sport
+            if eid:
+                link = f"https://www.pinnacle.com/en/mixed-martial-arts/matchup/{eid}"
+            else:
+                link = "https://www.pinnacle.com/en/mixed-martial-arts"
+            return (f"  🔗 [เปิด Pinnacle ตรงนี้เลย]({link})\n"
+                    f"  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n"
+                    f"  3. วาง ฿{int(stake)}")
+
+        elif "onexbet" in bk or "1xbet" in bm:
+            # 1xBet deep link ด้วย event_id
+            if eid:
+                link = f"https://1xbet.com/en/line/mixed-martial-arts/{eid}"
+            else:
+                link = "https://1xbet.com/en/line/mixed-martial-arts"
+            return (f"  🔗 [เปิด 1xBet ตรงนี้เลย]({link})\n"
+                    f"  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n"
+                    f"  3. วาง ฿{int(stake)}")
+
+        elif "dafabet" in bk:
+            link = "https://www.dafabet.com/en/sports/mma"
+            return (f"  🔗 [เปิด Dafabet]({link})\n"
+                    f"  2. ค้นหา *{leg.outcome}*\n"
+                    f"  3. วาง ฿{int(stake)}")
+
+        else:
+            return (f"  1. เปิด {leg.bookmaker}\n"
+                    f"  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n"
+                    f"  3. วาง ฿{int(stake)}")
 
     return (
         f"📋 *วางเงิน — {opp.event}*\n"
