@@ -139,7 +139,7 @@ _app:             Optional[Application]    = None
 # ══════════════════════════════════════════════════════════════════
 async def update_quota(remaining: int):
     """อัพเดท quota และส่งเตือนถ้าใกล้หมด"""
-    global api_remaining, api_used_session, quota_warned
+    global api_remaining, api_used_session, quota_warned, auto_scan
 
     api_remaining     = remaining
     api_used_session += 1
@@ -172,7 +172,6 @@ async def update_quota(remaining: int):
                 log.error(f"[Quota] ส่ง alert ไม่ได้: {e}")
 
         if critical and auto_scan:
-            global auto_scan
             auto_scan = False
             log.warning("[Quota] Credits เหลือน้อยมาก — หยุด auto scan อัตโนมัติ")
             if _app:
