@@ -57,7 +57,7 @@ def _i(key: str, default: int) -> int:
     return int(os.getenv(key, str(default)))
 
 # API Keys
-ODDS_API_KEY   = _s("ODDS_API_KEY",   "0205bd80de0af87de624e134b8c38db3")
+# ODDS_API_KEY ไม่จำเป็นแล้ว — ดึงตรงจาก Pinnacle + 1xBet ฟรี!
 TELEGRAM_TOKEN = _s("TELEGRAM_TOKEN", "8517689298:AAEgHOYN-zAOwsJ4LMYGQkLeZPTComJP4A8")
 CHAT_ID        = _s("CHAT_ID",        "6415456688")
 
@@ -70,9 +70,6 @@ TOTAL_STAKE     = TOTAL_STAKE_THB / USD_TO_THB      # คำนวณอัต�
 MIN_PROFIT_PCT = _d("MIN_PROFIT_PCT", "0.015")      # กำไรขั้นต่ำ (0.015 = 1.5%)
 SCAN_INTERVAL  = _i("SCAN_INTERVAL",  300)          # วินาที ต่อรอบ
 AUTO_SCAN_START = _s("AUTO_SCAN_START", "true").lower() == "true"
-
-# Bookmakers (key ของ Odds API)
-BOOKMAKERS = _s("BOOKMAKERS", "pinnacle,onexbet,dafabet")
 
 # Sports — แก้ใน .env เป็น comma-separated
 # ตัวอย่าง: SPORTS=basketball_nba,baseball_mlb,esports_csgo
@@ -129,29 +126,261 @@ _app:           Optional[Application]     = None
 
 
 # ══════════════════════════════════════════════════════════════════
-#  FETCH ODDS  —  The Odds API
+#  FETCH ODDS  —  Pinnacle (ฟรี ไม่ต้อง API key)
 # ══════════════════════════════════════════════════════════════════
-def fetch_odds(sport_key: str) -> list[dict]:
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey":     ODDS_API_KEY,
-        "regions":    "eu,uk,au",
-        "markets":    "h2h",
-        "oddsFormat": "decimal",
-        "bookmakers": BOOKMAKERS,
-    }
+
+# Map sport key → Pinnacle sport ID
+PINNACLE_SPORT_IDS = {
+    "basketball_nba":         "4",    # Basketball
+    "baseball_mlb":           "3",    # Baseball
+    "mma_mixed_martial_arts": "7",    # MMA
+    "esports_csgo":           "12",   # Esports (CS2)
+    "esports_dota2":          "12",   # Esports (Dota2)
+    "tennis_atp":             "33",   # Tennis
+}
+
+PINNACLE_HEADERS = {
+    "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":       "application/json",
+    "Referer":      "https://www.pinnacle.com/",
+    "X-API-Version": "v3",
+}
+
+# Map Pinnacle league ID → sport key (populate ตอน fetch)
+_pinnacle_league_cache: dict[str, list] = {}
+
+
+def fetch_pinnacle_sports() -> list[dict]:
+    """ดึงรายการ sports + leagues จาก Pinnacle"""
     try:
-        r = requests.get(url, params=params, timeout=15)
-        remaining = r.headers.get("x-requests-remaining", "?")
-        data = r.json()
-        if isinstance(data, list):
-            log.info(f"[OddsAPI] {sport_key} | events={len(data)} | remaining={remaining}")
-            return data
-        log.warning(f"[OddsAPI] Unexpected response: {data}")
-        return []
+        r = requests.get(
+            "https://pinnacle.com/api/v1/sports",
+            headers=PINNACLE_HEADERS,
+            timeout=15,
+        )
+        return r.json() if r.status_code == 200 else []
     except Exception as e:
-        log.error(f"[OddsAPI] {sport_key} error: {e}")
+        log.debug(f"[Pinnacle] sports error: {e}")
         return []
+
+
+def fetch_pinnacle_leagues(sport_id: str) -> list[dict]:
+    """ดึง leagues ของ sport"""
+    try:
+        r = requests.get(
+            f"https://pinnacle.com/api/v1/leagues?sportId={sport_id}&isOffering=1",
+            headers=PINNACLE_HEADERS,
+            timeout=15,
+        )
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        log.debug(f"[Pinnacle] leagues error: {e}")
+        return []
+
+
+def fetch_pinnacle_odds(sport_id: str) -> list[dict]:
+    """
+    ดึง h2h odds จาก Pinnacle สำหรับ sport_id
+    Return format เหมือน Odds API เพื่อให้ scan_sport() ใช้ได้เลย
+    """
+    try:
+        # ดึง matchup (events)
+        r = requests.get(
+            f"https://pinnacle.com/api/v1/matchups?sportId={sport_id}&isLive=0&brandId=0",
+            headers=PINNACLE_HEADERS,
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.warning(f"[Pinnacle] matchups {sport_id} status={r.status_code}")
+            return []
+        matchups = r.json()
+        if not isinstance(matchups, list):
+            log.warning(f"[Pinnacle] unexpected matchups: {matchups}")
+            return []
+
+        # ดึง odds แยก
+        r2 = requests.get(
+            f"https://pinnacle.com/api/v1/odds?sportId={sport_id}&isLive=0&brandId=0",
+            headers=PINNACLE_HEADERS,
+            timeout=15,
+        )
+        odds_raw = r2.json() if r2.status_code == 200 else []
+
+        # Map matchup_id → odds
+        odds_map: dict[int, dict] = {}
+        for o in odds_raw if isinstance(odds_raw, list) else []:
+            mid = o.get("matchupId") or o.get("id")
+            if mid:
+                odds_map[mid] = o
+
+        results = []
+        for m in matchups:
+            # เอาเฉพาะ pre-match 2-way (ไม่ใช่ special/parlay)
+            if m.get("type") != "matchup":
+                continue
+            participants = m.get("participants", [])
+            if len(participants) < 2:
+                continue
+
+            home = participants[0].get("name", "")
+            away = participants[1].get("name", "")
+            mid  = m.get("id", 0)
+            odds = odds_map.get(mid, {})
+
+            # ดึง moneyline (h2h) odds
+            prices = odds.get("prices", [])
+            home_odds = None
+            away_odds = None
+            for p in prices:
+                designation = p.get("designation", "").lower()
+                price       = p.get("price")
+                if price and designation == "home":
+                    # แปลง American odds → Decimal
+                    if isinstance(price, (int, float)):
+                        if price > 0:
+                            home_odds = Decimal(str(round(price / 100 + 1, 4)))
+                        else:
+                            home_odds = Decimal(str(round(100 / abs(price) + 1, 4)))
+                elif price and designation == "away":
+                    if isinstance(price, (int, float)):
+                        if price > 0:
+                            away_odds = Decimal(str(round(price / 100 + 1, 4)))
+                        else:
+                            away_odds = Decimal(str(round(100 / abs(price) + 1, 4)))
+
+            if home_odds and away_odds and home_odds > 1 and away_odds > 1:
+                # แปลงเป็น format เดียวกับ Odds API
+                results.append({
+                    "id":           str(mid),
+                    "home_team":    home,
+                    "away_team":    away,
+                    "commence_time": m.get("startTime", "")[:16],
+                    "bookmakers": [{
+                        "key":   "pinnacle",
+                        "title": "Pinnacle",
+                        "markets": [{
+                            "key": "h2h",
+                            "outcomes": [
+                                {"name": home, "price": float(home_odds)},
+                                {"name": away, "price": float(away_odds)},
+                            ]
+                        }]
+                    }]
+                })
+
+        log.info(f"[Pinnacle] sport={sport_id} | events={len(results)}")
+        return results
+
+    except Exception as e:
+        log.error(f"[Pinnacle] odds error: {e}")
+        return []
+
+
+def fetch_1xbet_odds(sport_key: str) -> list[dict]:
+    """
+    ดึง odds จาก 1xBet API (unofficial)
+    """
+    # Map sport key → 1xBet sport ID
+    SPORT_MAP = {
+        "basketball_nba":         "3",
+        "baseball_mlb":           "2",
+        "mma_mixed_martial_arts": "24",
+        "esports_csgo":           "40",
+        "esports_dota2":          "40",
+    }
+    sport_id = SPORT_MAP.get(sport_key)
+    if not sport_id:
+        return []
+    try:
+        r = requests.get(
+            f"https://1xbet.com/LineFeed/GetSports?sports={sport_id}&cnt=50&lng=en",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        data = r.json()
+        results = []
+        for league in data.get("Value", []):
+            for event in league.get("Events", []):
+                if event.get("IsLive"):
+                    continue
+                teams = event.get("Teams", [])
+                if len(teams) < 2:
+                    continue
+                home = teams[0].get("Name", "")
+                away = teams[1].get("Name", "")
+
+                # ดึง moneyline odds
+                odds_list = event.get("Odds", [])
+                home_odds = away_odds = None
+                for o in odds_list:
+                    if o.get("GroupId") == 1:   # Moneyline group
+                        if o.get("Type") == 1:
+                            home_odds = Decimal(str(o.get("Value", 0)))
+                        elif o.get("Type") == 2:
+                            away_odds = Decimal(str(o.get("Value", 0)))
+
+                if home_odds and away_odds and home_odds > 1 and away_odds > 1:
+                    results.append({
+                        "id":           str(event.get("Id", "")),
+                        "home_team":    home,
+                        "away_team":    away,
+                        "commence_time": event.get("Start", "")[:16],
+                        "bookmakers": [{
+                            "key":   "onexbet",
+                            "title": "1xBet",
+                            "markets": [{
+                                "key": "h2h",
+                                "outcomes": [
+                                    {"name": home, "price": float(home_odds)},
+                                    {"name": away, "price": float(away_odds)},
+                                ]
+                            }]
+                        }]
+                    })
+        log.info(f"[1xBet] sport={sport_key} | events={len(results)}")
+        return results
+    except Exception as e:
+        log.error(f"[1xBet] error: {e}")
+        return []
+
+
+def merge_events(pinnacle_events: list, xbet_events: list) -> list[dict]:
+    """
+    รวม events จากหลายแหล่ง โดย match ชื่อทีม
+    คืน list of events ที่มี bookmakers จากทุกแหล่งรวมกัน
+    """
+    merged: dict[str, dict] = {}
+
+    for ev in pinnacle_events:
+        key = f"{ev['home_team'][:6].lower()}_{ev['away_team'][:6].lower()}"
+        merged[key] = dict(ev)
+
+    for ev in xbet_events:
+        key = f"{ev['home_team'][:6].lower()}_{ev['away_team'][:6].lower()}"
+        if key in merged:
+            # เพิ่ม bookmaker เข้าไปใน event ที่มีอยู่แล้ว
+            merged[key]["bookmakers"].extend(ev["bookmakers"])
+        else:
+            merged[key] = dict(ev)
+
+    return list(merged.values())
+
+
+def fetch_odds(sport_key: str) -> list[dict]:
+    """
+    ดึง odds จาก Pinnacle + 1xBet โดยตรง (ฟรี ไม่ใช้ Odds API)
+    """
+    sport_id = PINNACLE_SPORT_IDS.get(sport_key)
+    if not sport_id:
+        log.warning(f"[fetch_odds] ไม่มี sport_id สำหรับ {sport_key}")
+        return []
+
+    pinnacle = fetch_pinnacle_odds(sport_id)
+    xbet     = fetch_1xbet_odds(sport_key)
+    merged   = merge_events(pinnacle, xbet)
+
+    log.info(f"[fetch_odds] {sport_key} | pinnacle={len(pinnacle)} | 1xbet={len(xbet)} | merged={len(merged)}")
+    return merged
 
 
 # ══════════════════════════════════════════════════════════════════
