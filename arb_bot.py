@@ -11,6 +11,11 @@
 """
 
 import asyncio, json, logging, os, re, signal, sqlite3, threading, uuid
+try:
+    import libsql_client as turso_client
+    HAS_TURSO = True
+except ImportError:
+    HAS_TURSO = False
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -40,7 +45,10 @@ TELEGRAM_TOKEN  = _s("TELEGRAM_TOKEN",  "8517689298:AAEgHOYN-zAOwsJ4LMYGQkLeZPTC
 CHAT_ID         = _s("CHAT_ID",         "6415456688")
 EXTRA_CHAT_IDS  = [c.strip() for c in _s("EXTRA_CHAT_IDS","").split(",") if c.strip()]  # 9. multi-chat
 PORT            = _i("PORT",            8080)
-DB_PATH         = _s("DB_PATH",         "/data/arb_bot.db")  # persistent volume path
+DB_PATH         = _s("DB_PATH",         "/tmp/arb_bot.db")   # local fallback
+TURSO_URL       = _s("TURSO_URL",       "")   # libsql://your-db.turso.io
+TURSO_TOKEN     = _s("TURSO_TOKEN",     "")   # eyJ...
+USE_TURSO       = bool(TURSO_URL and TURSO_TOKEN)
 
 TOTAL_STAKE_THB = _d("TOTAL_STAKE_THB","10000")
 USD_TO_THB      = _d("USD_TO_THB",     "35")
@@ -181,142 +189,162 @@ _shutdown_event = threading.Event()
 # ══════════════════════════════════════════════════════════════════
 #  💾 PERSISTENT STORAGE (SQLite)
 # ══════════════════════════════════════════════════════════════════
-def db_init():
-    """สร้าง database และ tables ถ้ายังไม่มี"""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.executescript("""
-        CREATE TABLE IF NOT EXISTS trade_records (
-            signal_id    TEXT PRIMARY KEY,
-            event        TEXT,
-            sport        TEXT,
-            leg1_bm      TEXT,
-            leg2_bm      TEXT,
-            leg1_odds    REAL,
-            leg2_odds    REAL,
-            stake1_thb   INTEGER,
-            stake2_thb   INTEGER,
-            profit_pct   REAL,
-            status       TEXT,
-            clv_leg1     REAL,
-            clv_leg2     REAL,
-            actual_profit_thb INTEGER,
-            settled_at   TEXT,
-            created_at   TEXT
-        );
-        CREATE TABLE IF NOT EXISTS opportunity_log (
-            id           TEXT PRIMARY KEY,
-            event        TEXT,
-            sport        TEXT,
-            profit_pct   REAL,
-            leg1_bm      TEXT,
-            leg1_odds    REAL,
-            leg2_bm      TEXT,
-            leg2_odds    REAL,
-            stake1_thb   INTEGER,
-            stake2_thb   INTEGER,
-            created_at   TEXT,
-            status       TEXT DEFAULT 'pending'
-        );
-        CREATE TABLE IF NOT EXISTS line_movements (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            event        TEXT,
-            sport        TEXT,
-            bookmaker    TEXT,
-            outcome      TEXT,
-            odds_before  REAL,
-            odds_after   REAL,
-            pct_change   REAL,
-            direction    TEXT,
-            is_steam     INTEGER,
-            is_rlm       INTEGER,
-            ts           TEXT
-        );
-        CREATE TABLE IF NOT EXISTS bot_state (
-            key          TEXT PRIMARY KEY,
-            value        TEXT
-        );
-    """)
-    con.commit()
-    con.close()
-    log.info(f"[DB] initialized at {DB_PATH}")
+# ══════════════════════════════════════════════════════════════════
+#  💾 DATABASE LAYER  (Turso cloud หรือ SQLite local fallback)
+# ══════════════════════════════════════════════════════════════════
 
+CREATE_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS trade_records (
+    signal_id TEXT PRIMARY KEY, event TEXT, sport TEXT,
+    leg1_bm TEXT, leg2_bm TEXT, leg1_odds REAL, leg2_odds REAL,
+    stake1_thb INTEGER, stake2_thb INTEGER, profit_pct REAL, status TEXT,
+    clv_leg1 REAL, clv_leg2 REAL, actual_profit_thb INTEGER,
+    settled_at TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS opportunity_log (
+    id TEXT PRIMARY KEY, event TEXT, sport TEXT, profit_pct REAL,
+    leg1_bm TEXT, leg1_odds REAL, leg2_bm TEXT, leg2_odds REAL,
+    stake1_thb INTEGER, stake2_thb INTEGER, created_at TEXT,
+    status TEXT DEFAULT 'pending'
+);
+CREATE TABLE IF NOT EXISTS line_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event TEXT, sport TEXT, bookmaker TEXT, outcome TEXT,
+    odds_before REAL, odds_after REAL, pct_change REAL,
+    direction TEXT, is_steam INTEGER, is_rlm INTEGER, ts TEXT
+);
+CREATE TABLE IF NOT EXISTS bot_state (
+    key TEXT PRIMARY KEY, value TEXT
+);
+"""
 
-def db_save_trade(t: "TradeRecord"):
-    """บันทึก trade record"""
+# ── Turso async client (ใช้ถ้ามี TURSO_URL) ──────────────────────
+_turso: Optional[object] = None
+
+async def turso_init():
+    global _turso
+    if not USE_TURSO or not HAS_TURSO:
+        return
+    try:
+        _turso = turso_client.create_client(
+            url=TURSO_URL, auth_token=TURSO_TOKEN
+        )
+        for stmt in CREATE_TABLES_SQL.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                await _turso.execute(stmt)
+        log.info("[DB] Turso connected ✅")
+    except Exception as e:
+        log.error(f"[DB] Turso init failed: {e} — fallback to SQLite")
+        _turso = None
+
+async def turso_exec(sql: str, params: tuple = ()):
+    """Execute write query (Turso หรือ SQLite)"""
+    if _turso:
+        try:
+            await _turso.execute(sql, list(params))
+            return
+        except Exception as e:
+            log.error(f"[DB] turso_exec: {e}")
+    # SQLite fallback
     try:
         con = sqlite3.connect(DB_PATH)
-        con.execute("""
-            INSERT OR REPLACE INTO trade_records VALUES
-            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (t.signal_id, t.event, t.sport, t.leg1_bm, t.leg2_bm,
-               t.leg1_odds, t.leg2_odds, t.stake1_thb, t.stake2_thb,
-               t.profit_pct, t.status, t.clv_leg1, t.clv_leg2,
-               t.actual_profit_thb, t.settled_at, t.created_at))
+        con.execute(sql, params)
         con.commit()
         con.close()
     except Exception as e:
-        log.error(f"[DB] save_trade: {e}")
+        log.error(f"[DB] sqlite_exec: {e}")
 
+async def turso_query(sql: str, params: tuple = ()) -> list:
+    """Execute read query (Turso หรือ SQLite)"""
+    if _turso:
+        try:
+            rs = await _turso.execute(sql, list(params))
+            return [tuple(row.values()) for row in rs.rows]
+        except Exception as e:
+            log.error(f"[DB] turso_query: {e}")
+    # SQLite fallback
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(sql, params).fetchall()
+        con.close()
+        return rows
+    except Exception as e:
+        log.error(f"[DB] sqlite_query: {e}")
+        return []
+
+# ── SQLite local init (fallback) ──────────────────────────────────
+def db_init_local():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        for stmt in CREATE_TABLES_SQL.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                con.execute(stmt)
+        con.commit()
+        con.close()
+        log.info(f"[DB] SQLite local at {DB_PATH}")
+    except Exception as e:
+        log.error(f"[DB] local init: {e}")
+
+def db_init():
+    if not USE_TURSO:
+        db_init_local()
+
+# ── Write helpers ─────────────────────────────────────────────────
+def db_save_trade(t: "TradeRecord"):
+    asyncio.get_event_loop().create_task(_async_save_trade(t))
+
+async def _async_save_trade(t: "TradeRecord"):
+    await turso_exec(
+        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (t.signal_id,t.event,t.sport,t.leg1_bm,t.leg2_bm,
+         t.leg1_odds,t.leg2_odds,t.stake1_thb,t.stake2_thb,
+         t.profit_pct,t.status,t.clv_leg1,t.clv_leg2,
+         t.actual_profit_thb,t.settled_at,t.created_at)
+    )
 
 def db_save_opportunity(opp: dict):
-    """บันทึก opportunity log"""
-    try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute("""
-            INSERT OR REPLACE INTO opportunity_log VALUES
-            (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (opp["id"], opp["event"], opp["sport"], opp["profit_pct"],
-               opp["leg1_bm"], opp["leg1_odds"], opp["leg2_bm"], opp["leg2_odds"],
-               opp["stake1_thb"], opp["stake2_thb"], opp["created_at"], opp["status"]))
-        con.commit()
-        con.close()
-    except Exception as e:
-        log.error(f"[DB] save_opportunity: {e}")
+    asyncio.get_event_loop().create_task(_async_save_opp(opp))
 
+async def _async_save_opp(opp: dict):
+    await turso_exec(
+        "INSERT OR REPLACE INTO opportunity_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (opp["id"],opp["event"],opp["sport"],opp["profit_pct"],
+         opp["leg1_bm"],opp["leg1_odds"],opp["leg2_bm"],opp["leg2_odds"],
+         opp["stake1_thb"],opp["stake2_thb"],opp["created_at"],opp["status"])
+    )
 
 def db_update_opp_status(signal_id: str, status: str):
-    """อัพเดท status ของ opportunity"""
-    try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute("UPDATE opportunity_log SET status=? WHERE id=?", (status, signal_id))
-        con.commit()
-        con.close()
-    except Exception as e:
-        log.error(f"[DB] update_status: {e}")
-
+    asyncio.get_event_loop().create_task(
+        turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", (status, signal_id))
+    )
 
 def db_save_line_movement(lm: "LineMovement"):
-    """บันทึก line movement"""
-    try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute("""
-            INSERT INTO line_movements
-            (event,sport,bookmaker,outcome,odds_before,odds_after,
-             pct_change,direction,is_steam,is_rlm,ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (lm.event, lm.sport, lm.bookmaker, lm.outcome,
-               float(lm.odds_before), float(lm.odds_after), float(lm.pct_change),
-               lm.direction, int(lm.is_steam), int(lm.is_rlm), lm.ts))
-        con.commit()
-        con.close()
-    except Exception as e:
-        log.error(f"[DB] save_line_movement: {e}")
+    asyncio.get_event_loop().create_task(_async_save_lm(lm))
 
+async def _async_save_lm(lm: "LineMovement"):
+    await turso_exec(
+        """INSERT INTO line_movements
+           (event,sport,bookmaker,outcome,odds_before,odds_after,
+            pct_change,direction,is_steam,is_rlm,ts)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (lm.event,lm.sport,lm.bookmaker,lm.outcome,
+         float(lm.odds_before),float(lm.odds_after),float(lm.pct_change),
+         lm.direction,int(lm.is_steam),int(lm.is_rlm),lm.ts)
+    )
 
 def db_save_state(key: str, value: str):
-    """บันทึก bot state"""
-    try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute("INSERT OR REPLACE INTO bot_state VALUES (?,?)", (key, value))
-        con.commit()
-        con.close()
-    except Exception as e:
-        log.error(f"[DB] save_state: {e}")
+    asyncio.get_event_loop().create_task(
+        turso_exec("INSERT OR REPLACE INTO bot_state VALUES (?,?)", (key, value))
+    )
 
+async def db_load_state_async(key: str, default: str = "") -> str:
+    rows = await turso_query("SELECT value FROM bot_state WHERE key=?", (key,))
+    return rows[0][0] if rows else default
 
 def db_load_state(key: str, default: str = "") -> str:
-    """โหลด bot state"""
+    """Sync version (ใช้ SQLite local เท่านั้น สำหรับ startup)"""
     try:
         con = sqlite3.connect(DB_PATH)
         row = con.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
@@ -325,53 +353,42 @@ def db_load_state(key: str, default: str = "") -> str:
     except:
         return default
 
-
-def db_load_all() -> tuple[list, list, list]:
-    """โหลดข้อมูลทั้งหมดจาก DB เมื่อ restart"""
+async def db_load_all() -> tuple[list, list, list]:
+    """โหลดทุกอย่างจาก DB (async)"""
     try:
-        con = sqlite3.connect(DB_PATH)
-
-        trades_rows = con.execute(
-            "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500"
-        ).fetchall()
+        trades_rows = await turso_query(
+            "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500")
         trades = []
         for r in trades_rows:
-            t = TradeRecord(signal_id=r[0], event=r[1], sport=r[2],
-                           leg1_bm=r[3], leg2_bm=r[4], leg1_odds=r[5], leg2_odds=r[6],
-                           stake1_thb=r[7], stake2_thb=r[8], profit_pct=r[9],
-                           status=r[10], clv_leg1=r[11], clv_leg2=r[12],
-                           actual_profit_thb=r[13], settled_at=r[14], created_at=r[15])
-            trades.append(t)
+            trades.append(TradeRecord(
+                signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
+                leg1_odds=r[5],leg2_odds=r[6],stake1_thb=r[7],stake2_thb=r[8],
+                profit_pct=r[9],status=r[10],clv_leg1=r[11],clv_leg2=r[12],
+                actual_profit_thb=r[13],settled_at=r[14],created_at=r[15]))
 
-        opps_rows = con.execute(
-            "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100"
-        ).fetchall()
+        opps_rows = await turso_query(
+            "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100")
         opps = [{"id":r[0],"event":r[1],"sport":r[2],"profit_pct":r[3],
                  "leg1_bm":r[4],"leg1_odds":r[5],"leg2_bm":r[6],"leg2_odds":r[7],
                  "stake1_thb":r[8],"stake2_thb":r[9],"created_at":r[10],"status":r[11]}
                 for r in opps_rows]
 
-        lm_rows = con.execute(
-            "SELECT * FROM line_movements ORDER BY ts DESC LIMIT 200"
-        ).fetchall()
-        lms = []
-        for r in lm_rows:
-            lm = LineMovement(event=r[1], sport=r[2], bookmaker=r[3], outcome=r[4],
-                             odds_before=Decimal(str(r[5])), odds_after=Decimal(str(r[6])),
-                             pct_change=Decimal(str(r[7])), direction=r[8],
-                             is_steam=bool(r[9]), is_rlm=bool(r[10]), ts=r[11])
-            lms.append(lm)
+        lm_rows = await turso_query(
+            "SELECT * FROM line_movements ORDER BY ts DESC LIMIT 200")
+        lms = [LineMovement(
+            event=r[1],sport=r[2],bookmaker=r[3],outcome=r[4],
+            odds_before=Decimal(str(r[5])),odds_after=Decimal(str(r[6])),
+            pct_change=Decimal(str(r[7])),direction=r[8],
+            is_steam=bool(r[9]),is_rlm=bool(r[10]),ts=r[11])
+               for r in lm_rows]
 
-        con.close()
         log.info(f"[DB] loaded: trades={len(trades)}, opps={len(opps)}, moves={len(lms)}")
         return trades, opps, lms
     except Exception as e:
         log.error(f"[DB] load_all: {e}")
         return [], [], []
 
-
 def save_snapshot():
-    """บันทึก scan_count และ auto_scan state"""
     db_save_state("scan_count",     str(scan_count))
     db_save_state("auto_scan",      str(auto_scan))
     db_save_state("last_scan_time", last_scan_time)
@@ -1317,12 +1334,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining
 
-    # ── โหลดข้อมูลจาก DB ──
-    db_init()
-    trade_records, opportunity_log, lms = db_load_all()
-    line_movements.extend(lms)
+    # ── init DB ──
+    db_init()                     # SQLite local (sync, fallback)
+    await turso_init()            # Turso cloud (async)
 
-    # โหลด bot state
+    # โหลด bot state จาก local SQLite ก่อน (เร็ว)
     scan_count     = int(db_load_state("scan_count", "0"))
     last_scan_time = db_load_state("last_scan_time", "ยังไม่ได้สแกน")
     api_remaining  = int(db_load_state("api_remaining", "500"))
@@ -1330,13 +1346,21 @@ async def post_init(app: Application):
     if saved_scan:
         auto_scan = saved_scan.lower() == "true"
 
-    log.info(f"[DB] restored: trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
+    # โหลด records จาก DB (Turso หรือ SQLite)
+    loaded_trades, loaded_opps, lms = await db_load_all()
+    trade_records.extend(loaded_trades)
+    opportunity_log.extend(loaded_opps)
+    line_movements.extend(lms)
+
+    db_mode = "☁️ Turso" if (_turso is not None) else "💾 SQLite local"
+    log.info(f"[DB] {db_mode} | trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
 
     app.add_error_handler(error_handler)
     threading.Thread(target=start_dashboard, daemon=True).start()
 
     is_restored = len(trade_records) > 0 or scan_count > 0
-    restore_note = f"♻️ restored: {len(trade_records)} trades, {scan_count} scans" if is_restored else "🆕 fresh start"
+    db_mode_str  = "☁️ Turso" if (_turso is not None) else "💾 SQLite"
+    restore_note = f"♻️ {db_mode_str}: {len(trade_records)} trades, {scan_count} scans" if is_restored else f"🆕 {db_mode_str}: fresh start"
 
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
