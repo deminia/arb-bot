@@ -1077,7 +1077,7 @@ async def send_alert(opp: ArbOpportunity):
     s2 = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
     w1 = (opp.stake1*opp.leg1.odds*USD_TO_THB).quantize(Decimal("1"))
     w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
-    tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
+    tt = s1 + s2  # ใช้ stake จริง (ไม่ใช่ TOTAL_STAKE_THB) — สำคัญมากเมื่อใช้ Kelly
 
     urgent_prefix = f"{urgency_tag}\n" if urgency_tag else ""
     msg = (
@@ -1126,7 +1126,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
     s2 = natural_round(s2_raw)
     w1 = (opp.stake1*opp.leg1.odds*USD_TO_THB).quantize(Decimal("1"))
     w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
-    tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
+    tt = s1 + s2  # ใช้ stake จริง (ไม่ใช่ TOTAL_STAKE_THB)
 
     # บันทึก trade
     tr = TradeRecord(
