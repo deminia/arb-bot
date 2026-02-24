@@ -1116,6 +1116,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
     )
     trade_records.append(tr)
     db_save_trade(tr)            # 💾 save to DB
+    register_for_settlement(tr, opp.commence)  # 🏆 auto settle
     # อัพเดท opportunity_log
     for entry in opportunity_log:
         if entry["id"] == opp.signal_id:
@@ -1216,14 +1217,24 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     avg_clv = sum(clv_values)/len(clv_values) if clv_values else None
 
     clv_str = f"{avg_clv:+.2f}%" if avg_clv is not None else "ยังไม่มีข้อมูล"
+    # actual P&L จาก settled trades
+    settled   = [t for t in confirmed if t.actual_profit_thb is not None]
+    unsettled = [t for t in confirmed if t.actual_profit_thb is None]
+    actual_profit = sum(t.actual_profit_thb for t in settled)
+    win_trades    = [t for t in settled if t.actual_profit_thb >= 0]
+    lose_trades   = [t for t in settled if t.actual_profit_thb < 0]
+    win_rate      = len(win_trades)/len(settled)*100 if settled else 0
+
     await update.message.reply_text(
         f"💰 *P&L Summary*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Confirmed   : {len(confirmed)} trades\n"
-        f"Rejected    : {len(rejected)} trades\n"
-        f"Est. Profit : ฿{total_profit:,.0f}\n"
+        f"  └ Settled : {len(settled)} | Unsettled: {len(unsettled)}\n"
+        f"  └ Win/Lose: {len(win_trades)}W / {len(lose_trades)}L ({win_rate:.0f}%)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📈 CLV avg  : {clv_str}\n"
+        f"💵 Actual P&L  : *฿{actual_profit:+,}*\n"
+        f"📊 Est. Profit : ฿{int(total_profit):,} _(ยังไม่ settle)_\n"
+        f"📈 CLV avg     : {clv_str}\n"
         f"_(CLV บวก = เอาชนะตลาด)_",
         parse_mode="Markdown",
     )
@@ -1260,7 +1271,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
         f"ล่าสุด      : {last_scan_time}\n"
-        f"รอ confirm  : {len(pending)} | trade: {confirmed}\n"
+        f"รอ confirm  : {len(pending)} | trade: {confirmed} | unsettled: {len(_pending_settlement)}\n"
         f"Line moves  : {len(line_movements)} events\n"
         f"Min profit  : {MIN_PROFIT_PCT:.1%} | Max odds: {MAX_ODDS_ALLOWED}\n"
         f"Cooldown    : {ALERT_COOLDOWN_MIN}m | Staleness: {MAX_ODDS_AGE_MIN}m\n"
@@ -1360,6 +1371,172 @@ def register_closing_watch(opp: "ArbOpportunity"):
             log.info(f"[CLV] watching closing line: {opp.event}")
     except Exception as e:
         log.debug(f"[CLV] register watch: {e}")
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  🏆 AUTO SETTLEMENT — ดึงผลการแข่งขันอัตโนมัติ
+# ══════════════════════════════════════════════════════════════════
+# track trades ที่รอ settle
+_pending_settlement: dict[str, TradeRecord] = {}   # signal_id → trade
+
+
+def register_for_settlement(trade: TradeRecord, commence: str):
+    """เพิ่ม trade เข้า queue รอ settle หลังแข่งเสร็จ"""
+    try:
+        dt = datetime.fromisoformat(commence.replace(" ", "T") + ":00+00:00")
+        _pending_settlement[trade.signal_id] = trade
+        log.info(f"[Settle] registered: {trade.event} | {dt.strftime('%d/%m %H:%M')} UTC")
+    except Exception as e:
+        log.debug(f"[Settle] register error: {e}")
+
+
+async def fetch_scores(sport: str) -> list[dict]:
+    """ดึงผลการแข่งขัน (scores) จาก Odds API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
+                params={"apiKey": ODDS_API_KEY, "daysFrom": 1},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                remaining = int(r.headers.get("x-requests-remaining", api_remaining))
+                await update_quota(remaining)
+                data = await r.json(content_type=None)
+                if isinstance(data, list):
+                    return data
+                return []
+    except Exception as e:
+        log.error(f"[Settle] fetch_scores {sport}: {e}")
+        return []
+
+
+def parse_winner(event: dict) -> Optional[str]:
+    """แกะผลจาก scores endpoint — คืนชื่อทีมที่ชนะ"""
+    scores = event.get("scores")
+    if not scores:
+        return None
+    if not event.get("completed", False):
+        return None
+    # scores = [{"name": "TeamA", "score": "110"}, {"name": "TeamB", "score": "98"}]
+    try:
+        sorted_scores = sorted(scores, key=lambda x: float(x.get("score", 0)), reverse=True)
+        return sorted_scores[0]["name"]  # ทีมที่ได้คะแนนสูงสุด
+    except Exception:
+        return None
+
+
+def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
+    """
+    คำนวณกำไร/ขาดทุนจริง
+    arb ที่ดี: ไม่ว่าใครชนะ = กำไรเสมอ
+    แต่ถ้า execution มีปัญหา (stake ไม่สมดุล, odds เปลี่ยน): อาจขาดทุนได้
+    """
+    total_staked = trade.stake1_thb + trade.stake2_thb
+
+    # หาว่า winner ตรงกับ leg ไหน
+    if fuzzy_match(winner, trade.leg1_bm.split()[0] if " " not in trade.event else trade.event.split(" vs ")[0]):
+        # leg1 ชนะ
+        payout = trade.stake1_thb * trade.leg1_odds
+    else:
+        # leg2 ชนะ
+        payout = trade.stake2_thb * trade.leg2_odds
+
+    profit = int(payout - total_staked)
+    return profit
+
+
+async def settle_completed_trades():
+    """
+    Loop ตรวจสอบผลการแข่งขัน ทุก 5 นาที
+    เมื่อแข่งเสร็จ → คำนวณ actual P&L → แจ้ง Telegram → บันทึก DB
+    """
+    await asyncio.sleep(60)  # รอ bot start ก่อน
+    log.info("[Settle] auto settlement loop started")
+
+    while True:
+        if not _pending_settlement:
+            await asyncio.sleep(300)
+            continue
+
+        # รวม sports ที่ต้องดึงผล
+        sports_needed = set(t.sport for t in _pending_settlement.values())
+        all_scores: dict[str, list] = {}
+
+        for sport in sports_needed:
+            scores = await fetch_scores(sport)
+            all_scores[sport] = scores
+            await asyncio.sleep(1)  # ไม่ spam API
+
+        settled_ids = []
+        for signal_id, trade in _pending_settlement.items():
+            # หา event ที่ตรงกัน
+            sport_scores = all_scores.get(trade.sport, [])
+            matched_event = None
+
+            for ev in sport_scores:
+                home = ev.get("home_team", "")
+                away = ev.get("away_team", "")
+                ev_name = f"{home} vs {away}"
+                if fuzzy_match(home, trade.event.split(" vs ")[0], 0.5) and                    fuzzy_match(away, trade.event.split(" vs ")[-1], 0.5):
+                    matched_event = ev
+                    break
+
+            if not matched_event:
+                continue
+            if not matched_event.get("completed", False):
+                # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
+                try:
+                    ct = datetime.fromisoformat(
+                        matched_event.get("commence_time","").replace("Z","+00:00"))
+                    if (datetime.now(timezone.utc) - ct).total_seconds() > 6 * 3600:
+                        log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
+                except:
+                    pass
+                continue
+
+            # แมตช์เสร็จแล้ว!
+            winner = parse_winner(matched_event)
+            if not winner:
+                continue
+
+            # คำนวณ P&L จริง
+            actual_profit = calc_actual_pnl(trade, winner)
+            total_staked  = trade.stake1_thb + trade.stake2_thb
+            emoji_result  = "✅" if actual_profit >= 0 else "❌"
+            sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
+
+            # อัพเดท trade record
+            trade.actual_profit_thb = actual_profit
+            trade.settled_at        = datetime.now(timezone.utc).isoformat()
+            db_save_trade(trade)
+            settled_ids.append(signal_id)
+
+            log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
+
+            # แจ้ง Telegram
+            msg = (
+                f"{sport_emoji} *SETTLED* \u2014 {trade.event}\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{winner}*\n"
+                f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
+                f"\U0001f4ca \u0e01\u0e33\u0e44\u0e23\u0e08\u0e23\u0e34\u0e07: {emoji_result} *\u0e3f{actual_profit:+,}*\n"
+                f"\U0001f4c8 ROI     : *{actual_profit/total_staked*100:+.2f}%*\n"
+                f"\U0001f194 `{signal_id}`"
+            )
+            if _app:
+                for cid in ALL_CHAT_IDS:
+                    try:
+                        await _app.bot.send_message(
+                            chat_id=cid, text=msg, parse_mode="Markdown")
+                    except Exception as e:
+                        log.error(f"[Settle] notify {cid}: {e}")
+
+        # ลบ trades ที่ settle แล้ว
+        for sid in settled_ids:
+            _pending_settlement.pop(sid, None)
+
+        await asyncio.sleep(300)  # เช็คทุก 5 นาที
 
 
 async def scanner_loop():
@@ -2000,6 +2177,12 @@ async def post_init(app: Application):
     db_mode = "☁️ Turso" if (_turso is not None) else "💾 SQLite local"
     log.info(f"[DB] {db_mode} | trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
 
+    # restore pending settlement — trades ที่ confirmed แต่ยังไม่มีผล
+    for t in trade_records:
+        if t.status == "confirmed" and t.actual_profit_thb is None and t.settled_at is None:
+            _pending_settlement[t.signal_id] = t
+    log.info(f"[Settle] restored {len(_pending_settlement)} unsettled trades")
+
     app.add_error_handler(error_handler)
     threading.Thread(target=start_dashboard, daemon=True).start()
 
@@ -2024,6 +2207,7 @@ async def post_init(app: Application):
     )
     asyncio.create_task(scanner_loop())
     asyncio.create_task(watch_closing_lines())  # 📌 auto CLV
+    asyncio.create_task(settle_completed_trades())  # 🏆 auto settle
 
 
 def handle_shutdown(signum, frame):
