@@ -655,6 +655,15 @@ def calc_arb(odds_a: Decimal, odds_b: Decimal):
     s_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_a, (TOTAL_STAKE - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
+def calc_arb_fixed(odds_a: Decimal, odds_b: Decimal, total: Decimal):
+    """Calc arb with custom total stake (ใช้หลัง cap)"""
+    inv_a, inv_b = Decimal("1")/odds_a, Decimal("1")/odds_b
+    margin = inv_a + inv_b
+    if margin >= 1: return Decimal("0"), Decimal("0"), Decimal("0")
+    profit = (Decimal("1") - margin) / margin
+    s_a = (total * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return profit, s_a, (total - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
 def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
     """5. จำกัด stake ตาม MAX_STAKE ของแต่ละเว็บ"""
     bm  = bookmaker.lower()
@@ -777,9 +786,31 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
                     profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
                     if profit >= MIN_PROFIT_PCT:
-                        # 5. Apply max stake
-                        s_a = apply_max_stake(s_a, best[a].bookmaker)
-                        s_b = apply_max_stake(s_b, best[b].bookmaker)
+                        # 5. Apply max stake — recalc ใหม่ถ้าถูก cap
+                        s_a_capped = apply_max_stake(s_a, best[a].bookmaker)
+                        s_b_capped = apply_max_stake(s_b, best[b].bookmaker)
+                        # ถ้า cap ทำให้ stake เปลี่ยน → recalculate อีกรอบ
+                        if s_a_capped != s_a or s_b_capped != s_b:
+                            # หา limited stake แล้ว recalc ให้สมดุล
+                            if s_a_capped < s_a:
+                                # Leg A ถูก cap → จำกัด total stake แล้ว recalc
+                                limited = s_a_capped * USD_TO_THB
+                                ratio   = Decimal("1") / best[a].odds
+                                margin  = Decimal("1")/best[a].odds + Decimal("1")/best[b].odds
+                                new_total = (limited / USD_TO_THB) / ratio * margin
+                                profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, new_total)
+                            else:
+                                limited = s_b_capped * USD_TO_THB
+                                ratio   = Decimal("1") / best[b].odds
+                                margin  = Decimal("1")/best[a].odds + Decimal("1")/best[b].odds
+                                new_total = (limited / USD_TO_THB) / ratio * margin
+                                profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, new_total)
+                            # ตรวจสอบอีกครั้งว่ายังกำไรอยู่ไหม
+                            if profit < MIN_PROFIT_PCT:
+                                log.debug(f"[ARB] {event_name} skipped after cap — profit={profit:.2%}")
+                                continue
+                        else:
+                            s_a, s_b = s_a_capped, s_b_capped
                         opp = ArbOpportunity(
                             signal_id=str(uuid.uuid4())[:8], sport=sport_key,
                             event=event_name, commence=commence,
