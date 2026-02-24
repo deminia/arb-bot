@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  ARB BOT v7.0  —  Production Ready                                  ║
+║  ARB BOT v8.0  —  Sharp Edition                                      ║
 ║  1.  Odds Staleness Check    7.  Line Movement Alert (Pinnacle)     ║
 ║  2.  Max Odds Filter         8.  Dashboard History Chart            ║
 ║  3.  Alert Cooldown          9.  Multi-chat Support                 ║
@@ -58,6 +58,18 @@ MIN_PROFIT_PCT  = _d("MIN_PROFIT_PCT",  "0.015")
 SCAN_INTERVAL   = _i("SCAN_INTERVAL",   300)
 AUTO_SCAN_START = _s("AUTO_SCAN_START","true").lower() == "true"
 QUOTA_WARN_AT   = _i("QUOTA_WARN_AT",   50)
+
+# Webhook (ใส่ใน Railway Variables)
+WEBHOOK_URL     = _s("WEBHOOK_URL", "https://worker-production-5619.up.railway.app")
+WEBHOOK_PATH    = "/webhook"
+USE_WEBHOOK     = bool(WEBHOOK_URL and "railway.app" in (WEBHOOK_URL or ""))
+
+# Kelly Criterion
+KELLY_FRACTION  = _d("KELLY_FRACTION", "0.25")   # 25% Kelly (conservative)
+BANKROLL_THB    = _d("BANKROLL_THB",   "100000")  # ทุนทั้งหมด (ใช้คำนวณ Kelly)
+USE_KELLY       = _s("USE_KELLY", "true").lower() == "true"
+MIN_KELLY_STAKE = _d("MIN_KELLY_STAKE", "500")    # ขั้นต่ำ
+MAX_KELLY_STAKE = _d("MAX_KELLY_STAKE", "20000")  # สูงสุด
 
 # 1. Odds staleness — ไม่รับ odds ที่เก่ากว่านี้ (นาที)
 MAX_ODDS_AGE_MIN   = _i("MAX_ODDS_AGE_MIN",  5)
@@ -618,15 +630,92 @@ async def async_fetch_odds(session: aiohttp.ClientSession, sport_key: str) -> li
         log.error(f"[OddsAPI] {sport_key}: {e}")
         return []
 
-async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
+async def fetch_poly_market_detail(session: aiohttp.ClientSession, condition_id: str) -> dict:
+    """ดึง orderbook depth + liquidity จริงของ market"""
     try:
+        # ดึง market depth
+        async with session.get(
+            f"https://clob.polymarket.com/book",
+            params={"token_id": condition_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status != 200: return {}
+            book = await r.json(content_type=None)
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            # คำนวณ liquidity top 3 levels
+            bid_liq = sum(float(b.get("size",0)) for b in bids[:3])
+            ask_liq = sum(float(a.get("size",0)) for a in asks[:3])
+            best_bid = float(bids[0]["price"]) if bids else 0
+            best_ask = float(asks[0]["price"]) if asks else 0
+            spread   = best_ask - best_bid if best_bid and best_ask else 0
+            return {
+                "bid_liquidity": bid_liq,
+                "ask_liquidity": ask_liq,
+                "best_bid":      best_bid,
+                "best_ask":      best_ask,
+                "spread":        spread,
+                "mid_price":     (best_bid + best_ask) / 2 if best_bid and best_ask else 0,
+            }
+    except Exception as e:
+        log.debug(f"[Poly orderbook] {condition_id}: {e}")
+        return {}
+
+
+async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
+    """ดึง Polymarket markets พร้อม liquidity จริง"""
+    try:
+        # Step 1: ดึง sports markets เท่านั้น
         async with session.get(
             "https://clob.polymarket.com/markets",
-            params={"active":True,"closed":False},
+            params={"active": True, "closed": False, "tag_slug": "sports"},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             data = await r.json(content_type=None)
-            return data.get("data",[])
+            markets = data.get("data", [])
+
+        if not markets:
+            # fallback — ดึงทั้งหมดถ้า tag ไม่ work
+            async with session.get(
+                "https://clob.polymarket.com/markets",
+                params={"active": True, "closed": False},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                data = await r.json(content_type=None)
+                markets = data.get("data", [])
+
+        # Step 2: ดึง fee จริง (Polymarket fee 2% standard แต่บาง market ต่างกัน)
+        enriched = []
+        for m in markets[:80]:  # limit 80 เพื่อไม่ให้ช้า
+            tokens = m.get("tokens", [])
+            if len(tokens) < 2: continue
+
+            # ดึง fee rate จาก market data
+            fee_rate = float(m.get("maker_base_fee", 0)) + float(m.get("taker_base_fee", 200))
+            fee_pct  = fee_rate / 10000  # basis points → decimal
+
+            # ดึง volume 24h เป็น proxy ของ liquidity
+            volume_24h = float(m.get("volume_num_24hr", 0) or 0)
+            total_vol  = float(m.get("volume", 0) or 0)
+
+            # กรอง market ที่ volume ต่ำเกินไป (< $500 USD)
+            MIN_VOLUME = 500
+            if volume_24h < MIN_VOLUME and total_vol < MIN_VOLUME * 10:
+                continue
+
+            # คำนวณ mid price จาก token prices
+            p_a = float(tokens[0].get("price", 0))
+            p_b = float(tokens[1].get("price", 0))
+            if p_a <= 0.01 or p_b <= 0.01: continue  # กรอง odds ที่สูงเกิน (>100x)
+
+            m["_fee_pct"]    = fee_pct
+            m["_volume_24h"] = volume_24h
+            m["_liquidity"]  = min(volume_24h, total_vol / 30)  # est. daily liquidity
+            enriched.append(m)
+
+        log.info(f"[Polymarket] markets={len(markets)} | filtered={len(enriched)} | sports only")
+        return enriched
+
     except Exception as e:
         log.debug(f"[Polymarket] {e}")
         return []
@@ -663,6 +752,37 @@ def calc_arb_fixed(odds_a: Decimal, odds_b: Decimal, total: Decimal):
     profit = (Decimal("1") - margin) / margin
     s_a = (total * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_a, (total - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> Decimal:
+    """
+    Kelly Criterion สำหรับ Arbitrage
+    ใน arb จริงๆ edge = profit_pct (guaranteed)
+    Kelly = edge / odds_range → แต่ใช้ fractional Kelly เพื่อความปลอดภัย
+
+    Full Kelly = (edge) / (1 - 1/max_odds)
+    Fractional = Full Kelly × KELLY_FRACTION
+    """
+    if not USE_KELLY:
+        return TOTAL_STAKE
+
+    edge = float(profit_pct)  # guaranteed edge
+    # Kelly stake as fraction of bankroll
+    # สำหรับ arb: f* = edge / (1 - min_implied_prob)
+    min_prob = float(min(Decimal("1")/odds_a, Decimal("1")/odds_b))
+    if min_prob >= 1 or edge <= 0:
+        return TOTAL_STAKE
+
+    full_kelly = edge / (1 - min_prob)
+    frac_kelly = full_kelly * float(KELLY_FRACTION)
+
+    # Kelly stake in THB
+    kelly_thb  = Decimal(str(frac_kelly)) * BANKROLL_THB
+    kelly_thb  = max(MIN_KELLY_STAKE, min(MAX_KELLY_STAKE, kelly_thb))
+    kelly_thb  = kelly_thb.quantize(Decimal("100"), rounding=ROUND_DOWN)
+
+    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} stake=฿{int(kelly_thb):,}")
+    return kelly_thb
+
 
 def natural_round(amount_thb: Decimal) -> Decimal:
     """
@@ -729,34 +849,65 @@ def is_on_cooldown(event: str, bm1: str, bm2: str) -> bool:
         return True
     return False
 
+# Minimum liquidity USD สำหรับ Polymarket (ตั้งใน Railway)
+POLY_MIN_LIQUIDITY = float(os.getenv("POLY_MIN_LIQUIDITY", "1000"))
+
 def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     parts = [p.strip() for p in event_name.replace(" vs ","|").split("|")]
     if len(parts) < 2: return None
     ta, tb = parts[0], parts[1]
     best, best_score = None, 0
+
     for m in poly_markets:
         tokens = m.get("tokens",[])
         if len(tokens) < 2: continue
+
+        # ✅ Liquidity check — กรอง market ที่ thin เกินไป
+        liquidity = m.get("_liquidity", 0)
+        if liquidity < POLY_MIN_LIQUIDITY:
+            continue
+
         title = m.get("question","")
         if fuzzy_match(ta, title, 0.3) and fuzzy_match(tb, title, 0.3):
-            score = sum(1 for t in (normalize_team(ta).split()+normalize_team(tb).split()) if t in title.lower())
+            # Score = keyword match + liquidity bonus
+            kw_score = sum(1 for t in (normalize_team(ta).split()+normalize_team(tb).split()) if t in title.lower())
+            liq_bonus = min(3, liquidity / 10000)  # liquidity สูง = score สูงกว่า
+            score = kw_score + liq_bonus
             if score > best_score:
                 best_score, best = score, m
+
     if not best: return None
-    tokens = best.get("tokens",[])
-    pa = Decimal(str(tokens[0].get("price",0)))
-    pb = Decimal(str(tokens[1].get("price",0)))
+
+    tokens   = best.get("tokens",[])
+    pa       = Decimal(str(tokens[0].get("price",0)))
+    pb       = Decimal(str(tokens[1].get("price",0)))
     if pa <= 0 or pb <= 0: return None
-    slug = best.get("slug","")
+
+    # ✅ ใช้ fee จริงจาก API แทน hardcode 2%
+    fee_pct  = Decimal(str(best.get("_fee_pct", 0.02)))
+    liq_usd  = best.get("_liquidity", 0)
+    vol_24h  = best.get("_volume_24h", 0)
+
+    def poly_odds(p: Decimal) -> tuple[Decimal, Decimal]:
+        odds_raw = (Decimal("1") / p).quantize(Decimal("0.001"))
+        # ใช้ fee จริง แทน hardcode
+        odds_eff = (odds_raw * (Decimal("1") - fee_pct)).quantize(Decimal("0.001"))
+        return odds_raw, odds_eff
+
+    slug    = best.get("slug","")
+    odds_raw_a, odds_a = poly_odds(pa)
+    odds_raw_b, odds_b = poly_odds(pb)
+
     return {
         "market_url": f"https://polymarket.com/event/{slug}",
+        "fee_pct":    float(fee_pct),
+        "liquidity":  liq_usd,
+        "volume_24h": vol_24h,
         "team_a": {"name": tokens[0].get("outcome",ta),
-                   "odds_raw": (Decimal("1")/pa).quantize(Decimal("0.001")),
-                   "odds": apply_slippage((Decimal("1")/pa).quantize(Decimal("0.001")),"polymarket"),
+                   "odds_raw": odds_raw_a, "odds": odds_a,
                    "token_id": tokens[0].get("token_id","")},
         "team_b": {"name": tokens[1].get("outcome",tb),
-                   "odds_raw": (Decimal("1")/pb).quantize(Decimal("0.001")),
-                   "odds": apply_slippage((Decimal("1")/pb).quantize(Decimal("0.001")),"polymarket"),
+                   "odds_raw": odds_raw_b, "odds": odds_b,
                    "token_id": tokens[1].get("token_id","")},
     }
 
@@ -814,6 +965,11 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
                     profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
                     if profit >= MIN_PROFIT_PCT:
+                        # Kelly — ปรับ total stake ตาม edge
+                        kelly_total = calc_kelly_stake(best[a].odds, best[b].odds, profit)
+                        if kelly_total != TOTAL_STAKE:
+                            profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds,
+                                                               kelly_total / USD_TO_THB)
                         # 5. Apply max stake — recalc ใหม่ถ้าถูก cap
                         s_a_capped = apply_max_stake(s_a, best[a].bookmaker)
                         s_b_capped = apply_max_stake(s_b, best[b].bookmaker)
@@ -908,7 +1064,7 @@ async def send_alert(opp: ArbOpportunity):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 {opp.commence} UTC {urgency_note}\n"
         f"🏆 `{opp.event}`\n"
-        f"💵 ทุน: *฿{int(tt):,}*  |  Credits: {api_remaining}\n"
+        f"💵 ทุน: *฿{int(tt):,}* {'_(Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"```\n"
         f"{'ช่องทาง':<12} {'ฝั่ง':<15} {'Odds':>5} {'วาง':>8} {'ได้':>8}\n"
@@ -1099,7 +1255,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
     confirmed = len([t for t in trade_records if t.status=="confirmed"])
     await update.message.reply_text(
-        f"📊 *ARB BOT v7.0*\n"
+        f"📊 *ARB BOT v8.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
@@ -1208,7 +1364,7 @@ def register_closing_watch(opp: "ArbOpportunity"):
 
 async def scanner_loop():
     await asyncio.sleep(3)
-    log.info(f"[Scanner] v7.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
+    log.info(f"[Scanner] v8.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
     while True:
         if auto_scan:
             try: await do_scan()
@@ -1224,7 +1380,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <meta http-equiv="refresh" content="20">
-<title>ARB BOT v7.0</title>
+<title>ARB BOT v8.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1263,7 +1419,7 @@ tr:hover td{background:#1c2128}
 </style>
 </head>
 <body>
-<h1>🤖 ARB BOT v7.0</h1>
+<h1>🤖 ARB BOT v8.0</h1>
 <div class="sub">รีเฟรชทุก 20 วินาที — Production Ready + Sharp Money Analytics</div>
 
 <div class="tabs">
@@ -1854,7 +2010,7 @@ async def post_init(app: Application):
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *ARB BOT v7.0 — Production Ready*\n"
+            "🤖 *ARB BOT v8.0 — Production Ready*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"💾 Persistent Storage + Health Check\n"
             f"{restore_note}\n"
@@ -1879,7 +2035,6 @@ def handle_shutdown(signum, frame):
 
 
 if __name__ == "__main__":
-    # Graceful shutdown handlers
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT,  handle_shutdown)
 
@@ -1896,4 +2051,18 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
     app.add_handler(CommandHandler("lines",  cmd_lines))
     _app = app
-    app.run_polling(drop_pending_updates=True)
+
+    if USE_WEBHOOK:
+        # ⚡ Webhook mode — เร็วกว่า polling 10x
+        log.info(f"[Bot] Webhook mode: {WEBHOOK_URL}{WEBHOOK_PATH}")
+        app.run_webhook(
+            listen           = "0.0.0.0",
+            port             = PORT + 1,       # port แยกจาก dashboard
+            url_path         = WEBHOOK_PATH,
+            webhook_url      = f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+            drop_pending_updates = True,
+        )
+    else:
+        # Polling mode (fallback)
+        log.info("[Bot] Polling mode")
+        app.run_polling(drop_pending_updates=True)
