@@ -1,1 +1,1 @@
-worker: python arb_bot.py
+web: python arb_bot.py
