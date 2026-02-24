@@ -10,7 +10,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import asyncio, json, logging, os, re, signal, sqlite3, threading, uuid
+import asyncio, json, logging, os, re, signal, sqlite3, threading, time, uuid
 try:
     import libsql_client as turso_client
     HAS_TURSO = True
@@ -40,15 +40,21 @@ def _d(k,v): return Decimal(os.getenv(k,v))
 def _s(k,v): return os.getenv(k,v)
 def _i(k,v): return int(os.getenv(k,str(v)))
 
-ODDS_API_KEY    = _s("ODDS_API_KEY",    "3eb65e34745253e9240627121408823c")
-TELEGRAM_TOKEN  = _s("TELEGRAM_TOKEN",  "8517689298:AAEgHOYN-zAOwsJ4LMYGQkLeZPTComJP4A8")
-CHAT_ID         = _s("CHAT_ID",         "6415456688")
+ODDS_API_KEY    = _s("ODDS_API_KEY",    "")
+TELEGRAM_TOKEN  = _s("TELEGRAM_TOKEN",  "")
+CHAT_ID         = _s("CHAT_ID",         "")
+
+# Validate required credentials at startup
+for _env_name, _env_val in [("ODDS_API_KEY", ODDS_API_KEY), ("TELEGRAM_TOKEN", TELEGRAM_TOKEN), ("CHAT_ID", CHAT_ID)]:
+    if not _env_val:
+        raise RuntimeError(f"Missing required env var: {_env_name} — set it in Railway Variables")
 EXTRA_CHAT_IDS  = [c.strip() for c in _s("EXTRA_CHAT_IDS","").split(",") if c.strip()]  # 9. multi-chat
 PORT            = _i("PORT",            8080)
 DB_PATH         = _s("DB_PATH",         "/tmp/arb_bot.db")   # local fallback
 TURSO_URL       = _s("TURSO_URL",       "")   # libsql://your-db.turso.io
 TURSO_TOKEN     = _s("TURSO_TOKEN",     "")   # eyJ...
 USE_TURSO       = bool(TURSO_URL and TURSO_TOKEN)
+DASHBOARD_TOKEN = _s("DASHBOARD_TOKEN", "")   # ตั้งใน Railway เพื่อป้องกัน dashboard
 
 TOTAL_STAKE_THB = _d("TOTAL_STAKE_THB","10000")
 USD_TO_THB      = _d("USD_TO_THB",     "35")
@@ -60,7 +66,7 @@ AUTO_SCAN_START = _s("AUTO_SCAN_START","true").lower() == "true"
 QUOTA_WARN_AT   = _i("QUOTA_WARN_AT",   50)
 
 # Webhook (ใส่ใน Railway Variables)
-WEBHOOK_URL     = _s("WEBHOOK_URL", "https://worker-production-5619.up.railway.app")
+WEBHOOK_URL     = _s("WEBHOOK_URL", "")
 WEBHOOK_PATH    = "/webhook"
 USE_WEBHOOK     = bool(WEBHOOK_URL and "railway.app" in (WEBHOOK_URL or ""))
 
@@ -264,10 +270,9 @@ async def turso_exec(sql: str, params: tuple = ()):
             log.error(f"[DB] turso_exec: {e}")
     # SQLite fallback
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(sql, params)
-        con.commit()
-        con.close()
+        with sqlite3.connect(DB_PATH, timeout=10) as con:
+            con.execute(sql, params)
+            con.commit()
     except Exception as e:
         log.error(f"[DB] sqlite_exec: {e}")
 
@@ -281,9 +286,8 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
             log.error(f"[DB] turso_query: {e}")
     # SQLite fallback
     try:
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute(sql, params).fetchall()
-        con.close()
+        with sqlite3.connect(DB_PATH, timeout=10) as con:
+            rows = con.execute(sql, params).fetchall()
         return rows
     except Exception as e:
         log.error(f"[DB] sqlite_query: {e}")
@@ -292,13 +296,12 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
 # ── SQLite local init (fallback) ──────────────────────────────────
 def db_init_local():
     try:
-        con = sqlite3.connect(DB_PATH)
-        for stmt in CREATE_TABLES_SQL.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                con.execute(stmt)
-        con.commit()
-        con.close()
+        with sqlite3.connect(DB_PATH, timeout=10) as con:
+            for stmt in CREATE_TABLES_SQL.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    con.execute(stmt)
+            con.commit()
         log.info(f"[DB] SQLite local at {DB_PATH}")
     except Exception as e:
         log.error(f"[DB] local init: {e}")
@@ -309,7 +312,7 @@ def db_init():
 
 # ── Write helpers ─────────────────────────────────────────────────
 def db_save_trade(t: "TradeRecord"):
-    asyncio.get_event_loop().create_task(_async_save_trade(t))
+    asyncio.get_running_loop().create_task(_async_save_trade(t))
 
 async def _async_save_trade(t: "TradeRecord"):
     await turso_exec(
@@ -322,7 +325,7 @@ async def _async_save_trade(t: "TradeRecord"):
     )
 
 def db_save_opportunity(opp: dict):
-    asyncio.get_event_loop().create_task(_async_save_opp(opp))
+    asyncio.get_running_loop().create_task(_async_save_opp(opp))
 
 async def _async_save_opp(opp: dict):
     await turso_exec(
@@ -333,12 +336,12 @@ async def _async_save_opp(opp: dict):
     )
 
 def db_update_opp_status(signal_id: str, status: str):
-    asyncio.get_event_loop().create_task(
+    asyncio.get_running_loop().create_task(
         turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", (status, signal_id))
     )
 
 def db_save_line_movement(lm: "LineMovement"):
-    asyncio.get_event_loop().create_task(_async_save_lm(lm))
+    asyncio.get_running_loop().create_task(_async_save_lm(lm))
 
 async def _async_save_lm(lm: "LineMovement"):
     await turso_exec(
@@ -352,7 +355,7 @@ async def _async_save_lm(lm: "LineMovement"):
     )
 
 def db_save_state(key: str, value: str):
-    asyncio.get_event_loop().create_task(
+    asyncio.get_running_loop().create_task(
         turso_exec("INSERT OR REPLACE INTO bot_state VALUES (?,?)", (key, value))
     )
 
@@ -363,11 +366,10 @@ async def db_load_state_async(key: str, default: str = "") -> str:
 def db_load_state(key: str, default: str = "") -> str:
     """Sync version (ใช้ SQLite local เท่านั้น สำหรับ startup)"""
     try:
-        con = sqlite3.connect(DB_PATH)
-        row = con.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
-        con.close()
+        with sqlite3.connect(DB_PATH, timeout=10) as con:
+            row = con.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
-    except:
+    except Exception:
         return default
 
 async def db_load_all() -> tuple[list, list, list]:
@@ -453,7 +455,7 @@ async def update_quota(remaining: int):
         if _app:
             for cid in ALL_CHAT_IDS:
                 try: await _app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-                except: pass
+                except Exception: pass
         if critical:
             auto_scan = False
 
@@ -532,7 +534,7 @@ async def detect_line_movements(odds_by_sport: dict):
                                     # ลบ entry เก่ากว่า 5 นาที
                                     steam_tracker[steam_key] = [
                                         (b,t) for b,t in steam_tracker[steam_key]
-                                        if (now-t).seconds < 300
+                                        if (now-t).total_seconds() < 300
                                     ]
                                     is_steam = len(steam_tracker[steam_key]) >= 2
 
@@ -852,7 +854,7 @@ def is_stale(commence_time: str) -> bool:
         # ถ้าแมตช์เริ่มไปแล้วเกิน 3 ชั่วโมง ถือว่า stale
         if ct < datetime.now(timezone.utc) - timedelta(hours=3):
             return True
-    except:
+    except Exception:
         pass
     return False
 
@@ -864,7 +866,7 @@ def is_on_cooldown(event: str, bm1: str, bm2: str) -> bool:
     """3. เช็ค alert cooldown"""
     key      = f"{event}|{bm1}|{bm2}"
     last     = alert_cooldown.get(key)
-    if last and (datetime.now(timezone.utc) - last).seconds < ALERT_COOLDOWN_MIN * 60:
+    if last and (datetime.now(timezone.utc) - last).total_seconds() < ALERT_COOLDOWN_MIN * 60:
         return True
     return False
 
@@ -1032,6 +1034,16 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
 # ══════════════════════════════════════════════════════════════════
 async def send_alert(opp: ArbOpportunity):
     pending[opp.signal_id] = opp
+
+    # ── คำนวณ mins_to_start ก่อนใช้ ──
+    try:
+        commence_dt = datetime.fromisoformat(
+            opp.commence.replace(" ","T") + ":00+00:00"
+        )
+        mins_to_start = (commence_dt - datetime.now(timezone.utc)).total_seconds() / 60
+    except Exception:
+        mins_to_start = 999
+
     entry = {
         "id": opp.signal_id, "event": opp.event, "sport": opp.sport,
         "profit_pct": float(opp.profit_pct),
@@ -1047,15 +1059,6 @@ async def send_alert(opp: ArbOpportunity):
     if len(opportunity_log) > 100: opportunity_log.pop(0)
 
     emoji = SPORT_EMOJI.get(opp.sport,"🏆")
-
-    # ── เช็คว่าแข่งภายใน 120 นาทีไหม ──
-    try:
-        commence_dt = datetime.fromisoformat(
-            opp.commence.replace(" ","T") + ":00+00:00"
-        )
-        mins_to_start = (commence_dt - datetime.now(timezone.utc)).total_seconds() / 60
-    except:
-        mins_to_start = 999
 
     urgent = mins_to_start <= 120 and mins_to_start > 0
     closing_soon = mins_to_start <= 30 and mins_to_start > 0
@@ -1182,7 +1185,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try: action, sid = query.data.split(":",1)
-    except: return
+    except Exception: return
     opp = pending.pop(sid, None)
     if not opp:
         await query.edit_message_text(query.message.text+"\n\n⚠️ หมดอายุ")
@@ -1346,33 +1349,35 @@ _closing_line_watch: dict[str, dict] = {}  # event_key → {sport, commence_dt, 
 async def watch_closing_lines():
     """ดึง closing line อัตโนมัติ 1 นาทีก่อนแข่ง"""
     while True:
-        now = datetime.now(timezone.utc)
-        to_fetch = []
-        done_keys = []
+        try:
+            now = datetime.now(timezone.utc)
+            to_fetch = []
 
-        for key, info in list(_closing_line_watch.items()):
-            if info.get("done"): continue
-            mins_left = (info["commence_dt"] - now).total_seconds() / 60
-            if mins_left <= 1:
-                to_fetch.append((key, info))
-                _closing_line_watch[key]["done"] = True
+            for key, info in list(_closing_line_watch.items()):
+                if info.get("done"): continue
+                mins_left = (info["commence_dt"] - now).total_seconds() / 60
+                if mins_left <= 1:
+                    to_fetch.append((key, info))
+                    _closing_line_watch[key]["done"] = True
 
-        if to_fetch:
-            async with aiohttp.ClientSession() as session:
-                for key, info in to_fetch:
-                    sport = info["sport"]
-                    events = await async_fetch_odds(session, sport)
-                    for event in events:
-                        ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
-                        if ename != info["event"]: continue
-                        for bm in event.get("bookmakers", []):
-                            bk = bm.get("key","")
-                            for mkt in bm.get("markets",[]):
-                                if mkt.get("key") != "h2h": continue
-                                for out in mkt.get("outcomes",[]):
-                                    update_clv(ename, out["name"], bk,
-                                               Decimal(str(out.get("price",1))))
-                        log.info(f"[CLV] closing line saved: {ename}")
+            if to_fetch:
+                async with aiohttp.ClientSession() as session:
+                    for key, info in to_fetch:
+                        sport = info["sport"]
+                        events = await async_fetch_odds(session, sport)
+                        for event in events:
+                            ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
+                            if ename != info["event"]: continue
+                            for bm in event.get("bookmakers", []):
+                                bk = bm.get("key","")
+                                for mkt in bm.get("markets",[]):
+                                    if mkt.get("key") != "h2h": continue
+                                    for out in mkt.get("outcomes",[]):
+                                        update_clv(ename, out["name"], bk,
+                                                   Decimal(str(out.get("price",1))))
+                            log.info(f"[CLV] closing line saved: {ename}")
+        except Exception as e:
+            log.error(f"[CLV] watch_closing_lines crash: {e}", exc_info=True)
 
         await asyncio.sleep(30)
 
@@ -1414,21 +1419,23 @@ def register_for_settlement(trade: TradeRecord, commence: str):
         log.debug(f"[Settle] register error: {e}")
 
 
-async def fetch_scores(sport: str) -> list[dict]:
+async def fetch_scores(sport: str, session: Optional[aiohttp.ClientSession] = None) -> list[dict]:
     """ดึงผลการแข่งขัน (scores) จาก Odds API"""
+    async def _fetch(s: aiohttp.ClientSession):
+        async with s.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
+            params={"apiKey": ODDS_API_KEY, "daysFrom": 1},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            remaining = int(r.headers.get("x-requests-remaining", api_remaining))
+            await update_quota(remaining)
+            data = await r.json(content_type=None)
+            return data if isinstance(data, list) else []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
-                params={"apiKey": ODDS_API_KEY, "daysFrom": 1},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                remaining = int(r.headers.get("x-requests-remaining", api_remaining))
-                await update_quota(remaining)
-                data = await r.json(content_type=None)
-                if isinstance(data, list):
-                    return data
-                return []
+        if session:
+            return await _fetch(session)
+        async with aiohttp.ClientSession() as s:
+            return await _fetch(s)
     except Exception as e:
         log.error(f"[Settle] fetch_scores {sport}: {e}")
         return []
@@ -1491,88 +1498,124 @@ async def settle_completed_trades():
     log.info("[Settle] auto settlement loop started")
 
     while True:
-        if not _pending_settlement:
-            await asyncio.sleep(300)
-            continue
-
-        # รวม sports ที่ต้องดึงผล
-        sports_needed = set(t.sport for t in _pending_settlement.values())
-        all_scores: dict[str, list] = {}
-
-        for sport in sports_needed:
-            scores = await fetch_scores(sport)
-            all_scores[sport] = scores
-            await asyncio.sleep(1)  # ไม่ spam API
-
-        settled_ids = []
-        for signal_id, trade in _pending_settlement.items():
-            # หา event ที่ตรงกัน
-            sport_scores = all_scores.get(trade.sport, [])
-            matched_event = None
-
-            for ev in sport_scores:
-                home = ev.get("home_team", "")
-                away = ev.get("away_team", "")
-                ev_name = f"{home} vs {away}"
-                if fuzzy_match(home, trade.event.split(" vs ")[0], 0.5) and                    fuzzy_match(away, trade.event.split(" vs ")[-1], 0.5):
-                    matched_event = ev
-                    break
-
-            if not matched_event:
-                continue
-            if not matched_event.get("completed", False):
-                # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
-                try:
-                    ct = datetime.fromisoformat(
-                        matched_event.get("commence_time","").replace("Z","+00:00"))
-                    if (datetime.now(timezone.utc) - ct).total_seconds() > 6 * 3600:
-                        log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
-                except:
-                    pass
+        try:
+            if not _pending_settlement:
+                await asyncio.sleep(300)
                 continue
 
-            # แมตช์เสร็จแล้ว!
-            winner = parse_winner(matched_event)
-            if not winner:
-                continue
+            # รวม sports ที่ต้องดึงผล
+            sports_needed = set(t.sport for t in _pending_settlement.values())
+            all_scores: dict[str, list] = {}
 
-            # คำนวณ P&L จริง
-            actual_profit = calc_actual_pnl(trade, winner)
-            total_staked  = trade.stake1_thb + trade.stake2_thb
-            emoji_result  = "✅" if actual_profit >= 0 else "❌"
-            sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
+            async with aiohttp.ClientSession() as session:
+                for sport in sports_needed:
+                    scores = await fetch_scores(sport, session=session)
+                    all_scores[sport] = scores
+                    await asyncio.sleep(1)  # ไม่ spam API
 
-            # อัพเดท trade record
-            trade.actual_profit_thb = actual_profit
-            trade.settled_at        = datetime.now(timezone.utc).isoformat()
-            db_save_trade(trade)
-            settled_ids.append(signal_id)
+            settled_ids = []
+            for signal_id, trade in list(_pending_settlement.items()):
+                # หา event ที่ตรงกัน
+                sport_scores = all_scores.get(trade.sport, [])
+                matched_event = None
 
-            log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
+                for ev in sport_scores:
+                    home = ev.get("home_team", "")
+                    away = ev.get("away_team", "")
+                    ev_name = f"{home} vs {away}"
+                    if fuzzy_match(home, trade.event.split(" vs ")[0], 0.5) and \
+                       fuzzy_match(away, trade.event.split(" vs ")[-1], 0.5):
+                        matched_event = ev
+                        break
 
-            # แจ้ง Telegram
-            msg = (
-                f"{sport_emoji} *SETTLED* \u2014 {trade.event}\n"
-                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{winner}*\n"
-                f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
-                f"\U0001f4ca \u0e01\u0e33\u0e44\u0e23\u0e08\u0e23\u0e34\u0e07: {emoji_result} *\u0e3f{actual_profit:+,}*\n"
-                f"\U0001f4c8 ROI     : *{actual_profit/total_staked*100:+.2f}%*\n"
-                f"\U0001f194 `{signal_id}`"
-            )
-            if _app:
-                for cid in ALL_CHAT_IDS:
+                if not matched_event:
+                    continue
+                if not matched_event.get("completed", False):
+                    # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
                     try:
-                        await _app.bot.send_message(
-                            chat_id=cid, text=msg, parse_mode="Markdown")
-                    except Exception as e:
-                        log.error(f"[Settle] notify {cid}: {e}")
+                        ct = datetime.fromisoformat(
+                            matched_event.get("commence_time","").replace("Z","+00:00"))
+                        if (datetime.now(timezone.utc) - ct).total_seconds() > 6 * 3600:
+                            log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
+                    except Exception:
+                        pass
+                    continue
 
-        # ลบ trades ที่ settle แล้ว
-        for sid in settled_ids:
-            _pending_settlement.pop(sid, None)
+                # แมตช์เสร็จแล้ว!
+                winner = parse_winner(matched_event)
+                if not winner:
+                    continue
+
+                # คำนวณ P&L จริง
+                actual_profit = calc_actual_pnl(trade, winner)
+                total_staked  = trade.stake1_thb + trade.stake2_thb
+                emoji_result  = "✅" if actual_profit >= 0 else "❌"
+                sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
+
+                # อัพเดท trade record
+                trade.actual_profit_thb = actual_profit
+                trade.settled_at        = datetime.now(timezone.utc).isoformat()
+                db_save_trade(trade)
+                settled_ids.append(signal_id)
+
+                log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
+
+                # แจ้ง Telegram
+                msg = (
+                    f"{sport_emoji} *SETTLED* \u2014 {trade.event}\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{winner}*\n"
+                    f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
+                    f"\U0001f4ca \u0e01\u0e33\u0e44\u0e23\u0e08\u0e23\u0e34\u0e07: {emoji_result} *\u0e3f{actual_profit:+,}*\n"
+                    f"\U0001f4c8 ROI     : *{actual_profit/total_staked*100:+.2f}%*\n"
+                    f"\U0001f194 `{signal_id}`"
+                )
+                if _app:
+                    for cid in ALL_CHAT_IDS:
+                        try:
+                            await _app.bot.send_message(
+                                chat_id=cid, text=msg, parse_mode="Markdown")
+                        except Exception as e:
+                            log.error(f"[Settle] notify {cid}: {e}")
+
+            # ลบ trades ที่ settle แล้ว
+            for sid in settled_ids:
+                _pending_settlement.pop(sid, None)
+
+        except Exception as e:
+            log.error(f"[Settle] crash in loop: {e}", exc_info=True)
 
         await asyncio.sleep(300)  # เช็คทุก 5 นาที
+
+
+def periodic_cleanup():
+    """ทำความสะอาด memory — เรียกทุกรอบ scan เพื่อป้องกัน leak ใน 24/7"""
+    now = datetime.now(timezone.utc)
+    # trim trade_records ใน memory (DB ยังเก็บทั้งหมด)
+    if len(trade_records) > 500:
+        trade_records[:] = trade_records[-500:]
+    # ลบ cooldown entries ที่หมดอายุ
+    expired = [k for k, v in alert_cooldown.items()
+               if (now - v).total_seconds() > ALERT_COOLDOWN_MIN * 60 * 2]
+    for k in expired:
+        del alert_cooldown[k]
+    # trim odds_history — เก็บแค่ 500 keys ล่าสุด
+    if len(odds_history) > 500:
+        keys_to_remove = list(odds_history.keys())[:-500]
+        for k in keys_to_remove:
+            del odds_history[k]
+    # trim steam_tracker — ลบ entries เก่า
+    expired_steam = [k for k, v in steam_tracker.items() if not v]
+    for k in expired_steam:
+        del steam_tracker[k]
+    # trim closing_odds — ลบ done entries
+    done_clw = [k for k, v in _closing_line_watch.items() if v.get("done")]
+    for k in done_clw:
+        del _closing_line_watch[k]
+    if len(closing_odds) > 500:
+        keys_to_remove = list(closing_odds.keys())[:-500]
+        for k in keys_to_remove:
+            del closing_odds[k]
 
 
 async def scanner_loop():
@@ -1582,6 +1625,7 @@ async def scanner_loop():
         if auto_scan:
             try: await do_scan()
             except Exception as e: log.error(f"[Scanner] {e}")
+        periodic_cleanup()
         await asyncio.sleep(SCAN_INTERVAL)
 
 
@@ -2113,6 +2157,17 @@ load();
 </html>"""
 
 
+_stats_cache: dict = {"data": None, "ts": 0}
+
+def calc_stats_cached() -> dict:
+    """calc_stats พร้อม cache 15 วินาที — ลดภาระ CPU ตอน dashboard refresh"""
+    if time.time() - _stats_cache["ts"] < 15 and _stats_cache["data"] is not None:
+        return _stats_cache["data"]
+    result = calc_stats()
+    _stats_cache["data"] = result
+    _stats_cache["ts"]   = time.time()
+    return result
+
 def calc_stats() -> dict:
     """คำนวณสถิติทั้งหมดสำหรับ /api/stats"""
     confirmed = [t for t in trade_records if t.status == "confirmed"]
@@ -2266,7 +2321,7 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
             return True, f"USE_KELLY = {USE_KELLY}"
         elif key == "scan_now":
             # trigger scan ทันที
-            asyncio.get_event_loop().create_task(do_scan())
+            asyncio.get_running_loop().create_task(do_scan())
             return True, "scan triggered"
         elif key == "clear_seen":
             seen_signals.clear()
@@ -2279,8 +2334,27 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 
+    def _check_auth(self) -> bool:
+        """ตรวจ Dashboard token (ถ้าตั้งไว้)"""
+        if not DASHBOARD_TOKEN:
+            return True  # ไม่ได้ตั้ง token = ไม่บังคับ auth
+        auth = self.headers.get("Authorization", "")
+        # รองรับทั้ง header และ query param ?token=xxx
+        from urllib.parse import urlparse, parse_qs
+        qs_token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+        if auth == f"Bearer {DASHBOARD_TOKEN}" or qs_token == DASHBOARD_TOKEN:
+            return True
+        self.send_response(401)
+        body = b'{"error":"unauthorized"}'
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
     def do_POST(self):
         """รับ POST จาก Dashboard UI Controls"""
+        if not self._check_auth(): return
         if self.path == "/api/control":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -2309,7 +2383,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        # Health check endpoint สำหรับ Railway
+        # Health check endpoint สำหรับ Railway (ไม่ต้อง auth)
         if self.path == "/health":
             body = b'{"status":"ok"}'
             self.send_response(200)
@@ -2319,7 +2393,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if self.path == "/api/state":
+        if not self._check_auth(): return
+
+        # strip query params for path matching
+        from urllib.parse import urlparse
+        clean_path = urlparse(self.path).path
+
+        if clean_path == "/api/state":
             confirmed = [t for t in trade_records if t.status=="confirmed"]
             rejected  = [t for t in trade_records if t.status=="rejected"]
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
@@ -2363,8 +2443,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length",len(body))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/api/stats":
-            body = json.dumps(calc_stats(), default=str).encode()
+        elif clean_path == "/api/stats":
+            body = json.dumps(calc_stats_cached(), default=str).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
