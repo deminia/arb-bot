@@ -10,7 +10,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import asyncio, json, logging, os, re, threading, uuid
+import asyncio, json, logging, os, re, signal, sqlite3, threading, uuid
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -40,6 +40,7 @@ TELEGRAM_TOKEN  = _s("TELEGRAM_TOKEN",  "8517689298:AAEgHOYN-zAOwsJ4LMYGQkLeZPTC
 CHAT_ID         = _s("CHAT_ID",         "6415456688")
 EXTRA_CHAT_IDS  = [c.strip() for c in _s("EXTRA_CHAT_IDS","").split(",") if c.strip()]  # 9. multi-chat
 PORT            = _i("PORT",            8080)
+DB_PATH         = _s("DB_PATH",         "/data/arb_bot.db")  # persistent volume path
 
 TOTAL_STAKE_THB = _d("TOTAL_STAKE_THB","10000")
 USD_TO_THB      = _d("USD_TO_THB",     "35")
@@ -174,6 +175,208 @@ _app:              Optional[Application]     = None
 # 3. Alert cooldown
 alert_cooldown:    dict[str, datetime]       = {}   # event_key → last_alert_time
 
+_shutdown_event = threading.Event()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  💾 PERSISTENT STORAGE (SQLite)
+# ══════════════════════════════════════════════════════════════════
+def db_init():
+    """สร้าง database และ tables ถ้ายังไม่มี"""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS trade_records (
+            signal_id    TEXT PRIMARY KEY,
+            event        TEXT,
+            sport        TEXT,
+            leg1_bm      TEXT,
+            leg2_bm      TEXT,
+            leg1_odds    REAL,
+            leg2_odds    REAL,
+            stake1_thb   INTEGER,
+            stake2_thb   INTEGER,
+            profit_pct   REAL,
+            status       TEXT,
+            clv_leg1     REAL,
+            clv_leg2     REAL,
+            actual_profit_thb INTEGER,
+            settled_at   TEXT,
+            created_at   TEXT
+        );
+        CREATE TABLE IF NOT EXISTS opportunity_log (
+            id           TEXT PRIMARY KEY,
+            event        TEXT,
+            sport        TEXT,
+            profit_pct   REAL,
+            leg1_bm      TEXT,
+            leg1_odds    REAL,
+            leg2_bm      TEXT,
+            leg2_odds    REAL,
+            stake1_thb   INTEGER,
+            stake2_thb   INTEGER,
+            created_at   TEXT,
+            status       TEXT DEFAULT 'pending'
+        );
+        CREATE TABLE IF NOT EXISTS line_movements (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            event        TEXT,
+            sport        TEXT,
+            bookmaker    TEXT,
+            outcome      TEXT,
+            odds_before  REAL,
+            odds_after   REAL,
+            pct_change   REAL,
+            direction    TEXT,
+            is_steam     INTEGER,
+            is_rlm       INTEGER,
+            ts           TEXT
+        );
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key          TEXT PRIMARY KEY,
+            value        TEXT
+        );
+    """)
+    con.commit()
+    con.close()
+    log.info(f"[DB] initialized at {DB_PATH}")
+
+
+def db_save_trade(t: "TradeRecord"):
+    """บันทึก trade record"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            INSERT OR REPLACE INTO trade_records VALUES
+            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (t.signal_id, t.event, t.sport, t.leg1_bm, t.leg2_bm,
+               t.leg1_odds, t.leg2_odds, t.stake1_thb, t.stake2_thb,
+               t.profit_pct, t.status, t.clv_leg1, t.clv_leg2,
+               t.actual_profit_thb, t.settled_at, t.created_at))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] save_trade: {e}")
+
+
+def db_save_opportunity(opp: dict):
+    """บันทึก opportunity log"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            INSERT OR REPLACE INTO opportunity_log VALUES
+            (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (opp["id"], opp["event"], opp["sport"], opp["profit_pct"],
+               opp["leg1_bm"], opp["leg1_odds"], opp["leg2_bm"], opp["leg2_odds"],
+               opp["stake1_thb"], opp["stake2_thb"], opp["created_at"], opp["status"]))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] save_opportunity: {e}")
+
+
+def db_update_opp_status(signal_id: str, status: str):
+    """อัพเดท status ของ opportunity"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE opportunity_log SET status=? WHERE id=?", (status, signal_id))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] update_status: {e}")
+
+
+def db_save_line_movement(lm: "LineMovement"):
+    """บันทึก line movement"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            INSERT INTO line_movements
+            (event,sport,bookmaker,outcome,odds_before,odds_after,
+             pct_change,direction,is_steam,is_rlm,ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (lm.event, lm.sport, lm.bookmaker, lm.outcome,
+               float(lm.odds_before), float(lm.odds_after), float(lm.pct_change),
+               lm.direction, int(lm.is_steam), int(lm.is_rlm), lm.ts))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] save_line_movement: {e}")
+
+
+def db_save_state(key: str, value: str):
+    """บันทึก bot state"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("INSERT OR REPLACE INTO bot_state VALUES (?,?)", (key, value))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] save_state: {e}")
+
+
+def db_load_state(key: str, default: str = "") -> str:
+    """โหลด bot state"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+        con.close()
+        return row[0] if row else default
+    except:
+        return default
+
+
+def db_load_all() -> tuple[list, list, list]:
+    """โหลดข้อมูลทั้งหมดจาก DB เมื่อ restart"""
+    try:
+        con = sqlite3.connect(DB_PATH)
+
+        trades_rows = con.execute(
+            "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+        trades = []
+        for r in trades_rows:
+            t = TradeRecord(signal_id=r[0], event=r[1], sport=r[2],
+                           leg1_bm=r[3], leg2_bm=r[4], leg1_odds=r[5], leg2_odds=r[6],
+                           stake1_thb=r[7], stake2_thb=r[8], profit_pct=r[9],
+                           status=r[10], clv_leg1=r[11], clv_leg2=r[12],
+                           actual_profit_thb=r[13], settled_at=r[14], created_at=r[15])
+            trades.append(t)
+
+        opps_rows = con.execute(
+            "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+        opps = [{"id":r[0],"event":r[1],"sport":r[2],"profit_pct":r[3],
+                 "leg1_bm":r[4],"leg1_odds":r[5],"leg2_bm":r[6],"leg2_odds":r[7],
+                 "stake1_thb":r[8],"stake2_thb":r[9],"created_at":r[10],"status":r[11]}
+                for r in opps_rows]
+
+        lm_rows = con.execute(
+            "SELECT * FROM line_movements ORDER BY ts DESC LIMIT 200"
+        ).fetchall()
+        lms = []
+        for r in lm_rows:
+            lm = LineMovement(event=r[1], sport=r[2], bookmaker=r[3], outcome=r[4],
+                             odds_before=Decimal(str(r[5])), odds_after=Decimal(str(r[6])),
+                             pct_change=Decimal(str(r[7])), direction=r[8],
+                             is_steam=bool(r[9]), is_rlm=bool(r[10]), ts=r[11])
+            lms.append(lm)
+
+        con.close()
+        log.info(f"[DB] loaded: trades={len(trades)}, opps={len(opps)}, moves={len(lms)}")
+        return trades, opps, lms
+    except Exception as e:
+        log.error(f"[DB] load_all: {e}")
+        return [], [], []
+
+
+def save_snapshot():
+    """บันทึก scan_count และ auto_scan state"""
+    db_save_state("scan_count",     str(scan_count))
+    db_save_state("auto_scan",      str(auto_scan))
+    db_save_state("last_scan_time", last_scan_time)
+    db_save_state("api_remaining",  str(api_remaining))
+
 # 7/10/11. Line movement tracking
 odds_history:      dict[str, dict]           = defaultdict(dict)  # event+outcome → {bm: odds}
 line_movements:    list[LineMovement]        = []   # ประวัติ line move
@@ -298,6 +501,7 @@ async def detect_line_movements(odds_by_sport: dict):
                                     )
                                     new_movements.append(lm)
                                     line_movements.append(lm)
+                                    db_save_line_movement(lm)  # 💾
                                     log.info(f"[LineMove] {ename} | {bn} {outcome} {float(old_odds):.3f}→{float(new_odds):.3f} ({pct:.1%}) {'🌊STEAM' if is_steam else ''} {'🔄RLM' if is_rlm else ''}")
 
                         # อัพเดท history
@@ -577,7 +781,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
 # ══════════════════════════════════════════════════════════════════
 async def send_alert(opp: ArbOpportunity):
     pending[opp.signal_id] = opp
-    opportunity_log.append({
+    entry = {
         "id": opp.signal_id, "event": opp.event, "sport": opp.sport,
         "profit_pct": float(opp.profit_pct),
         "leg1_bm": opp.leg1.bookmaker, "leg1_odds": float(opp.leg1.odds),
@@ -585,7 +789,9 @@ async def send_alert(opp: ArbOpportunity):
         "stake1_thb": int(opp.stake1*USD_TO_THB),
         "stake2_thb": int(opp.stake2*USD_TO_THB),
         "created_at": opp.created_at, "status": "pending",
-    })
+    }
+    opportunity_log.append(entry)
+    db_save_opportunity(entry)   # 💾 save to DB
     if len(opportunity_log) > 100: opportunity_log.pop(0)
 
     emoji = SPORT_EMOJI.get(opp.sport,"🏆")
@@ -648,10 +854,12 @@ async def execute_both(opp: ArbOpportunity) -> str:
         profit_pct=float(opp.profit_pct), status="confirmed",
     )
     trade_records.append(tr)
+    db_save_trade(tr)            # 💾 save to DB
     # อัพเดท opportunity_log
     for entry in opportunity_log:
         if entry["id"] == opp.signal_id:
             entry["status"] = "confirmed"
+    db_update_opp_status(opp.signal_id, "confirmed")  # 💾
 
     def steps(leg, stake):
         bm  = leg.bookmaker.lower()
@@ -700,13 +908,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if entry["id"] == sid: entry["status"] = action
     orig = query.message.text
     if action == "reject":
-        trade_records.append(TradeRecord(
+        tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
             leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
             leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
             stake1_thb=int(opp.stake1*USD_TO_THB), stake2_thb=int(opp.stake2*USD_TO_THB),
             profit_pct=float(opp.profit_pct), status="rejected",
-        ))
+        )
+        trade_records.append(tr_rej)
+        db_save_trade(tr_rej)    # 💾
+        db_update_opp_status(sid, "rejected")  # 💾
         await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         return
     await query.edit_message_text(orig+"\n\n⏳ *กำลังเตรียม...*", parse_mode="Markdown")
@@ -830,6 +1041,7 @@ async def do_scan() -> int:
     if len(seen_signals) > 500: seen_signals.clear()
     scan_count    += 1
     last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
+    save_snapshot()   # 💾 บันทึก state
     return sent
 
 
@@ -1023,6 +1235,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 
     def do_GET(self):
+        # Health check endpoint สำหรับ Railway
+        if self.path == "/health":
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path == "/api/state":
             confirmed = [t for t in trade_records if t.status=="confirmed"]
             rejected  = [t for t in trade_records if t.status=="rejected"]
@@ -1093,14 +1315,36 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
+    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining
+
+    # ── โหลดข้อมูลจาก DB ──
+    db_init()
+    trade_records, opportunity_log, lms = db_load_all()
+    line_movements.extend(lms)
+
+    # โหลด bot state
+    scan_count     = int(db_load_state("scan_count", "0"))
+    last_scan_time = db_load_state("last_scan_time", "ยังไม่ได้สแกน")
+    api_remaining  = int(db_load_state("api_remaining", "500"))
+    saved_scan     = db_load_state("auto_scan", "")
+    if saved_scan:
+        auto_scan = saved_scan.lower() == "true"
+
+    log.info(f"[DB] restored: trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
+
     app.add_error_handler(error_handler)
     threading.Thread(target=start_dashboard, daemon=True).start()
+
+    is_restored = len(trade_records) > 0 or scan_count > 0
+    restore_note = f"♻️ restored: {len(trade_records)} trades, {scan_count} scans" if is_restored else "🆕 fresh start"
+
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *ARB BOT v6.0 — Complete Edition*\n"
+            "🤖 *ARB BOT v7.0 — Production Ready*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"✅ 12 Features ครบ\n"
+            f"💾 Persistent Storage + Health Check\n"
+            f"{restore_note}\n"
             f"Sports    : {' '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
             f"Min profit: {MIN_PROFIT_PCT:.1%} | Max odds: {MAX_ODDS_ALLOWED}\n"
             f"ทุน/trade : ฿{int(TOTAL_STAKE_THB):,} | Cooldown: {ALERT_COOLDOWN_MIN}m\n"
@@ -1112,7 +1356,19 @@ async def post_init(app: Application):
     asyncio.create_task(scanner_loop())
 
 
+def handle_shutdown(signum, frame):
+    """Graceful shutdown — บันทึก state ก่อนปิด"""
+    log.info("[Shutdown] กำลังบันทึก state...")
+    save_snapshot()
+    log.info("[Shutdown] saved. Bye!")
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    # Graceful shutdown handlers
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT,  handle_shutdown)
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
