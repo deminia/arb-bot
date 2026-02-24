@@ -664,6 +664,34 @@ def calc_arb_fixed(odds_a: Decimal, odds_b: Decimal, total: Decimal):
     s_a = (total * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_a, (total - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
+def natural_round(amount_thb: Decimal) -> Decimal:
+    """
+    ปัดตัวเลขให้ดูเป็นธรรมชาติ ไม่ให้เว็บจับได้ว่าใช้บอท
+    หลักการ: ปัดไปหาเลขกลมที่ใกล้ที่สุด โดย randomize เล็กน้อย
+    ฿1,234.56 → ฿1,230 หรือ ฿1,240 (random ±)
+    """
+    import random
+    amt = int(amount_thb)
+    if amt < 500:
+        # ปัดไป 10
+        base = round(amt / 10) * 10
+        jitter = random.choice([-10, 0, 10])
+    elif amt < 2000:
+        # ปัดไป 50
+        base = round(amt / 50) * 50
+        jitter = random.choice([-50, 0, 50])
+    elif amt < 10000:
+        # ปัดไป 100
+        base = round(amt / 100) * 100
+        jitter = random.choice([-100, 0, 100])
+    else:
+        # ปัดไป 500
+        base = round(amt / 500) * 500
+        jitter = random.choice([-500, 0, 500])
+    result = max(100, base + jitter)
+    return Decimal(str(result))
+
+
 def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
     """5. จำกัด stake ตาม MAX_STAKE ของแต่ละเว็บ"""
     bm  = bookmaker.lower()
@@ -837,22 +865,48 @@ async def send_alert(opp: ArbOpportunity):
         "stake1_thb": int(opp.stake1*USD_TO_THB),
         "stake2_thb": int(opp.stake2*USD_TO_THB),
         "created_at": opp.created_at, "status": "pending",
+        "mins_to_start": round(mins_to_start) if mins_to_start < 9999 else 9999,
     }
     opportunity_log.append(entry)
     db_save_opportunity(entry)   # 💾 save to DB
     if len(opportunity_log) > 100: opportunity_log.pop(0)
 
     emoji = SPORT_EMOJI.get(opp.sport,"🏆")
+
+    # ── เช็คว่าแข่งภายใน 120 นาทีไหม ──
+    try:
+        commence_dt = datetime.fromisoformat(
+            opp.commence.replace(" ","T") + ":00+00:00"
+        )
+        mins_to_start = (commence_dt - datetime.now(timezone.utc)).total_seconds() / 60
+    except:
+        mins_to_start = 999
+
+    urgent = mins_to_start <= 120 and mins_to_start > 0
+    closing_soon = mins_to_start <= 30 and mins_to_start > 0
+
+    if closing_soon:
+        urgency_tag = "🔴 *CLOSING SOON* — CLV สูงสุด!"
+        urgency_note = f"⏰ เหลือ *{int(mins_to_start)} นาที* — ราคาใกล้ปิด CLV แม่นที่สุด"
+    elif urgent:
+        urgency_tag = "🟡 *แข่งเร็วๆ นี้* — CLV ดี"
+        urgency_note = f"⏰ เหลือ *{int(mins_to_start)} นาที* — ยังได้ closing line ที่ดี"
+    else:
+        urgency_tag = ""
+        urgency_note = ""
+
     s1 = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2 = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
     w1 = (opp.stake1*opp.leg1.odds*USD_TO_THB).quantize(Decimal("1"))
     w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
     tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
 
+    urgent_prefix = f"{urgency_tag}\n" if urgency_tag else ""
     msg = (
+        f"{urgent_prefix}"
         f"{emoji} *ARB FOUND — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 {opp.commence} UTC\n"
+        f"📅 {opp.commence} UTC {urgency_note}\n"
         f"🏆 `{opp.event}`\n"
         f"💵 ทุน: *฿{int(tt):,}*  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -887,8 +941,11 @@ async def send_alert(opp: ArbOpportunity):
 #  EXECUTE
 # ══════════════════════════════════════════════════════════════════
 async def execute_both(opp: ArbOpportunity) -> str:
-    s1 = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
-    s2 = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
+    s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
+    s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
+    # 🎭 Natural rounding — ป้องกันโดนจับว่าใช้บอท
+    s1 = natural_round(s1_raw)
+    s2 = natural_round(s2_raw)
     w1 = (opp.stake1*opp.leg1.odds*USD_TO_THB).quantize(Decimal("1"))
     w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
     tt = TOTAL_STAKE_THB.quantize(Decimal("1"))
@@ -1091,6 +1148,62 @@ async def do_scan() -> int:
     last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
     save_snapshot()   # 💾 บันทึก state
     return sent
+
+
+# track events ที่รอดึง closing line
+_closing_line_watch: dict[str, dict] = {}  # event_key → {sport, commence_dt, done}
+
+async def watch_closing_lines():
+    """ดึง closing line อัตโนมัติ 1 นาทีก่อนแข่ง"""
+    while True:
+        now = datetime.now(timezone.utc)
+        to_fetch = []
+        done_keys = []
+
+        for key, info in list(_closing_line_watch.items()):
+            if info.get("done"): continue
+            mins_left = (info["commence_dt"] - now).total_seconds() / 60
+            if mins_left <= 1:
+                to_fetch.append((key, info))
+                _closing_line_watch[key]["done"] = True
+
+        if to_fetch:
+            async with aiohttp.ClientSession() as session:
+                for key, info in to_fetch:
+                    sport = info["sport"]
+                    events = await async_fetch_odds(session, sport)
+                    for event in events:
+                        ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
+                        if ename != info["event"]: continue
+                        for bm in event.get("bookmakers", []):
+                            bk = bm.get("key","")
+                            for mkt in bm.get("markets",[]):
+                                if mkt.get("key") != "h2h": continue
+                                for out in mkt.get("outcomes",[]):
+                                    update_clv(ename, out["name"], bk,
+                                               Decimal(str(out.get("price",1))))
+                        log.info(f"[CLV] closing line saved: {ename}")
+
+        await asyncio.sleep(30)
+
+
+def register_closing_watch(opp: "ArbOpportunity"):
+    """เพิ่ม event เข้า watchlist สำหรับ closing line"""
+    try:
+        commence_dt = datetime.fromisoformat(
+            opp.commence.replace(" ","T") + ":00+00:00"
+        )
+        key = f"{opp.event}|{opp.sport}"
+        if key not in _closing_line_watch:
+            _closing_line_watch[key] = {
+                "event":       opp.event,
+                "sport":       opp.sport,
+                "commence_dt": commence_dt,
+                "done":        False,
+            }
+            log.info(f"[CLV] watching closing line: {opp.event}")
+    except Exception as e:
+        log.debug(f"[CLV] register watch: {e}")
 
 
 async def scanner_loop():
@@ -1354,7 +1467,8 @@ function renderTab(tab, d) {
       return `<tr><td>${o.event}</td><td>${o.leg1_bm} @${o.leg1_odds.toFixed(2)}</td>
         <td>${o.leg2_bm} @${o.leg2_odds.toFixed(2)}</td>
         <td class="profit">+${(o.profit_pct*100).toFixed(2)}%</td>
-        <td>${t}</td><td><span class="badge ${bc}">${bl}</span></td></tr>`;
+        <td>${t}</td>
+        <td><span class="badge ${bc}">${bl}</span>${o.mins_to_start<=30&&o.mins_to_start>0?' <span class="badge" style="background:#3d1a1a;color:#f85149">🔴CLOSING</span>':o.mins_to_start<=120&&o.mins_to_start>0?' <span class="badge" style="background:#2d2a1a;color:#d29922">⏰120m</span>':''}</td></tr>`;
     }).join('');
     document.getElementById('oppBody').innerHTML = oppRows||'<tr><td colspan="6" style="text-align:center;color:#8b949e;padding:20px">ยังไม่พบ opportunity</td></tr>';
   }
@@ -1753,6 +1867,7 @@ async def post_init(app: Application):
         ),
     )
     asyncio.create_task(scanner_loop())
+    asyncio.create_task(watch_closing_lines())  # 📌 auto CLV
 
 
 def handle_shutdown(signum, frame):
