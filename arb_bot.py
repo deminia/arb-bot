@@ -1115,168 +1115,505 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}
-h1{color:#58a6ff;font-size:1.4rem;margin-bottom:2px}
-.sub{color:#8b949e;font-size:.8rem;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
-.card .label{color:#8b949e;font-size:.7rem;text-transform:uppercase;letter-spacing:.5px}
-.card .value{font-size:1.5rem;font-weight:700;margin-top:4px}
-.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}.purple{color:#bc8cff}
-.quota-wrap{margin-bottom:16px}
-.quota-bar{background:#21262d;border-radius:4px;height:6px;overflow:hidden}
-.quota-fill{height:100%;border-radius:4px;transition:width .3s}
-.quota-text{color:#8b949e;font-size:.72rem;margin-top:4px}
-.section{color:#8b949e;font-size:.75rem;text-transform:uppercase;letter-spacing:.5px;margin:16px 0 8px}
-table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:16px}
-th{background:#21262d;color:#8b949e;font-size:.7rem;text-transform:uppercase;padding:8px 12px;text-align:left}
-td{padding:8px 12px;border-top:1px solid #21262d;font-size:.82rem}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:16px}
+h1{color:#58a6ff;font-size:1.3rem;margin-bottom:2px}
+.sub{color:#8b949e;font-size:.75rem;margin-bottom:12px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #30363d;padding-bottom:0}
+.tab{padding:8px 16px;cursor:pointer;color:#8b949e;font-size:.85rem;border-radius:6px 6px 0 0;border:1px solid transparent;border-bottom:none;margin-bottom:-1px}
+.tab.active{color:#e6edf3;background:#161b22;border-color:#30363d;border-bottom-color:#161b22}
+.tab:hover:not(.active){color:#e6edf3;background:#1c2128}
+.page{display:none}.page.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:12px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+.card .lbl{color:#8b949e;font-size:.68rem;text-transform:uppercase;letter-spacing:.5px}
+.card .val{font-size:1.4rem;font-weight:700;margin-top:2px}
+.card .sub2{color:#8b949e;font-size:.7rem;margin-top:2px}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}.purple{color:#bc8cff}.orange{color:#fb8f44}
+.quota-bar{background:#21262d;border-radius:3px;height:5px;overflow:hidden;margin:4px 0}
+.quota-fill{height:100%;border-radius:3px;transition:width .3s}
+.qtext{color:#8b949e;font-size:.7rem;margin-bottom:12px}
+.sec{color:#8b949e;font-size:.7rem;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:12px}
+th{background:#21262d;color:#8b949e;font-size:.68rem;text-transform:uppercase;padding:7px 10px;text-align:left}
+td{padding:7px 10px;border-top:1px solid #21262d;font-size:.8rem}
 tr:hover td{background:#1c2128}
-.badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:.68rem;font-weight:600}
+.badge{display:inline-block;padding:1px 6px;border-radius:10px;font-size:.65rem;font-weight:600}
 .bp{background:#1f3d5c;color:#58a6ff}.bc{background:#1a3a2a;color:#3fb950}.br{background:#3d1f1f;color:#f85149}
-.profit{color:#3fb950;font-weight:700}
-.steam{color:#58a6ff}.rlm{color:#bc8cff}
-.chart-wrap{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
-.two-col{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-@media(max-width:600px){.two-col{grid-template-columns:1fr}}
+.brlm{background:#2d1f4a;color:#bc8cff}.bsteam{background:#1a2d4a;color:#58a6ff}
+.profit{color:#3fb950;font-weight:700}.loss{color:#f85149;font-weight:700}
+.cw{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.wr-ring{display:flex;align-items:center;gap:12px;padding:8px 0}
+.ring{width:64px;height:64px;flex-shrink:0}
+@media(max-width:600px){.two,.three{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <h1>🤖 ARB BOT v7.0</h1>
-<div class="sub">รีเฟรชทุก 20 วินาที — Fuzzy Match + Async + Slippage + Line Movement + CLV</div>
+<div class="sub">รีเฟรชทุก 20 วินาที — Production Ready + Sharp Money Analytics</div>
 
-<div class="grid" id="stats"></div>
-<div class="quota-wrap">
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('overview')">📊 Overview</div>
+  <div class="tab" onclick="switchTab('linelog')">📡 Line Moves</div>
+  <div class="tab" onclick="switchTab('stats')">🔬 Statistics</div>
+  <div class="tab" onclick="switchTab('trades')">💰 Trades</div>
+</div>
+
+<!-- ═══ TAB 1: OVERVIEW ═══ -->
+<div id="page-overview" class="page active">
+  <div class="grid" id="overviewCards"></div>
   <div class="quota-bar"><div class="quota-fill" id="qFill"></div></div>
-  <div class="quota-text" id="qText"></div>
+  <div class="qtext" id="qText"></div>
+  <div class="two">
+    <div class="cw"><div class="sec">📈 Profit Opportunity History</div><canvas id="profitChart" height="150"></canvas></div>
+    <div class="cw"><div class="sec">📡 Line Movement Flow</div><canvas id="lineFlowChart" height="150"></canvas></div>
+  </div>
+  <div class="sec">📋 Opportunity Log ล่าสุด</div>
+  <table>
+    <thead><tr><th>Event</th><th>Leg 1</th><th>Leg 2</th><th>Profit</th><th>เวลา</th><th>Status</th></tr></thead>
+    <tbody id="oppBody"></tbody>
+  </table>
 </div>
 
-<div class="two-col">
-  <div class="chart-wrap">
-    <div class="section">📈 Profit Opportunity History</div>
-    <canvas id="profitChart" height="140"></canvas>
+<!-- ═══ TAB 2: LINE MOVES ═══ -->
+<div id="page-linelog" class="page">
+  <div class="two">
+    <div class="cw"><div class="sec">💧 Price Flow — odds เปลี่ยนตามเวลา</div><canvas id="priceFlowChart" height="180"></canvas></div>
+    <div class="cw"><div class="sec">🌊 Steam vs 🔄 RLM Count</div><canvas id="signalTypeChart" height="180"></canvas></div>
   </div>
-  <div class="chart-wrap">
-    <div class="section">📡 Line Movements</div>
-    <canvas id="lineChart" height="140"></canvas>
-  </div>
+  <div class="sec">🌊 Line Movement Log</div>
+  <table>
+    <thead><tr><th>Event</th><th>Bookmaker</th><th>Outcome</th><th>Before→After</th><th>Change</th><th>Signal</th><th>เวลา</th></tr></thead>
+    <tbody id="lineBody"></tbody>
+  </table>
 </div>
 
-<div class="section">🌊 Line Movement Log</div>
-<table>
-  <thead><tr><th>Event</th><th>Bookmaker</th><th>Outcome</th><th>Before</th><th>After</th><th>Change</th><th>Type</th><th>เวลา</th></tr></thead>
-  <tbody id="lineBody"></tbody>
-</table>
+<!-- ═══ TAB 3: STATISTICS ═══ -->
+<div id="page-stats" class="page">
+  <!-- Win Rate Section -->
+  <div class="three">
+    <div class="cw">
+      <div class="sec">🔄 RLM Win Rate</div>
+      <div class="wr-ring">
+        <svg class="ring" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#bc8cff" stroke-width="3"
+            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
+            id="rlmRing"/>
+        </svg>
+        <div>
+          <div class="val purple" id="rlmWR">—</div>
+          <div class="sub2" id="rlmCount">0 signals</div>
+          <div class="sub2" style="font-size:.65rem;margin-top:2px">Pinnacle ขยับ = sharp money</div>
+        </div>
+      </div>
+    </div>
+    <div class="cw">
+      <div class="sec">🌊 Steam Win Rate</div>
+      <div class="wr-ring">
+        <svg class="ring" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#58a6ff" stroke-width="3"
+            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
+            id="steamRing"/>
+        </svg>
+        <div>
+          <div class="val blue" id="steamWR">—</div>
+          <div class="sub2" id="steamCount">0 signals</div>
+          <div class="sub2" style="font-size:.65rem;margin-top:2px">หลายเว็บขยับพร้อมกัน</div>
+        </div>
+      </div>
+    </div>
+    <div class="cw">
+      <div class="sec">📊 Overall Arb Win Rate</div>
+      <div class="wr-ring">
+        <svg class="ring" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#3fb950" stroke-width="3"
+            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
+            id="arbRing"/>
+        </svg>
+        <div>
+          <div class="val green" id="arbWR">—</div>
+          <div class="sub2" id="arbCount">0 trades</div>
+          <div class="sub2" style="font-size:.65rem;margin-top:2px">Confirmed / total</div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-<div class="section">📋 Opportunity Log</div>
-<table>
-  <thead><tr><th>Event</th><th>Leg 1</th><th>Leg 2</th><th>Profit</th><th>ทุน</th><th>เวลา</th><th>Status</th></tr></thead>
-  <tbody id="oppBody"></tbody>
-</table>
+  <!-- Sharp vs Public + Bookmaker Accuracy -->
+  <div class="two">
+    <div class="cw">
+      <div class="sec">💎 Sharp vs Public Money</div>
+      <canvas id="sharpPublicChart" height="160"></canvas>
+      <div id="sharpNote" style="color:#8b949e;font-size:.72rem;margin-top:6px"></div>
+    </div>
+    <div class="cw">
+      <div class="sec">🎯 Bookmaker Accuracy (vs closing line)</div>
+      <canvas id="bmAccChart" height="160"></canvas>
+    </div>
+  </div>
 
-<div class="section">💰 P&L Summary</div>
-<div id="pnl" class="card" style="margin-bottom:16px"></div>
+  <!-- ROI per Sport -->
+  <div class="cw">
+    <div class="sec">💹 ROI ต่อ Sport</div>
+    <canvas id="roiChart" height="130"></canvas>
+  </div>
+
+  <!-- CLV Summary -->
+  <div class="grid" id="clvCards"></div>
+</div>
+
+<!-- ═══ TAB 4: TRADES ═══ -->
+<div id="page-trades" class="page">
+  <div class="grid" id="pnlCards"></div>
+  <div class="sec">📝 Trade History</div>
+  <table>
+    <thead><tr><th>Event</th><th>Sport</th><th>Leg 1</th><th>Leg 2</th><th>Profit%</th><th>ทุน</th><th>CLV</th><th>Status</th><th>เวลา</th></tr></thead>
+    <tbody id="tradeBody"></tbody>
+  </table>
+</div>
 
 <script>
-let profitChart, lineChart;
+let charts = {};
+let currentTab = 'overview';
+let lastData = null;
 
-function initCharts(opps, moves) {
-  // Profit chart
-  const labels = opps.slice(-20).map(o => o.event.split(' vs ')[0].substring(0,10));
-  const data   = opps.slice(-20).map(o => +(o.profit_pct*100).toFixed(2));
-  const ctx1   = document.getElementById('profitChart').getContext('2d');
-  if (profitChart) profitChart.destroy();
-  profitChart = new Chart(ctx1, {
-    type:'bar',
-    data:{labels, datasets:[{label:'Profit %', data,
-      backgroundColor: data.map(v => v>2?'#3fb950':v>1?'#d29922':'#58a6ff'),
-      borderRadius:4}]},
-    options:{plugins:{legend:{display:false}},scales:{
-      x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},
-      y:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'},
-         title:{display:true,text:'%',color:'#8b949e',font:{size:9}}}
-    }}
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const names = ['overview','linelog','stats','trades'];
+    t.classList.toggle('active', names[i]===name);
   });
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  if (lastData) renderTab(name, lastData);
+}
 
-  // Line movement chart
-  const lmLabels = moves.slice(-15).map(m => m.event.split(' vs ')[0].substring(0,8));
-  const lmData   = moves.slice(-15).map(m => +(m.pct_change*100).toFixed(2));
-  const ctx2     = document.getElementById('lineChart').getContext('2d');
-  if (lineChart) lineChart.destroy();
-  lineChart = new Chart(ctx2, {
-    type:'bar',
-    data:{labels:lmLabels, datasets:[{label:'Move %', data:lmData,
-      backgroundColor: lmData.map(v => v<0?'#f85149':'#3fb950'),
-      borderRadius:4}]},
-    options:{plugins:{legend:{display:false}},scales:{
-      x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},
-      y:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'},
-         title:{display:true,text:'%',color:'#8b949e',font:{size:9}}}
-    }}
+function mkChart(id, type, labels, datasets, opts={}) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(ctx, {
+    type,
+    data:{labels, datasets},
+    options:{
+      responsive:true,
+      plugins:{legend:{display:opts.legend??false,labels:{color:'#8b949e',font:{size:10}}},
+               tooltip:{callbacks:{label: ctx => opts.tooltipFn ? opts.tooltipFn(ctx) : ctx.formattedValue}}},
+      scales: type==='pie'||type==='doughnut' ? {} : {
+        x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},
+        y:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'},
+           ...(opts.yTitle?{title:{display:true,text:opts.yTitle,color:'#8b949e',font:{size:9}}}:{})}
+      }
+    }
   });
 }
 
+function setRing(id, pct, color) {
+  const el = document.getElementById(id);
+  if (el) el.setAttribute('stroke-dasharray', `${pct} ${100-pct}`);
+}
+
+function renderTab(tab, d) {
+  const s = d.stats || {};
+  const lm = d.line_movements || [];
+  const opps = d.opportunities || [];
+  const trades = d.trade_records || [];
+
+  if (tab === 'overview') {
+    const qPct = Math.round((d.api_remaining/500)*100);
+    const qColor = qPct>30?'#3fb950':qPct>10?'#d29922':'#f85149';
+    document.getElementById('overviewCards').innerHTML = `
+      <div class="card"><div class="lbl">Auto Scan</div><div class="val ${d.auto_scan?'green':'red'}">${d.auto_scan?'🟢 ON':'🔴 OFF'}</div></div>
+      <div class="card"><div class="lbl">สแกน</div><div class="val blue">${d.scan_count} รอบ</div></div>
+      <div class="card"><div class="lbl">รอ Confirm</div><div class="val yellow">${d.pending_count}</div></div>
+      <div class="card"><div class="lbl">API Credits</div><div class="val" style="color:${qColor}">${d.api_remaining}</div></div>
+      <div class="card"><div class="lbl">Line Moves</div><div class="val purple">${d.line_move_count}</div></div>
+      <div class="card"><div class="lbl">Trades</div><div class="val green">${d.confirmed_trades}</div></div>
+    `;
+    document.getElementById('qFill').style.cssText=`width:${qPct}%;background:${qColor}`;
+    document.getElementById('qText').textContent=`Credits ${d.api_remaining}/500 (${qPct}%) | เตือนที่ ${d.quota_warn_at} | ${d.last_scan_time}`;
+
+    const pLabels = opps.slice(-20).map(o=>o.event.split(' vs ')[0].substring(0,8));
+    const pData   = opps.slice(-20).map(o=>+(o.profit_pct*100).toFixed(2));
+    mkChart('profitChart','bar',pLabels,[{label:'Profit%',data:pData,
+      backgroundColor:pData.map(v=>v>2?'#3fb950':v>1?'#d29922':'#58a6ff'),borderRadius:3}],{yTitle:'%'});
+
+    const lmLabels = lm.slice(-20).map(m=>m.event.split(' vs ')[0].substring(0,6));
+    const lmData   = lm.slice(-20).map(m=>+(m.pct_change*100).toFixed(2));
+    mkChart('lineFlowChart','bar',lmLabels,[{label:'Move%',data:lmData,
+      backgroundColor:lmData.map(v=>v<0?'#f85149':'#3fb950'),borderRadius:3}],{yTitle:'%'});
+
+    const oppRows = opps.slice(-15).reverse().map(o=>{
+      const bc=o.status==='pending'?'bp':o.status==='confirmed'?'bc':'br';
+      const bl=o.status==='pending'?'รอ':o.status==='confirmed'?'✅':'❌';
+      const t=new Date(o.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      return `<tr><td>${o.event}</td><td>${o.leg1_bm} @${o.leg1_odds.toFixed(2)}</td>
+        <td>${o.leg2_bm} @${o.leg2_odds.toFixed(2)}</td>
+        <td class="profit">+${(o.profit_pct*100).toFixed(2)}%</td>
+        <td>${t}</td><td><span class="badge ${bc}">${bl}</span></td></tr>`;
+    }).join('');
+    document.getElementById('oppBody').innerHTML = oppRows||'<tr><td colspan="6" style="text-align:center;color:#8b949e;padding:20px">ยังไม่พบ opportunity</td></tr>';
+  }
+
+  if (tab === 'linelog') {
+    // Price Flow Chart — odds ของ event ล่าสุดตามเวลา
+    const byEvent = {};
+    lm.forEach(m => {
+      const k = m.event.substring(0,20);
+      if (!byEvent[k]) byEvent[k] = [];
+      byEvent[k].push({t: new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'}),
+                       v: m.odds_after, bm: m.bookmaker});
+    });
+    const topEvents = Object.keys(byEvent).slice(-4);
+    const colors = ['#58a6ff','#3fb950','#d29922','#bc8cff'];
+    const flowDatasets = topEvents.map((ev,i)=>({
+      label: ev, borderColor: colors[i], backgroundColor: colors[i]+'33',
+      data: byEvent[ev].map(p=>p.v), fill:false, tension:0.3, pointRadius:3,
+    }));
+    const flowLabels = topEvents.length ? byEvent[topEvents[0]].map(p=>p.t) : [];
+    mkChart('priceFlowChart','line',flowLabels,flowDatasets,{legend:true,yTitle:'Odds'});
+
+    // Signal type donut
+    const rlmCount   = lm.filter(m=>m.is_rlm).length;
+    const steamCount = lm.filter(m=>m.is_steam).length;
+    const normalCount= lm.length - rlmCount - steamCount;
+    mkChart('signalTypeChart','doughnut',
+      ['🔄 RLM','🌊 Steam','📊 Normal'],
+      [{data:[rlmCount,steamCount,normalCount],backgroundColor:['#bc8cff','#58a6ff','#30363d'],borderWidth:0}],
+      {legend:true});
+
+    const lmRows = lm.slice(-20).reverse().map(m=>{
+      const pct=(m.pct_change*100).toFixed(1);
+      const sign=m.pct_change>0?'+':'';
+      const tags=(m.is_steam?'<span class="badge bsteam">🌊Steam</span> ':'')+(m.is_rlm?'<span class="badge brlm">🔄RLM</span>':'');
+      const t=new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      return `<tr><td>${m.event}</td><td>${m.bookmaker}</td><td>${m.outcome}</td>
+        <td>${m.odds_before.toFixed(3)}→${m.odds_after.toFixed(3)}</td>
+        <td style="color:${m.pct_change<0?'#f85149':'#3fb950'}">${sign}${pct}%</td>
+        <td>${tags||'—'}</td><td>${t}</td></tr>`;
+    }).join('');
+    document.getElementById('lineBody').innerHTML = lmRows||'<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มีข้อมูล</td></tr>';
+  }
+
+  if (tab === 'stats') {
+    // RLM Win Rate
+    const rlmWR  = s.rlm_win_rate ?? null;
+    const rlmCnt = s.rlm_count ?? 0;
+    const steamWR  = s.steam_win_rate ?? null;
+    const steamCnt = s.steam_count ?? 0;
+    const arbWR    = s.arb_win_rate ?? null;
+    const arbCnt   = s.confirmed_trades ?? 0;
+
+    document.getElementById('rlmWR').textContent   = rlmWR!==null ? rlmWR.toFixed(1)+'%' : '—';
+    document.getElementById('rlmCount').textContent = rlmCnt+' signals';
+    document.getElementById('steamWR').textContent  = steamWR!==null ? steamWR.toFixed(1)+'%' : '—';
+    document.getElementById('steamCount').textContent= steamCnt+' signals';
+    document.getElementById('arbWR').textContent    = arbWR!==null ? arbWR.toFixed(1)+'%' : '—';
+    document.getElementById('arbCount').textContent  = arbCnt+' trades';
+
+    if (rlmWR!==null)   setRing('rlmRing', rlmWR, '#bc8cff');
+    if (steamWR!==null) setRing('steamRing', steamWR, '#58a6ff');
+    if (arbWR!==null)   setRing('arbRing', arbWR, '#3fb950');
+
+    // Sharp vs Public
+    const sharpCount  = s.sharp_count ?? 0;
+    const publicCount = s.public_count ?? 0;
+    mkChart('sharpPublicChart','doughnut',
+      ['💎 Sharp (RLM+Steam)', '📢 Public (Normal)'],
+      [{data:[sharpCount,publicCount],backgroundColor:['#bc8cff','#30363d'],borderWidth:0}],
+      {legend:true});
+    document.getElementById('sharpNote').textContent =
+      `Sharp signals: ${sharpCount} | Public: ${publicCount} | Sharp ratio: ${sharpCount+publicCount>0?((sharpCount/(sharpCount+publicCount))*100).toFixed(1):'—'}%`;
+
+    // Bookmaker accuracy
+    const bmNames  = Object.keys(s.bm_accuracy ?? {});
+    const bmScores = bmNames.map(k=>(s.bm_accuracy[k]*100).toFixed(1));
+    mkChart('bmAccChart','bar',bmNames,
+      [{label:'Accuracy%',data:bmScores,
+        backgroundColor:bmScores.map(v=>v>60?'#3fb950':v>40?'#d29922':'#f85149'),borderRadius:3}],
+      {yTitle:'%'});
+
+    // ROI per sport
+    const sportNames = Object.keys(s.roi_by_sport ?? {});
+    const sportROI   = sportNames.map(k=>+(s.roi_by_sport[k]*100).toFixed(2));
+    mkChart('roiChart','bar',sportNames.map(n=>n.split('_').pop().toUpperCase()),
+      [{label:'ROI%',data:sportROI,
+        backgroundColor:sportROI.map(v=>v>0?'#3fb950':'#f85149'),borderRadius:3}],
+      {yTitle:'%'});
+
+    // CLV cards
+    const clv = s.clv ?? {};
+    document.getElementById('clvCards').innerHTML = `
+      <div class="card"><div class="lbl">CLV avg</div>
+        <div class="val ${(clv.avg??0)>=0?'green':'red'}">${clv.avg!==null&&clv.avg!==undefined?clv.avg.toFixed(2)+'%':'—'}</div>
+        <div class="sub2">เอาชนะตลาด = บวก</div></div>
+      <div class="card"><div class="lbl">CLV บวก</div><div class="val green">${clv.positive??0} trades</div></div>
+      <div class="card"><div class="lbl">CLV ลบ</div><div class="val red">${clv.negative??0} trades</div></div>
+      <div class="card"><div class="lbl">Best CLV</div><div class="val green">${clv.best!==undefined?'+'+clv.best.toFixed(2)+'%':'—'}</div></div>
+    `;
+  }
+
+  if (tab === 'trades') {
+    const p = d.pnl ?? {};
+    document.getElementById('pnlCards').innerHTML = `
+      <div class="card"><div class="lbl">Confirmed</div><div class="val green">${p.confirmed??0}</div></div>
+      <div class="card"><div class="lbl">Rejected</div><div class="val red">${p.rejected??0}</div></div>
+      <div class="card"><div class="lbl">Est. Profit</div><div class="val green">฿${(p.est_profit??0).toLocaleString()}</div></div>
+      <div class="card"><div class="lbl">Avg Profit%</div><div class="val blue">${p.avg_profit?p.avg_profit.toFixed(2)+'%':'—'}</div></div>
+      <div class="card"><div class="lbl">CLV avg</div><div class="val ${(p.avg_clv??0)>=0?'green':'red'}">${p.avg_clv!==null&&p.avg_clv!==undefined?p.avg_clv.toFixed(2)+'%':'—'}</div></div>
+    `;
+    const tRows = trades.slice(-30).reverse().map(t=>{
+      const bc=t.status==='confirmed'?'bc':'br';
+      const tm=new Date(t.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      const clvStr=(t.clv_leg1!==null&&t.clv_leg1!==undefined)?`${t.clv_leg1>0?'+':''}${t.clv_leg1.toFixed(1)}%`:'—';
+      return `<tr>
+        <td>${t.event}</td><td>${t.sport.split('_').pop().toUpperCase()}</td>
+        <td>${t.leg1_bm} @${t.leg1_odds.toFixed(2)}</td>
+        <td>${t.leg2_bm} @${t.leg2_odds.toFixed(2)}</td>
+        <td class="profit">+${(t.profit_pct*100).toFixed(2)}%</td>
+        <td>฿${t.stake1_thb.toLocaleString()}/฿${t.stake2_thb.toLocaleString()}</td>
+        <td style="color:${(t.clv_leg1??0)>=0?'#3fb950':'#f85149'}">${clvStr}</td>
+        <td><span class="badge ${bc}">${t.status==='confirmed'?'✅ Confirmed':'❌ Rejected'}</span></td>
+        <td>${tm}</td></tr>`;
+    }).join('');
+    document.getElementById('tradeBody').innerHTML = tRows||'<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มี trades</td></tr>';
+  }
+}
+
 async function load() {
-  const r = await fetch('/api/state');
-  const d = await r.json();
-
-  const qPct   = Math.round((d.api_remaining/500)*100);
-  const qColor = qPct>30?'#3fb950':qPct>10?'#d29922':'#f85149';
-  const scanC  = d.auto_scan?'green':'red';
-
-  document.getElementById('stats').innerHTML = `
-    <div class="card"><div class="label">Auto Scan</div><div class="value ${scanC}">${d.auto_scan?'🟢 ON':'🔴 OFF'}</div></div>
-    <div class="card"><div class="label">สแกน</div><div class="value blue">${d.scan_count} รอบ</div></div>
-    <div class="card"><div class="label">รอ Confirm</div><div class="value yellow">${d.pending_count}</div></div>
-    <div class="card"><div class="label">API Credits</div><div class="value" style="color:${qColor}">${d.api_remaining}</div></div>
-    <div class="card"><div class="label">Line Moves</div><div class="value purple">${d.line_move_count}</div></div>
-    <div class="card"><div class="label">Trades</div><div class="value green">${d.confirmed_trades}</div></div>
-  `;
-  document.getElementById('qFill').style.cssText = `width:${qPct}%;background:${qColor}`;
-  document.getElementById('qText').textContent = `Credits ${d.api_remaining}/500 (${qPct}%) | เตือนที่ ${d.quota_warn_at} | สแกนล่าสุด ${d.last_scan_time}`;
-
-  initCharts(d.opportunities||[], d.line_movements||[]);
-
-  // Line movement table
-  const lmRows = (d.line_movements||[]).slice(-15).reverse().map(m => {
-    const pct  = (m.pct_change*100).toFixed(1);
-    const sign = m.pct_change>0?'+':'';
-    const tags = (m.is_steam?'<span class="steam">🌊Steam</span> ':'')+(m.is_rlm?'<span class="rlm">🔄RLM</span>':'');
-    const t    = new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
-    return `<tr><td>${m.event}</td><td>${m.bookmaker}</td><td>${m.outcome}</td>
-      <td>${m.odds_before.toFixed(3)}</td><td>${m.odds_after.toFixed(3)}</td>
-      <td style="color:${m.pct_change<0?'#f85149':'#3fb950'}">${sign}${pct}%</td>
-      <td>${tags||'—'}</td><td>${t}</td></tr>`;
-  }).join('');
-  document.getElementById('lineBody').innerHTML = lmRows||'<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มีข้อมูล</td></tr>';
-
-  // Opportunity table
-  const oppRows = (d.opportunities||[]).slice(-20).reverse().map(o => {
-    const bc   = o.status==='pending'?'bp':o.status==='confirmed'?'bc':'br';
-    const bl   = o.status==='pending'?'รอ':o.status==='confirmed'?'✅':'❌';
-    const t    = new Date(o.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
-    return `<tr><td>${o.event}</td><td>${o.leg1_bm} @${o.leg1_odds.toFixed(2)}</td>
-      <td>${o.leg2_bm} @${o.leg2_odds.toFixed(2)}</td>
-      <td class="profit">+${(o.profit_pct*100).toFixed(2)}%</td>
-      <td>฿${o.stake1_thb.toLocaleString()}/฿${o.stake2_thb.toLocaleString()}</td>
-      <td>${t}</td><td><span class="badge ${bc}">${bl}</span></td></tr>`;
-  }).join('');
-  document.getElementById('oppBody').innerHTML = oppRows||'<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px">ยังไม่พบ opportunity</td></tr>';
-
-  // P&L
-  const p = d.pnl;
-  document.getElementById('pnl').innerHTML = `
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
-      <div><div class="label">Confirmed</div><div class="value green">${p.confirmed}</div></div>
-      <div><div class="label">Rejected</div><div class="value red">${p.rejected}</div></div>
-      <div><div class="label">Est. Profit</div><div class="value green">฿${p.est_profit.toLocaleString()}</div></div>
-      <div><div class="label">CLV avg</div><div class="value ${p.avg_clv>=0?'green':'red'}">${p.avg_clv!==null?p.avg_clv.toFixed(2)+'%':'—'}</div></div>
-    </div>`;
+  const [stateRes, statsRes] = await Promise.all([
+    fetch('/api/state'), fetch('/api/stats')
+  ]);
+  const state = await stateRes.json();
+  const stats = await statsRes.json();
+  const data  = {...state, stats};
+  data.trade_records = stats.trade_records || [];
+  lastData = data;
+  renderTab(currentTab, data);
 }
 load();
 </script>
 </body>
 </html>"""
+
+
+def calc_stats() -> dict:
+    """คำนวณสถิติทั้งหมดสำหรับ /api/stats"""
+    confirmed = [t for t in trade_records if t.status == "confirmed"]
+    rejected  = [t for t in trade_records if t.status == "rejected"]
+
+    # ── Win Rate ──────────────────────────────────────────────────
+    # RLM win rate: นับ line movements ที่เป็น RLM
+    rlm_moves   = [m for m in line_movements if m.is_rlm]
+    steam_moves = [m for m in line_movements if m.is_steam]
+
+    # เชื่อม RLM กับ trade ที่เกิดขึ้นหลังสัญญาณ (ภายใน 30 นาที)
+    def signal_win_rate(moves):
+        if not moves or not confirmed: return None, len(moves)
+        wins = 0
+        total = 0
+        for m in moves:
+            m_ts = datetime.fromisoformat(m.ts.replace("Z","+00:00")) if "Z" in m.ts else datetime.fromisoformat(m.ts)
+            for t in confirmed:
+                t_ts = datetime.fromisoformat(t.created_at)
+                if abs((t_ts - m_ts).total_seconds()) < 1800:  # 30 นาที
+                    if m.event in t.event or t.event in m.event:
+                        total += 1
+                        wins  += 1  # confirmed = win (arb)
+                        break
+        return (wins/total*100 if total > 0 else None), len(moves)
+
+    rlm_wr,   rlm_cnt   = signal_win_rate(rlm_moves)
+    steam_wr, steam_cnt = signal_win_rate(steam_moves)
+    arb_total = len(confirmed) + len(rejected)
+    arb_wr    = (len(confirmed) / arb_total * 100) if arb_total > 0 else None
+
+    # ── Sharp vs Public ───────────────────────────────────────────
+    sharp_count  = len(rlm_moves) + len(steam_moves)
+    public_count = max(0, len(line_movements) - sharp_count)
+
+    # ── Bookmaker Accuracy ────────────────────────────────────────
+    # วัดจาก: ถ้า Pinnacle ขยับ odds ฝั่งไหน แล้ว outcome นั้นชนะบ่อยแค่ไหน
+    # ใช้ line_movements เพื่อดูว่า bookmaker ไหน "รู้ก่อน" (odds ลดลง = favourite จริง)
+    bm_correct = defaultdict(int)
+    bm_total   = defaultdict(int)
+    for m in line_movements:
+        bm_total[m.bookmaker] += 1
+        # ถ้า odds ลด = เว็บเชื่อว่าจะชนะมากขึ้น = "sharp signal"
+        if m.pct_change < -0.03:
+            bm_correct[m.bookmaker] += 1
+    bm_accuracy = {bm: bm_correct[bm]/bm_total[bm]
+                   for bm in bm_total if bm_total[bm] >= 3}
+
+    # ── ROI per Sport ─────────────────────────────────────────────
+    sport_profit = defaultdict(float)
+    sport_stake  = defaultdict(float)
+    for t in confirmed:
+        est = t.profit_pct * (t.stake1_thb + t.stake2_thb)
+        sport_profit[t.sport] += est
+        sport_stake[t.sport]  += (t.stake1_thb + t.stake2_thb)
+    roi_by_sport = {s: sport_profit[s]/sport_stake[s]
+                    for s in sport_stake if sport_stake[s] > 0}
+
+    # ── CLV Summary ───────────────────────────────────────────────
+    clv_values = []
+    for t in confirmed:
+        c1, c2 = calc_clv(t)
+        if c1 is not None: clv_values.append(c1)
+        if c2 is not None: clv_values.append(c2)
+    avg_clv = sum(clv_values)/len(clv_values) if clv_values else None
+    clv_positive = len([c for c in clv_values if c > 0])
+    clv_negative = len([c for c in clv_values if c < 0])
+    best_clv     = max(clv_values) if clv_values else None
+
+    # ── P&L ───────────────────────────────────────────────────────
+    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
+    avg_profit = (sum(t.profit_pct for t in confirmed)/len(confirmed)*100) if confirmed else None
+
+    # ── Trade records สำหรับ table ────────────────────────────────
+    trade_list = []
+    for t in trade_records[-50:]:
+        c1, c2 = calc_clv(t)
+        trade_list.append({
+            "signal_id": t.signal_id, "event": t.event, "sport": t.sport,
+            "leg1_bm": t.leg1_bm, "leg2_bm": t.leg2_bm,
+            "leg1_odds": t.leg1_odds, "leg2_odds": t.leg2_odds,
+            "stake1_thb": t.stake1_thb, "stake2_thb": t.stake2_thb,
+            "profit_pct": t.profit_pct, "status": t.status,
+            "clv_leg1": c1, "clv_leg2": c2,
+            "created_at": t.created_at,
+        })
+
+    return {
+        "rlm_win_rate":    rlm_wr,
+        "rlm_count":       rlm_cnt,
+        "steam_win_rate":  steam_wr,
+        "steam_count":     steam_cnt,
+        "arb_win_rate":    arb_wr,
+        "confirmed_trades":len(confirmed),
+        "sharp_count":     sharp_count,
+        "public_count":    public_count,
+        "bm_accuracy":     bm_accuracy,
+        "roi_by_sport":    roi_by_sport,
+        "clv": {
+            "avg":      round(avg_clv,2) if avg_clv is not None else None,
+            "positive": clv_positive,
+            "negative": clv_negative,
+            "best":     round(best_clv,2) if best_clv is not None else None,
+        },
+        "pnl": {
+            "confirmed":  len(confirmed),
+            "rejected":   len(rejected),
+            "est_profit": round(est_profit),
+            "avg_profit": round(avg_profit,2) if avg_profit else None,
+            "avg_clv":    round(avg_clv,2) if avg_clv is not None else None,
+        },
+        "trade_records": trade_list,
+    }
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1332,6 +1669,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 },
             }
             body = json.dumps(data, default=str).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/stats":
+            body = json.dumps(calc_stats(), default=str).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
