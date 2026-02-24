@@ -2052,17 +2052,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("lines",  cmd_lines))
     _app = app
 
-    if USE_WEBHOOK:
-        # ⚡ Webhook mode — เร็วกว่า polling 10x
-        log.info(f"[Bot] Webhook mode: {WEBHOOK_URL}{WEBHOOK_PATH}")
-        app.run_webhook(
-            listen           = "0.0.0.0",
-            port             = PORT + 1,       # port แยกจาก dashboard
-            url_path         = WEBHOOK_PATH,
-            webhook_url      = f"{WEBHOOK_URL}{WEBHOOK_PATH}",
-            drop_pending_updates = True,
-        )
-    else:
-        # Polling mode (fallback)
-        log.info("[Bot] Polling mode")
-        app.run_polling(drop_pending_updates=True)
+    # Railway expose ได้แค่ 1 port — ใช้ polling เสมอ
+    # Dashboard อยู่ที่ PORT, bot ใช้ polling (stable กว่าใน Railway)
+    log.info("[Bot] Polling mode (Railway single-port compatible)")
+    app.run_polling(drop_pending_updates=True)
