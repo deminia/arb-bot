@@ -2486,11 +2486,17 @@ async def post_init(app: Application):
     db_init()                     # SQLite local (sync, fallback)
     await turso_init()            # Turso cloud (async)
 
-    # โหลด bot state จาก local SQLite ก่อน (เร็ว)
-    scan_count     = int(db_load_state("scan_count", "0"))
-    last_scan_time = db_load_state("last_scan_time", "ยังไม่ได้สแกน")
-    api_remaining  = int(db_load_state("api_remaining", "500"))
-    saved_scan     = db_load_state("auto_scan", "")
+    # โหลด bot state จาก Turso (persistent) → fallback local SQLite
+    if _turso is not None:
+        scan_count     = int(await db_load_state_async("scan_count", "0"))
+        last_scan_time = await db_load_state_async("last_scan_time", "ยังไม่ได้สแกน")
+        api_remaining  = int(await db_load_state_async("api_remaining", "500"))
+        saved_scan     = await db_load_state_async("auto_scan", "")
+    else:
+        scan_count     = int(db_load_state("scan_count", "0"))
+        last_scan_time = db_load_state("last_scan_time", "ยังไม่ได้สแกน")
+        api_remaining  = int(db_load_state("api_remaining", "500"))
+        saved_scan     = db_load_state("auto_scan", "")
     if saved_scan:
         auto_scan = saved_scan.lower() == "true"
 
