@@ -1636,7 +1636,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="th">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta http-equiv="refresh" content="20">
 <title>ARB BOT v8.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
@@ -2100,8 +2099,13 @@ function renderTab(tab, d) {
   }
 }
 
+const _qs = new URLSearchParams(location.search);
+const _tk = _qs.get('token') || '';
+function apiUrl(path) { return _tk ? path + '?token=' + encodeURIComponent(_tk) : path; }
+setInterval(() => location.reload(), 20000);
+
 async function action(key, value) {
-  const r = await fetch('/api/control', {
+  const r = await fetch(apiUrl('/api/control'), {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({key, value})
   });
@@ -2116,7 +2120,7 @@ async function save(key, value) {
 }
 
 async function toggleScan() {
-  const r = await fetch('/api/state');
+  const r = await fetch(apiUrl('/api/state'));
   const d = await r.json();
   await action('auto_scan', (!d.auto_scan).toString());
 }
@@ -2142,7 +2146,7 @@ function renderControls(d) {
 
 async function load() {
   const [stateRes, statsRes] = await Promise.all([
-    fetch('/api/state'), fetch('/api/stats')
+    fetch(apiUrl('/api/state')), fetch(apiUrl('/api/stats'))
   ]);
   const state = await stateRes.json();
   const stats = await statsRes.json();
