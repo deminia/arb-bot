@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  ARB BOT v6.0  —  Complete Edition                                  ║
+║  ARB BOT v7.0  —  Production Ready                                  ║
 ║  1.  Odds Staleness Check    7.  Line Movement Alert (Pinnacle)     ║
 ║  2.  Max Odds Filter         8.  Dashboard History Chart            ║
 ║  3.  Alert Cooldown          9.  Multi-chat Support                 ║
@@ -1011,7 +1011,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
     confirmed = len([t for t in trade_records if t.status=="confirmed"])
     await update.message.reply_text(
-        f"📊 *ARB BOT v6.0*\n"
+        f"📊 *ARB BOT v7.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
@@ -1064,7 +1064,7 @@ async def do_scan() -> int:
 
 async def scanner_loop():
     await asyncio.sleep(3)
-    log.info(f"[Scanner] v6.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
+    log.info(f"[Scanner] v7.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
     while True:
         if auto_scan:
             try: await do_scan()
@@ -1080,7 +1080,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <meta http-equiv="refresh" content="20">
-<title>ARB BOT v6.0</title>
+<title>ARB BOT v7.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1111,7 +1111,7 @@ tr:hover td{background:#1c2128}
 </style>
 </head>
 <body>
-<h1>🤖 ARB BOT v6.0</h1>
+<h1>🤖 ARB BOT v7.0</h1>
 <div class="sub">รีเฟรชทุก 20 วินาที — Fuzzy Match + Async + Slippage + Line Movement + CLV</div>
 
 <div class="grid" id="stats"></div>
