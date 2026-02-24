@@ -164,13 +164,15 @@ class TradeRecord:
     sport:       str
     leg1_bm:     str
     leg2_bm:     str
+    leg1_team:   str         # ชื่อทีม/นักกีฬาที่วาง leg1
+    leg2_team:   str         # ชื่อทีม/นักกีฬาที่วาง leg2
     leg1_odds:   float
     leg2_odds:   float
     stake1_thb:  int
     stake2_thb:  int
     profit_pct:  float
     status:      str    # confirmed | rejected
-    clv_leg1:    Optional[float] = None   # 12. CLV
+    clv_leg1:    Optional[float] = None
     clv_leg2:    Optional[float] = None
     actual_profit_thb: Optional[int] = None
     settled_at:  Optional[str] = None
@@ -208,7 +210,9 @@ _shutdown_event = threading.Event()
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS trade_records (
     signal_id TEXT PRIMARY KEY, event TEXT, sport TEXT,
-    leg1_bm TEXT, leg2_bm TEXT, leg1_odds REAL, leg2_odds REAL,
+    leg1_bm TEXT, leg2_bm TEXT,
+    leg1_team TEXT DEFAULT '', leg2_team TEXT DEFAULT '',
+    leg1_odds REAL, leg2_odds REAL,
     stake1_thb INTEGER, stake2_thb INTEGER, profit_pct REAL, status TEXT,
     clv_leg1 REAL, clv_leg2 REAL, actual_profit_thb INTEGER,
     settled_at TEXT, created_at TEXT
@@ -309,8 +313,9 @@ def db_save_trade(t: "TradeRecord"):
 
 async def _async_save_trade(t: "TradeRecord"):
     await turso_exec(
-        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (t.signal_id,t.event,t.sport,t.leg1_bm,t.leg2_bm,
+         t.leg1_team,t.leg2_team,
          t.leg1_odds,t.leg2_odds,t.stake1_thb,t.stake2_thb,
          t.profit_pct,t.status,t.clv_leg1,t.clv_leg2,
          t.actual_profit_thb,t.settled_at,t.created_at)
@@ -372,11 +377,25 @@ async def db_load_all() -> tuple[list, list, list]:
             "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500")
         trades = []
         for r in trades_rows:
-            trades.append(TradeRecord(
-                signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
-                leg1_odds=r[5],leg2_odds=r[6],stake1_thb=r[7],stake2_thb=r[8],
-                profit_pct=r[9],status=r[10],clv_leg1=r[11],clv_leg2=r[12],
-                actual_profit_thb=r[13],settled_at=r[14],created_at=r[15]))
+            # รองรับ DB เก่า (16 col) และใหม่ (18 col)
+            if len(r) >= 18:
+                trades.append(TradeRecord(
+                    signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
+                    leg1_team=r[5] or "",leg2_team=r[6] or "",
+                    leg1_odds=r[7],leg2_odds=r[8],stake1_thb=r[9],stake2_thb=r[10],
+                    profit_pct=r[11],status=r[12],clv_leg1=r[13],clv_leg2=r[14],
+                    actual_profit_thb=r[15],settled_at=r[16],created_at=r[17]))
+            else:
+                # DB เก่า — ไม่มี leg1_team/leg2_team
+                ev = r[1] if len(r)>1 else ""
+                parts = ev.split(" vs ")
+                trades.append(TradeRecord(
+                    signal_id=r[0],event=ev,sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
+                    leg1_team=parts[0] if parts else "",
+                    leg2_team=parts[1] if len(parts)>1 else "",
+                    leg1_odds=r[5],leg2_odds=r[6],stake1_thb=r[7],stake2_thb=r[8],
+                    profit_pct=r[9],status=r[10],clv_leg1=r[11],clv_leg2=r[12],
+                    actual_profit_thb=r[13],settled_at=r[14],created_at=r[15]))
 
         opps_rows = await turso_query(
             "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100")
@@ -1110,6 +1129,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
     tr = TradeRecord(
         signal_id=opp.signal_id, event=opp.event, sport=opp.sport,
         leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
+        leg1_team=opp.leg1.outcome,   # ✅ ชื่อทีม/นักกีฬาจริง
+        leg2_team=opp.leg2.outcome,   # ✅ ชื่อทีม/นักกีฬาจริง
         leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
         stake1_thb=int(s1), stake2_thb=int(s2),
         profit_pct=float(opp.profit_pct), status="confirmed",
@@ -1173,6 +1194,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
             leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
+            leg1_team=opp.leg1.outcome,
+            leg2_team=opp.leg2.outcome,
             leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
             stake1_thb=int(opp.stake1*USD_TO_THB), stake2_thb=int(opp.stake2*USD_TO_THB),
             profit_pct=float(opp.profit_pct), status="rejected",
@@ -1428,19 +1451,32 @@ def parse_winner(event: dict) -> Optional[str]:
 
 def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     """
-    คำนวณกำไร/ขาดทุนจริง
-    arb ที่ดี: ไม่ว่าใครชนะ = กำไรเสมอ
-    แต่ถ้า execution มีปัญหา (stake ไม่สมดุล, odds เปลี่ยน): อาจขาดทุนได้
+    คำนวณกำไร/ขาดทุนจริง โดยใช้ชื่อทีมที่บันทึกไว้ใน trade
+
+    arb ที่ดี → กำไรไม่ว่าใครชนะ
+    แต่ถ้า stake ถูก cap หรือ odds เปลี่ยนก่อนวาง → อาจมีผิดพลาดได้
     """
     total_staked = trade.stake1_thb + trade.stake2_thb
 
-    # หาว่า winner ตรงกับ leg ไหน
-    if fuzzy_match(winner, trade.leg1_bm.split()[0] if " " not in trade.event else trade.event.split(" vs ")[0]):
-        # leg1 ชนะ
+    # match winner กับ leg1_team หรือ leg2_team (fuzzy)
+    match_leg1 = fuzzy_match(winner, trade.leg1_team, threshold=0.5)
+    match_leg2 = fuzzy_match(winner, trade.leg2_team, threshold=0.5)
+
+    if match_leg1 and not match_leg2:
+        # leg1 ชนะ → ได้ payout จาก stake1
         payout = trade.stake1_thb * trade.leg1_odds
-    else:
-        # leg2 ชนะ
+        log.info(f"[Settle] {trade.event} → leg1 won ({trade.leg1_team})")
+    elif match_leg2 and not match_leg1:
+        # leg2 ชนะ → ได้ payout จาก stake2
         payout = trade.stake2_thb * trade.leg2_odds
+        log.info(f"[Settle] {trade.event} → leg2 won ({trade.leg2_team})")
+    else:
+        # match ทั้งคู่หรือไม่ match เลย — ใช้ leg ที่ให้ payout สูงกว่า (conservative)
+        payout1 = trade.stake1_thb * trade.leg1_odds
+        payout2 = trade.stake2_thb * trade.leg2_odds
+        payout  = min(payout1, payout2)  # worst case
+        log.warning(f"[Settle] {trade.event} — winner '{winner}' ambiguous "
+                    f"(leg1={trade.leg1_team}, leg2={trade.leg2_team}) using worst-case")
 
     profit = int(payout - total_staked)
     return profit
@@ -1604,6 +1640,7 @@ tr:hover td{background:#1c2128}
   <div class="tab" onclick="switchTab('linelog')">📡 Line Moves</div>
   <div class="tab" onclick="switchTab('stats')">🔬 Statistics</div>
   <div class="tab" onclick="switchTab('trades')">💰 Trades</div>
+  <div class="tab" onclick="switchTab('controls')">⚙️ Controls</div>
 </div>
 
 <!-- ═══ TAB 1: OVERVIEW ═══ -->
@@ -1722,6 +1759,94 @@ tr:hover td{background:#1c2128}
   </table>
 </div>
 
+<!-- ═══ TAB 5: CONTROLS ═══ -->
+<div id="page-controls" class="page">
+  <div class="two">
+    <!-- Quick Actions -->
+    <div class="cw">
+      <div class="sec">⚡ Quick Actions</div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
+        <button class="btn-green" onclick="action('scan_now','true')">🔍 Scan Now</button>
+        <button class="btn-blue"  onclick="toggleScan()">🔄 Toggle Auto Scan</button>
+        <button class="btn-gray"  onclick="action('clear_seen','true')">🗑️ Clear Seen Signals</button>
+      </div>
+    </div>
+    <!-- Scan Settings -->
+    <div class="cw">
+      <div class="sec">📡 Scan Settings</div>
+      <div class="ctrl-row">
+        <label>Min Profit %</label>
+        <input type="number" id="cfg_min_profit" step="0.1" min="0.5" max="10" placeholder="1.5">
+        <button onclick="save('min_profit_pct', document.getElementById('cfg_min_profit').value/100)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Scan Interval (s)</label>
+        <input type="number" id="cfg_interval" step="60" min="60" max="3600" placeholder="300">
+        <button onclick="save('scan_interval', document.getElementById('cfg_interval').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Alert Cooldown (m)</label>
+        <input type="number" id="cfg_cooldown" step="5" min="5" max="120" placeholder="30">
+        <button onclick="save('cooldown', document.getElementById('cfg_cooldown').value)">Save</button>
+      </div>
+    </div>
+  </div>
+  <div class="two">
+    <!-- Odds Settings -->
+    <div class="cw">
+      <div class="sec">📊 Odds Filter</div>
+      <div class="ctrl-row">
+        <label>Max Odds</label>
+        <input type="number" id="cfg_max_odds" step="1" min="2" max="50" placeholder="15">
+        <button onclick="save('max_odds', document.getElementById('cfg_max_odds').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Min Odds</label>
+        <input type="number" id="cfg_min_odds" step="0.05" min="1.01" max="2" placeholder="1.05">
+        <button onclick="save('min_odds', document.getElementById('cfg_min_odds').value)">Save</button>
+      </div>
+    </div>
+    <!-- Stake Settings -->
+    <div class="cw">
+      <div class="sec">💵 Stake / Kelly</div>
+      <div class="ctrl-row">
+        <label>Total Stake (฿)</label>
+        <input type="number" id="cfg_stake" step="1000" min="1000" placeholder="10000">
+        <button onclick="save('total_stake', document.getElementById('cfg_stake').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Kelly Fraction</label>
+        <input type="number" id="cfg_kelly" step="0.05" min="0.1" max="1" placeholder="0.25">
+        <button onclick="save('kelly_fraction', document.getElementById('cfg_kelly').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Use Kelly</label>
+        <select id="cfg_use_kelly">
+          <option value="true">ON</option>
+          <option value="false">OFF</option>
+        </select>
+        <button onclick="save('use_kelly', document.getElementById('cfg_use_kelly').value)">Save</button>
+      </div>
+    </div>
+  </div>
+  <div id="ctrl-msg" style="margin-top:8px;padding:10px;border-radius:6px;display:none;font-size:.85rem"></div>
+  <div class="cw" style="margin-top:12px">
+    <div class="sec">📋 Current Config</div>
+    <div id="cfg-display" style="font-size:.8rem;color:#8b949e;line-height:1.8"></div>
+  </div>
+</div>
+
+<style>
+.btn-green{background:#1a3a2a;color:#3fb950;border:1px solid #3fb950;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
+.btn-blue{background:#1f3d5c;color:#58a6ff;border:1px solid #58a6ff;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
+.btn-gray{background:#21262d;color:#8b949e;border:1px solid #30363d;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
+.ctrl-row{display:grid;grid-template-columns:140px 1fr auto;gap:6px;align-items:center;margin-bottom:8px}
+.ctrl-row label{color:#8b949e;font-size:.78rem}
+.ctrl-row input,.ctrl-row select{background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:5px 8px;font-size:.82rem;width:100%}
+.ctrl-row button{background:#21262d;color:#58a6ff;border:1px solid #30363d;border-radius:4px;padding:5px 10px;cursor:pointer;font-size:.78rem;white-space:nowrap}
+.ctrl-row button:hover{background:#1f3d5c}
+</style>
+
 <script>
 let charts = {};
 let currentTab = 'overview';
@@ -1730,12 +1855,12 @@ let lastData = null;
 function switchTab(name) {
   currentTab = name;
   document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['overview','linelog','stats','trades'];
+    const names = ['overview','linelog','stats','trades','controls'];
     t.classList.toggle('active', names[i]===name);
   });
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
-  if (lastData) renderTab(name, lastData);
+  if (lastData) { renderTab(name, lastData); if(name==='controls') renderControls(lastData); }
 }
 
 function mkChart(id, type, labels, datasets, opts={}) {
@@ -1931,6 +2056,46 @@ function renderTab(tab, d) {
   }
 }
 
+async function action(key, value) {
+  const r = await fetch('/api/control', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({key, value})
+  });
+  const d = await r.json();
+  showMsg(d.msg, d.ok);
+  if (d.ok) load();
+}
+
+async function save(key, value) {
+  if (!value && value !== false) { showMsg('กรุณากรอกค่า','error'); return; }
+  await action(key, value);
+}
+
+async function toggleScan() {
+  const r = await fetch('/api/state');
+  const d = await r.json();
+  await action('auto_scan', (!d.auto_scan).toString());
+}
+
+function showMsg(msg, ok) {
+  const el = document.getElementById('ctrl-msg');
+  el.textContent = ok ? '✅ ' + msg : '❌ ' + msg;
+  el.style.display = 'block';
+  el.style.background = ok ? '#1a3a2a' : '#3d1f1f';
+  el.style.color = ok ? '#3fb950' : '#f85149';
+  setTimeout(() => el.style.display='none', 3000);
+}
+
+function renderControls(d) {
+  document.getElementById('cfg-display').innerHTML = `
+    Auto Scan: <b style="color:${d.auto_scan?'#3fb950':'#f85149'}">${d.auto_scan?'ON':'OFF'}</b><br>
+    Min Profit: <b>${(d.min_profit_pct*100).toFixed(2)}%</b><br>
+    Scan Interval: <b>${d.scan_interval}s</b><br>
+    Total Stake: <b>฿${d.total_stake_thb.toLocaleString()}</b><br>
+    API Credits: <b>${d.api_remaining}/500</b>
+  `;
+}
+
 async function load() {
   const [stateRes, statsRes] = await Promise.all([
     fetch('/api/state'), fetch('/api/stats')
@@ -2063,8 +2228,85 @@ def calc_stats() -> dict:
     }
 
 
+
+def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
+    """ปรับ config runtime โดยไม่ต้อง redeploy"""
+    global auto_scan, MIN_PROFIT_PCT, SCAN_INTERVAL, MAX_ODDS_ALLOWED
+    global MIN_ODDS_ALLOWED, ALERT_COOLDOWN_MIN, TOTAL_STAKE_THB, TOTAL_STAKE
+    global KELLY_FRACTION, USE_KELLY, QUOTA_WARN_AT
+
+    try:
+        if key == "auto_scan":
+            auto_scan = value.lower() in ("true","1","on")
+            return True, f"auto_scan = {auto_scan}"
+        elif key == "min_profit_pct":
+            MIN_PROFIT_PCT = Decimal(value)
+            return True, f"MIN_PROFIT_PCT = {MIN_PROFIT_PCT:.3f}"
+        elif key == "scan_interval":
+            SCAN_INTERVAL = int(value)
+            return True, f"SCAN_INTERVAL = {SCAN_INTERVAL}s"
+        elif key == "max_odds":
+            MAX_ODDS_ALLOWED = Decimal(value)
+            return True, f"MAX_ODDS_ALLOWED = {MAX_ODDS_ALLOWED}"
+        elif key == "min_odds":
+            MIN_ODDS_ALLOWED = Decimal(value)
+            return True, f"MIN_ODDS_ALLOWED = {MIN_ODDS_ALLOWED}"
+        elif key == "cooldown":
+            ALERT_COOLDOWN_MIN = int(value)
+            return True, f"ALERT_COOLDOWN_MIN = {ALERT_COOLDOWN_MIN}m"
+        elif key == "total_stake":
+            TOTAL_STAKE_THB = Decimal(value)
+            TOTAL_STAKE     = TOTAL_STAKE_THB / USD_TO_THB
+            return True, f"TOTAL_STAKE_THB = ฿{int(TOTAL_STAKE_THB):,}"
+        elif key == "kelly_fraction":
+            KELLY_FRACTION = Decimal(value)
+            return True, f"KELLY_FRACTION = {KELLY_FRACTION}"
+        elif key == "use_kelly":
+            USE_KELLY = value.lower() in ("true","1","on")
+            return True, f"USE_KELLY = {USE_KELLY}"
+        elif key == "scan_now":
+            # trigger scan ทันที
+            asyncio.get_event_loop().create_task(do_scan())
+            return True, "scan triggered"
+        elif key == "clear_seen":
+            seen_signals.clear()
+            return True, "seen_signals cleared"
+        else:
+            return False, f"unknown key: {key}"
+    except Exception as e:
+        return False, str(e)
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
+
+    def do_POST(self):
+        """รับ POST จาก Dashboard UI Controls"""
+        if self.path == "/api/control":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body   = json.loads(self.rfile.read(length))
+                key    = body.get("key","")
+                value  = str(body.get("value",""))
+                ok, msg = apply_runtime_config(key, value)
+                # save ลง DB ด้วย
+                if ok:
+                    db_save_state(f"cfg_{key}", value)
+                resp = json.dumps({"ok": ok, "msg": msg}).encode()
+                self.send_response(200 if ok else 400)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length",len(resp))
+                self.end_headers()
+                self.wfile.write(resp)
+            except Exception as e:
+                err = json.dumps({"ok":False,"msg":str(e)}).encode()
+                self.send_response(500)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length",len(err))
+                self.end_headers()
+                self.wfile.write(err)
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_GET(self):
         # Health check endpoint สำหรับ Railway
