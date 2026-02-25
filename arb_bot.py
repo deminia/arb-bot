@@ -1,12 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  ARB BOT v8.0  —  Sharp Edition                                      ║
-║  1.  Odds Staleness Check    7.  Line Movement Alert (Pinnacle)     ║
-║  2.  Max Odds Filter         8.  Dashboard History Chart            ║
-║  3.  Alert Cooldown          9.  Multi-chat Support                 ║
-║  4.  P&L Tracker             10. Reverse Line Movement (RLM)        ║
-║  5.  Max Stake per Book      11. Steam Move Alert                   ║
-║  6.  Dynamic Commission      12. CLV Tracker                        ║
+║  ARB BOT v9.0  —  Sharp Edition                                      ║
+║  1.  Odds Staleness (last_update) 7.  Line Movement Alert (Pinnacle) ║
+║  2.  Max Odds Filter              8.  Dashboard (fetch-only refresh) ║
+║  3.  Alert Cooldown               9.  Multi-chat Support             ║
+║  4.  P&L Tracker + CLV Benchmark  10. Sharp Move (Pinnacle Down)     ║
+║  5.  Slippage Guard (re-fetch)    11. Steam Move Alert               ║
+║  6.  Polymarket Impact Cost       12. Settlement Parser (sport-aware) ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -1456,8 +1456,9 @@ async def execute_both(opp: ArbOpportunity) -> str:
     # 🎭 Natural rounding — ป้องกันโดนจับว่าใช้บอท
     s1 = natural_round(s1_raw)
     s2 = natural_round(s2_raw)
-    w1 = (opp.stake1*opp.leg1.odds*USD_TO_THB).quantize(Decimal("1"))
-    w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
+    # คำนวณ payout จาก stake จริงหลัง rounding (ไม่ใช่ opp.stake1 ก่อน round)
+    w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
+    w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
     tt = s1 + s2  # ใช้ stake จริง (ไม่ใช่ TOTAL_STAKE_THB)
 
     # บันทึก trade
