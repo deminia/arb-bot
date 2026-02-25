@@ -599,14 +599,14 @@ async def detect_line_movements(odds_by_sport: dict):
 
                                     # 10. RLM: odds ขยับ反向กับ public bet
                                     # ถ้า odds ลง (favourite กลายเป็น underdog) = sharp money เดิน
-                                    is_rlm = pct < -LINE_MOVE_THRESHOLD and bk == "pinnacle"
+                                    is_sharp_move = pct < -LINE_MOVE_THRESHOLD and bk == "pinnacle"
 
                                     lm = LineMovement(
                                         event=ename, sport=sport,
                                         bookmaker=bn, outcome=outcome,
                                         odds_before=old_odds, odds_after=new_odds,
                                         pct_change=pct, direction=direction,
-                                        is_steam=is_steam, is_rlm=is_rlm,
+                                        is_steam=is_steam, is_rlm=is_sharp_move,
                                     )
                                     ctx = {
                                         "commence_time": commence,
@@ -616,7 +616,7 @@ async def detect_line_movements(odds_by_sport: dict):
                                     new_movements.append((lm, ctx))
                                     line_movements.append(lm)
                                     db_save_line_movement(lm)  # 💾
-                                    log.info(f"[LineMove] {ename} | {bn} {outcome} {float(old_odds):.3f}→{float(new_odds):.3f} ({pct:.1%}) {'🌊STEAM' if is_steam else ''} {'🔄RLM' if is_rlm else ''}")
+                                    log.info(f"[LineMove] {ename} | {bn} {outcome} {float(old_odds):.3f}→{float(new_odds):.3f} ({pct:.1%}) {'🌊STEAM' if is_steam else ''} {'🔄Sharp' if is_sharp_move else ''}")
 
                         # อัพเดท history
                         if hist_key not in odds_history:
@@ -1165,21 +1165,36 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     liq_usd  = best.get("_liquidity", 0)
     vol_24h  = best.get("_volume_24h", 0)
 
+    # #26 Impact Cost — ถ้า liquidity บาง stake ใหญ่จะกิน spread
+    # ประมาณ stake ที่จะวาง (Kelly min ÷ USD_TO_THB เป็น USD)
+    est_stake_usd = float(MIN_KELLY_STAKE) / float(USD_TO_THB)
+    if liq_usd > 0:
+        # impact = stake / liquidity (สัดส่วน orderbook ที่จะกิน)
+        impact_ratio = min(est_stake_usd / liq_usd, 0.10)  # cap 10%
+    else:
+        impact_ratio = 0.05  # default 5% ถ้าไม่รู้ liquidity
+    # แปลง impact เป็น odds penalty (ยิ่ง impact มาก ยิ่ง odds ลด)
+    impact_adj = Decimal(str(1 - impact_ratio * 0.5))  # max -5% odds
+
     def poly_odds(p: Decimal) -> tuple[Decimal, Decimal]:
         odds_raw = (Decimal("1") / p).quantize(Decimal("0.001"))
-        # ใช้ fee จริง แทน hardcode
-        odds_eff = (odds_raw * (Decimal("1") - fee_pct)).quantize(Decimal("0.001"))
+        # fee + impact cost
+        odds_eff = (odds_raw * (Decimal("1") - fee_pct) * impact_adj).quantize(Decimal("0.001"))
         return odds_raw, odds_eff
 
     slug    = best.get("slug","")
     odds_raw_a, odds_a = poly_odds(pa)
     odds_raw_b, odds_b = poly_odds(pb)
 
+    if impact_ratio > 0.03:
+        log.info(f"[PolyImpact] {best.get('question','?')[:40]} liq=${liq_usd:.0f} impact={impact_ratio:.1%} adj={float(impact_adj):.3f}")
+
     return {
-        "market_url": f"https://polymarket.com/event/{slug}",
-        "fee_pct":    float(fee_pct),
-        "liquidity":  liq_usd,
-        "volume_24h": vol_24h,
+        "market_url":   f"https://polymarket.com/event/{slug}",
+        "fee_pct":      float(fee_pct),
+        "liquidity":    liq_usd,
+        "volume_24h":   vol_24h,
+        "impact_ratio": impact_ratio,
         "team_a": {"name": tokens[0].get("outcome",ta),
                    "odds_raw": odds_raw_a, "odds": odds_a,
                    "token_id": tokens[0].get("token_id","")},
@@ -1377,9 +1392,65 @@ async def send_alert(opp: ArbOpportunity):
 
 
 # ══════════════════════════════════════════════════════════════════
+#  SLIPPAGE GUARD — Re-fetch live odds ก่อน execute
+# ══════════════════════════════════════════════════════════════════
+async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
+    """
+    Re-fetch ราคาล่าสุดจาก API ก่อนยืนยันการเดิมพัน
+    Returns: (live_odds_leg1, live_odds_leg2)
+    ถ้าหาไม่เจอ → คืนค่าเดิม (ไม่ abort)
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            events = await async_fetch_odds(session, opp.sport)
+        for event in events:
+            ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
+            if not fuzzy_match(ename, opp.event, 0.7): continue
+            live1 = opp.leg1.odds
+            live2 = opp.leg2.odds
+            for bm in event.get("bookmakers", []):
+                bk = bm.get("key","")
+                for mkt in bm.get("markets", []):
+                    if mkt.get("key") != "h2h": continue
+                    for out in mkt.get("outcomes", []):
+                        name = out.get("name","")
+                        price = Decimal(str(out.get("price", 1)))
+                        bm_title = bm.get("title", bk)
+                        if fuzzy_match(name, opp.leg1.outcome, 0.8) and \
+                           opp.leg1.bookmaker.lower() in bk.lower():
+                            live1 = apply_slippage(price, bk)
+                        elif fuzzy_match(name, opp.leg2.outcome, 0.8) and \
+                             opp.leg2.bookmaker.lower() in bk.lower():
+                            live2 = apply_slippage(price, bk)
+            return live1, live2
+    except Exception as e:
+        log.warning(f"[SlippageGuard] re-fetch failed: {e}")
+    return opp.leg1.odds, opp.leg2.odds
+
+
+# ══════════════════════════════════════════════════════════════════
 #  EXECUTE
 # ══════════════════════════════════════════════════════════════════
 async def execute_both(opp: ArbOpportunity) -> str:
+    # 🛡️ Slippage Guard — ตรวจราคาล่าสุดก่อน execute
+    live1, live2 = await refetch_live_odds(opp)
+    live_profit, _, _ = calc_arb(live1, live2)
+
+    if live_profit < Decimal("0"):
+        log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%}")
+        raise ValueError(
+            f"🚫 *ABORT: Odds Dropped*\n"
+            f"ราคาเปลี่ยนขณะรอยืนยัน — arb หายแล้ว\n"
+            f"Live profit: *{live_profit:.2%}*\n"
+            f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
+        )
+
+    # แจ้งถ้า profit ลดลงมากกว่า 30% จากที่คำนวณไว้
+    profit_drop = float(opp.profit_pct - live_profit) / float(opp.profit_pct) if opp.profit_pct > 0 else 0
+    slippage_warn = ""
+    if profit_drop > 0.30:
+        slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit):.2%})"
+
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
     # 🎭 Natural rounding — ป้องกันโดนจับว่าใช้บอท
@@ -1428,12 +1499,12 @@ async def execute_both(opp: ArbOpportunity) -> str:
         return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
 
     return (
-        f"📋 *วางเงิน — {opp.event}*\n"
+        f"📋 *วางเงิน — {opp.event}*{slippage_warn}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 *{opp.leg1.bookmaker}*\n{steps(opp.leg1, s1)}\n\n"
         f"🟠 *{opp.leg2.bookmaker}*\n{steps(opp.leg2, s2)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 ทุน ฿{int(tt):,}\n"
+        f"💵 ทุน ฿{int(tt):,}  _(Live profit: {float(live_profit):.2%})_\n"
         f"   {opp.leg1.outcome} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
         f"   {opp.leg2.outcome} ชนะ → ฿{int(w2):,} (+฿{int(w2-tt):,})"
     )
@@ -1469,9 +1540,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_update_opp_status(sid, "rejected")  # 💾
         await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         return
-    await query.edit_message_text(orig+"\n\n⏳ *กำลังเตรียม...*", parse_mode="Markdown")
-    result = await execute_both(opp)
-    await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
+    await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
+    try:
+        result = await execute_both(opp)
+        await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
+    except ValueError as abort_msg:
+        await query.edit_message_text(orig+"\n\n"+str(abort_msg), parse_mode="Markdown")
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1553,7 +1627,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
     confirmed = len([t for t in trade_records if t.status=="confirmed"])
     await update.message.reply_text(
-        f"📊 *ARB BOT v8.0*\n"
+        f"📊 *ARB BOT v9.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
@@ -1629,14 +1703,20 @@ async def watch_closing_lines():
                         for event in events:
                             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
                             if ename != info["event"]: continue
+                            pinnacle_found = False
                             for bm in event.get("bookmakers", []):
                                 bk = bm.get("key","")
                                 for mkt in bm.get("markets",[]):
                                     if mkt.get("key") != "h2h": continue
                                     for out in mkt.get("outcomes",[]):
-                                        update_clv(ename, out["name"], bk,
-                                                   Decimal(str(out.get("price",1))))
-                            log.info(f"[CLV] closing line saved: {ename}")
+                                        price = Decimal(str(out.get("price",1)))
+                                        # #27 บังคับเก็บ Pinnacle เป็น benchmark เสมอ
+                                        update_clv(ename, out["name"], bk, price)
+                                        if bk == "pinnacle":
+                                            pinnacle_found = True
+                            if not pinnacle_found:
+                                log.warning(f"[CLV] ⚠️ Pinnacle closing line missing for {ename} — CLV benchmark unreliable")
+                            log.info(f"[CLV] closing line saved: {ename} (pinnacle={'✅' if pinnacle_found else '❌'})")
         except Exception as e:
             log.error(f"[CLV] watch_closing_lines crash: {e}", exc_info=True)
 
@@ -1702,19 +1782,73 @@ async def fetch_scores(sport: str, session: Optional[aiohttp.ClientSession] = No
         return []
 
 
-def parse_winner(event: dict) -> Optional[str]:
-    """แกะผลจาก scores endpoint — คืนชื่อทีมที่ชนะ"""
-    scores = event.get("scores")
-    if not scores:
-        return None
+def parse_winner(event: dict, sport: str = "") -> Optional[str]:
+    """
+    แกะผลจาก scores endpoint — คืนชื่อทีมที่ชนะ
+    #28 Sport-specific logic:
+    - NBA/NFL/MLB/Soccer: ใช้คะแนนสูงสุด
+    - Soccer draw: คืน "DRAW" — caller จะ mark เป็น manual review
+    - MMA/Tennis: scores schema ต่างกัน → log + manual review
+    - ไม่มี scores หรือ schema ผิด → คืน None (needs manual review)
+    """
     if not event.get("completed", False):
         return None
-    # scores = [{"name": "TeamA", "score": "110"}, {"name": "TeamB", "score": "98"}]
+    scores = event.get("scores")
+    if not scores:
+        log.warning(f"[Settle] no scores for completed event: {event.get('id','?')} sport={sport}")
+        return None
+
+    sport_lower = sport.lower()
+
+    # MMA — scores อาจเป็น method (KO/TKO/Decision) ไม่ใช่ตัวเลข
+    if "mma" in sport_lower:
+        try:
+            sorted_scores = sorted(scores, key=lambda x: float(x.get("score", 0)), reverse=True)
+            winner = sorted_scores[0]["name"]
+            log.info(f"[Settle] MMA result: {winner} (scores={scores})")
+            return winner
+        except Exception:
+            log.warning(f"[Settle] MMA scores schema unknown: {scores} — needs manual review")
+            return "MANUAL_REVIEW"
+
+    # Tennis — scores เป็น sets (e.g. "6-4 7-5") ไม่ใช่ integer
+    if "tennis" in sport_lower:
+        try:
+            # นับ sets ที่ชนะ
+            set_wins = {}
+            for s in scores:
+                name = s.get("name","")
+                score_str = str(s.get("score","0"))
+                # รูปแบบ "6-4 7-5" → นับ sets
+                sets_won = sum(1 for pair in score_str.split() if "-" in pair
+                               and int(pair.split("-")[0]) > int(pair.split("-")[1]))
+                set_wins[name] = sets_won
+            if set_wins:
+                winner = max(set_wins, key=set_wins.get)
+                log.info(f"[Settle] Tennis result: {winner} sets={set_wins}")
+                return winner
+        except Exception:
+            log.warning(f"[Settle] Tennis scores schema unknown: {scores} — needs manual review")
+            return "MANUAL_REVIEW"
+
+    # Soccer — อาจเสมอ (arb scan กรอง draw ออกแล้ว แต่ผลจริงอาจเสมอ)
+    if "soccer" in sport_lower:
+        try:
+            sorted_scores = sorted(scores, key=lambda x: float(x.get("score", 0)), reverse=True)
+            if float(sorted_scores[0].get("score", 0)) == float(sorted_scores[-1].get("score", 0)):
+                log.info(f"[Settle] Soccer draw — {event.get('home_team','')} vs {event.get('away_team','')}")
+                return "DRAW"
+            return sorted_scores[0]["name"]
+        except Exception:
+            return "MANUAL_REVIEW"
+
+    # Default: NBA/NFL/MLB/EuroLeague — numeric score
     try:
         sorted_scores = sorted(scores, key=lambda x: float(x.get("score", 0)), reverse=True)
-        return sorted_scores[0]["name"]  # ทีมที่ได้คะแนนสูงสุด
+        return sorted_scores[0]["name"]
     except Exception:
-        return None
+        log.warning(f"[Settle] Unknown scores schema sport={sport}: {scores}")
+        return "MANUAL_REVIEW"
 
 
 def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
@@ -1803,8 +1937,32 @@ async def settle_completed_trades():
                     continue
 
                 # แมตช์เสร็จแล้ว!
-                winner = parse_winner(matched_event)
+                winner = parse_winner(matched_event, sport=trade.sport)
                 if not winner:
+                    continue
+
+                # #28 Handle special outcomes
+                if winner == "DRAW":
+                    log.info(f"[Settle] {trade.event} — DRAW, marking manual review")
+                    for cid in ALL_CHAT_IDS:
+                        try:
+                            await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
+                                text=f"🤝 *DRAW — Manual Review*\n`{trade.event}`\n"
+                                     f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเปล่า")
+                        except Exception: pass
+                    settled_ids.append(signal_id)
+                    continue
+
+                if winner == "MANUAL_REVIEW":
+                    log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
+                    for cid in ALL_CHAT_IDS:
+                        try:
+                            await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
+                                text=f"⚠️ *Manual Review Required*\n`{trade.event}`\n"
+                                     f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({trade.sport})\n"
+                                     f"กรุณาตรวจสอบผลเองใน Dashboard")
+                        except Exception: pass
+                    settled_ids.append(signal_id)
                     continue
 
                 # คำนวณ P&L จริง
@@ -1882,7 +2040,7 @@ def periodic_cleanup():
 
 async def scanner_loop():
     await asyncio.sleep(3)
-    log.info(f"[Scanner] v8.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
+    log.info(f"[Scanner] v9.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
     while True:
         if auto_scan:
             try: await do_scan()
@@ -1937,8 +2095,8 @@ tr:hover td{background:#1c2128}
 </style>
 </head>
 <body>
-<h1>🤖 ARB BOT v8.0</h1>
-<div class="sub">รีเฟรชทุก 20 วินาที — Production Ready + Sharp Money Analytics</div>
+<h1>🤖 ARB BOT v9.0</h1>
+<div class="sub">รีเฟรชทุก 20 วินาที — v9.0 — Slippage Guard + CLV Benchmark + Settlement Parser + Thread-Safe</div>
 
 <div class="tabs">
   <div class="tab active" onclick="switchTab('overview')">📊 Overview</div>
