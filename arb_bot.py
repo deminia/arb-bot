@@ -1024,6 +1024,21 @@ def calc_arb_fixed(odds_a: Decimal, odds_b: Decimal, total: Decimal):
     s_a = (total * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_a, (total - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
+def natural_round(amount: Decimal) -> Decimal:
+    """
+    Natural Rounding — ปัด stake ให้ดูเป็นธรรมชาติ ไม่ให้บ่อนสงสัย
+    < 50,000  → ปัดเป็นทวีคูณ 500  (เช่น 10,230 → 10,000 หรือ 10,500)
+    >= 50,000 → ปัดเป็นทวีคูณ 1,000 (เช่น 52,300 → 52,000)
+    + random jitter ±1 step เพื่อให้ไม่ซ้ำกันทุกครั้ง
+    """
+    import random
+    step = Decimal("500") if amount < Decimal("50000") else Decimal("1000")
+    # ปัดลงก่อน แล้วสุ่ม +0 หรือ +1 step (50/50)
+    base = (amount // step) * step
+    jitter = step if random.random() < 0.5 else Decimal("0")
+    return base + jitter
+
+
 def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> Decimal:
     """
     Kelly Criterion สำหรับ Arbitrage
@@ -1049,38 +1064,11 @@ def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> D
     # Kelly stake in THB
     kelly_thb  = Decimal(str(frac_kelly)) * BANKROLL_THB
     kelly_thb  = max(MIN_KELLY_STAKE, min(MAX_KELLY_STAKE, kelly_thb))
-    kelly_thb  = kelly_thb.quantize(Decimal("100"), rounding=ROUND_DOWN)
+    kelly_thb  = natural_round(kelly_thb)  # พรางตัว — ปัดเป็นเลขกลม 500/1000
+    kelly_thb  = max(MIN_KELLY_STAKE, kelly_thb)  # ตรวจ MIN อีกรอบหลัง round
 
-    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} stake=฿{int(kelly_thb):,}")
+    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} stake=฿{int(kelly_thb):,} (natural_round)")
     return kelly_thb
-
-
-def natural_round(amount_thb: Decimal) -> Decimal:
-    """
-    ปัดตัวเลขให้ดูเป็นธรรมชาติ ไม่ให้เว็บจับได้ว่าใช้บอท
-    หลักการ: ปัดไปหาเลขกลมที่ใกล้ที่สุด โดย randomize เล็กน้อย
-    ฿1,234.56 → ฿1,230 หรือ ฿1,240 (random ±)
-    """
-    import random
-    amt = int(amount_thb)
-    if amt < 500:
-        # ปัดไป 10
-        base = round(amt / 10) * 10
-        jitter = random.choice([-10, 0, 10])
-    elif amt < 2000:
-        # ปัดไป 50
-        base = round(amt / 50) * 50
-        jitter = random.choice([-50, 0, 50])
-    elif amt < 10000:
-        # ปัดไป 100
-        base = round(amt / 100) * 100
-        jitter = random.choice([-100, 0, 100])
-    else:
-        # ปัดไป 500
-        base = round(amt / 500) * 500
-        jitter = random.choice([-500, 0, 500])
-    result = max(100, base + jitter)
-    return Decimal(str(result))
 
 
 def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
