@@ -71,11 +71,11 @@ WEBHOOK_PATH    = "/webhook"
 USE_WEBHOOK     = bool(WEBHOOK_URL and "railway.app" in (WEBHOOK_URL or ""))
 
 # Kelly Criterion
-KELLY_FRACTION  = _d("KELLY_FRACTION", "0.25")   # 25% Kelly (conservative)
-BANKROLL_THB    = _d("BANKROLL_THB",   "100000")  # ทุนทั้งหมด (ใช้คำนวณ Kelly)
+KELLY_FRACTION  = _d("KELLY_FRACTION", "0.25")   # คงไว้ที่ 0.25 เพื่อความปลอดภัย
+BANKROLL_THB    = _d("BANKROLL_THB", "2000000")  # แนะนำให้ตั้งไว้ที่ 2 ล้านเพื่อให้ Kelly คำนวณได้ยอดหมื่นต้นๆ
 USE_KELLY       = _s("USE_KELLY", "true").lower() == "true"
-MIN_KELLY_STAKE = _d("MIN_KELLY_STAKE", "500")    # ขั้นต่ำ
-MAX_KELLY_STAKE = _d("MAX_KELLY_STAKE", "20000")  # สูงสุด
+MIN_KELLY_STAKE = _d("MIN_KELLY_STAKE", "10000") # บังคับขั้นต่ำ 10,000 บาท
+MAX_KELLY_STAKE = _d("MAX_KELLY_STAKE", "50000") # เพดานสูงสุดต่อรอบ
 
 # 1. Odds staleness — ไม่รับ odds ที่เก่ากว่านี้ (นาที)
 MAX_ODDS_AGE_MIN   = _i("MAX_ODDS_AGE_MIN",  5)
