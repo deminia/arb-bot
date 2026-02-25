@@ -452,6 +452,10 @@ steam_tracker:     dict[str, list]           = defaultdict(list)  # event → [(
 # 12. CLV tracking — odds ตอนปิด
 closing_odds:      dict[str, dict]           = {}   # event+outcome → {bm: final_odds}
 
+# Thread-safety lock — dashboard thread อ่าน global lists พร้อมกับ asyncio เขียน
+import threading as _threading
+_data_lock = _threading.Lock()
+
 
 # ══════════════════════════════════════════════════════════════════
 #  QUOTA TRACKER
@@ -737,8 +741,9 @@ def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float]]:
             return round((float(odds_got) / float(co) - 1) * 100, 2)
         return None
 
-    clv1 = _clv(trade.event, trade.leg1_bm, trade.leg1_bm, trade.leg1_odds)
-    clv2 = _clv(trade.event, trade.leg2_bm, trade.leg2_bm, trade.leg2_odds)
+    # ใช้ leg1_team/leg2_team เป็น outcome key (ชื่อทีม ไม่ใช่ bookmaker)
+    clv1 = _clv(trade.event, trade.leg1_team or trade.leg1_bm, trade.leg1_bm, trade.leg1_odds)
+    clv2 = _clv(trade.event, trade.leg2_team or trade.leg2_bm, trade.leg2_bm, trade.leg2_odds)
     return clv1, clv2
 
 
@@ -1085,15 +1090,26 @@ def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
 # ══════════════════════════════════════════════════════════════════
 #  SCAN
 # ══════════════════════════════════════════════════════════════════
-def is_stale(commence_time: str) -> bool:
-    """1. เช็ค odds staleness"""
+def is_stale(commence_time: str, last_update: str = "") -> bool:
+    """1. เช็ค odds staleness
+    - แมตช์เริ่มไปแล้วเกิน 3 ชั่วโมง → stale
+    - last_update ของ odds เก่าเกิน MAX_ODDS_AGE_MIN นาที → stale
+    """
+    now = datetime.now(timezone.utc)
     try:
         ct = datetime.fromisoformat(commence_time.replace("Z","+00:00"))
-        # ถ้าแมตช์เริ่มไปแล้วเกิน 3 ชั่วโมง ถือว่า stale
-        if ct < datetime.now(timezone.utc) - timedelta(hours=3):
+        if ct < now - timedelta(hours=3):
             return True
     except Exception:
         pass
+    # ตรวจ odds age จาก last_update (OddsAPI ส่งมาใน market/outcome)
+    if last_update:
+        try:
+            lu = datetime.fromisoformat(last_update.replace("Z","+00:00"))
+            if (now - lu).total_seconds() > MAX_ODDS_AGE_MIN * 60:
+                return True
+        except Exception:
+            pass
     return False
 
 def is_valid_odds(odds: Decimal) -> bool:
@@ -1191,6 +1207,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                 bk, bn = bm.get("key",""), bm.get("title", bm.get("key",""))
                 for mkt in bm.get("markets",[]):
                     if mkt.get("key") != "h2h": continue
+                    mkt_last_update = mkt.get("last_update", "")
                     for out in mkt.get("outcomes",[]):
                         name     = out.get("name","")
                         # กรอง Draw/Tie
@@ -1198,12 +1215,16 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                         odds_raw = Decimal(str(out.get("price",1)))
                         # 2. Odds filter
                         if not is_valid_odds(odds_raw): continue
+                        # 1b. Odds staleness check ด้วย last_update จริง
+                        if is_stale(event.get("commence_time",""), mkt_last_update):
+                            log.debug(f"[Stale-odds] {event_name} {bn} last_update={mkt_last_update}")
+                            continue
                         odds_eff = apply_slippage(odds_raw, bk)
                         if name not in best or odds_eff > best[name].odds:
                             best[name] = OddsLine(bookmaker=bn, outcome=name,
                                                   odds=odds_eff, odds_raw=odds_raw,
                                                   raw={"bm_key":bk,"event_id":event.get("id","")},
-                                                  last_update=commence)
+                                                  last_update=mkt_last_update or commence)
 
             poly = find_polymarket(event_name, poly_markets)
             if poly:
@@ -1831,31 +1852,32 @@ async def settle_completed_trades():
 def periodic_cleanup():
     """ทำความสะอาด memory — เรียกทุกรอบ scan เพื่อป้องกัน leak ใน 24/7"""
     now = datetime.now(timezone.utc)
-    # trim trade_records ใน memory (DB ยังเก็บทั้งหมด)
-    if len(trade_records) > 500:
-        trade_records[:] = trade_records[-500:]
-    # ลบ cooldown entries ที่หมดอายุ
-    expired = [k for k, v in alert_cooldown.items()
-               if (now - v).total_seconds() > ALERT_COOLDOWN_MIN * 60 * 2]
-    for k in expired:
-        del alert_cooldown[k]
-    # trim odds_history — เก็บแค่ 500 keys ล่าสุด
-    if len(odds_history) > 500:
-        keys_to_remove = list(odds_history.keys())[:-500]
-        for k in keys_to_remove:
-            del odds_history[k]
-    # trim steam_tracker — ลบ entries เก่า
-    expired_steam = [k for k, v in steam_tracker.items() if not v]
-    for k in expired_steam:
-        del steam_tracker[k]
-    # trim closing_odds — ลบ done entries
-    done_clw = [k for k, v in _closing_line_watch.items() if v.get("done")]
-    for k in done_clw:
-        del _closing_line_watch[k]
-    if len(closing_odds) > 500:
-        keys_to_remove = list(closing_odds.keys())[:-500]
-        for k in keys_to_remove:
-            del closing_odds[k]
+    with _data_lock:
+        # trim trade_records ใน memory (DB ยังเก็บทั้งหมด)
+        if len(trade_records) > 500:
+            trade_records[:] = trade_records[-500:]
+        # ลบ cooldown entries ที่หมดอายุ
+        expired = [k for k, v in alert_cooldown.items()
+                   if (now - v).total_seconds() > ALERT_COOLDOWN_MIN * 60 * 2]
+        for k in expired:
+            del alert_cooldown[k]
+        # trim odds_history — เก็บแค่ 500 keys ล่าสุด
+        if len(odds_history) > 500:
+            keys_to_remove = list(odds_history.keys())[:-500]
+            for k in keys_to_remove:
+                del odds_history[k]
+        # trim steam_tracker — ลบ entries เก่า
+        expired_steam = [k for k, v in steam_tracker.items() if not v]
+        for k in expired_steam:
+            del steam_tracker[k]
+        # trim closing_odds — ลบ done entries
+        done_clw = [k for k, v in _closing_line_watch.items() if v.get("done")]
+        for k in done_clw:
+            del _closing_line_watch[k]
+        if len(closing_odds) > 500:
+            keys_to_remove = list(closing_odds.keys())[:-500]
+            for k in keys_to_remove:
+                del closing_odds[k]
 
 
 async def scanner_loop():
@@ -2342,7 +2364,7 @@ function renderTab(tab, d) {
 const _qs = new URLSearchParams(location.search);
 const _tk = _qs.get('token') || '';
 function apiUrl(path) { return _tk ? path + '?token=' + encodeURIComponent(_tk) : path; }
-setInterval(() => location.reload(), 20000);
+setInterval(() => { load(); }, 20000);  // fetch+render เฉพาะ tab — ไม่ reload ทั้งหน้า
 
 async function action(key, value) {
   const r = await fetch(apiUrl('/api/control'), {
@@ -2644,8 +2666,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         clean_path = urlparse(self.path).path
 
         if clean_path == "/api/state":
-            confirmed = [t for t in trade_records if t.status=="confirmed"]
-            rejected  = [t for t in trade_records if t.status=="rejected"]
+            with _data_lock:
+                confirmed = list(t for t in trade_records if t.status=="confirmed")
+                rejected  = list(t for t in trade_records if t.status=="rejected")
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
             clv_values = []
             for t in confirmed:
