@@ -2057,7 +2057,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="th">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ARB BOT v8.0</title>
+<title>ARB BOT v9.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2947,7 +2947,7 @@ async def post_init(app: Application):
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *ARB BOT v8.0 — Production Ready*\n"
+            "🤖 *ARB BOT v9.0 — Sharp Edition*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"💾 Persistent Storage + Health Check\n"
             f"{restore_note}\n"
