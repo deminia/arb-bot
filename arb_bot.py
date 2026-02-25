@@ -93,15 +93,32 @@ LINE_MOVE_THRESHOLD = _d("LINE_MOVE_THRESHOLD", "0.05")  # 5%
 # 9. Multi-chat
 ALL_CHAT_IDS = [CHAT_ID] + EXTRA_CHAT_IDS
 
-_SPORTS_DEFAULT = "basketball_nba,baseball_mlb,mma_mixed_martial_arts"
+_SPORTS_DEFAULT = (
+    "basketball_nba,basketball_euroleague,basketball_ncaab,"
+    "americanfootball_nfl,"
+    "soccer_epl,soccer_uefa_champs_league,soccer_spain_la_liga,soccer_germany_bundesliga,"
+    "soccer_fifa_world_cup,"
+    "baseball_mlb,mma_mixed_martial_arts"
+)
 SPORTS     = [s.strip() for s in _s("SPORTS",_SPORTS_DEFAULT).split(",") if s.strip()]
 BOOKMAKERS = _s("BOOKMAKERS","pinnacle,onexbet,dafabet")
 
 SPORT_EMOJI = {
-    "basketball_nba":"🏀","basketball_euroleague":"🏀",
+    "basketball_nba":"🏀","basketball_euroleague":"🏀","basketball_ncaab":"🏀",
+    "americanfootball_nfl":"🏈","americanfootball_nfl_super_bowl_winner":"🏈",
+    "soccer_epl":"⚽","soccer_uefa_champs_league":"⚽",
+    "soccer_spain_la_liga":"⚽","soccer_germany_bundesliga":"⚽",
+    "soccer_fifa_world_cup":"⚽",
     "tennis_atp_wimbledon":"🎾","tennis_wta":"🎾",
     "baseball_mlb":"⚾","mma_mixed_martial_arts":"🥊",
     "esports_csgo":"🎮","esports_dota2":"🎮","esports_lol":"🎮",
+}
+
+# กีฬาที่ควรเน้น H2H/Moneyline (Sharp money เข้ามากที่ตลาดนี้)
+H2H_FOCUS_SPORTS = {
+    "basketball_nba", "basketball_euroleague", "basketball_ncaab",
+    "tennis_atp_wimbledon", "tennis_wta",
+    "americanfootball_nfl",
 }
 
 # 6. Commission แบบ dynamic (อ่านจาก env ได้)
@@ -467,7 +484,7 @@ TEAM_ALIASES = {
     "lakers":"Los Angeles Lakers","la lakers":"Los Angeles Lakers",
     "clippers":"LA Clippers","warriors":"Golden State Warriors",
     "celtics":"Boston Celtics","heat":"Miami Heat","nets":"Brooklyn Nets",
-    "bulls":"Chicago Bulls","spurs":"San Antonio Spurs","kings":"Sacramento Kings",
+    "bulls":"Chicago Bulls","sa spurs":"San Antonio Spurs","kings":"Sacramento Kings",
     "nuggets":"Denver Nuggets","suns":"Phoenix Suns","bucks":"Milwaukee Bucks",
     "sixers":"Philadelphia 76ers","76ers":"Philadelphia 76ers",
     "knicks":"New York Knicks","mavs":"Dallas Mavericks",
@@ -476,6 +493,41 @@ TEAM_ALIASES = {
     "dodgers":"Los Angeles Dodgers","cubs":"Chicago Cubs","astros":"Houston Astros",
     "navi":"Natus Vincere","faze":"FaZe Clan","g2":"G2 Esports",
     "liquid":"Team Liquid","og":"OG","secret":"Team Secret",
+    # Soccer — EPL
+    "man utd":"Manchester United","man united":"Manchester United","mufc":"Manchester United",
+    "man city":"Manchester City","mcfc":"Manchester City",
+    "arsenal":"Arsenal","gunners":"Arsenal","afc":"Arsenal",
+    "liverpool":"Liverpool","reds":"Liverpool","lfc":"Liverpool",
+    "chelsea":"Chelsea","blues":"Chelsea","cfc":"Chelsea",
+    "spurs":"Tottenham Hotspur","tottenham":"Tottenham Hotspur","thfc":"Tottenham Hotspur",
+    "newcastle":"Newcastle United","nufc":"Newcastle United",
+    "villa":"Aston Villa","avfc":"Aston Villa",
+    "west ham":"West Ham United","hammers":"West Ham United",
+    "everton":"Everton","toffees":"Everton",
+    # Soccer — La Liga / Bundesliga / UCL
+    "barca":"FC Barcelona","barcelona":"FC Barcelona","fcb":"FC Barcelona",
+    "real":"Real Madrid","rmcf":"Real Madrid",
+    "atletico":"Atletico Madrid","atleti":"Atletico Madrid",
+    "bayern":"Bayern Munich","fcb munich":"Bayern Munich",
+    "dortmund":"Borussia Dortmund","bvb":"Borussia Dortmund",
+    "psg":"Paris Saint-Germain","paris":"Paris Saint-Germain",
+    "juve":"Juventus","juventus":"Juventus",
+    "inter":"Inter Milan","internazionale":"Inter Milan",
+    "milan":"AC Milan","acm":"AC Milan",
+    # NFL
+    "chiefs":"Kansas City Chiefs","kc":"Kansas City Chiefs",
+    "eagles":"Philadelphia Eagles","philly":"Philadelphia Eagles",
+    "49ers":"San Francisco 49ers","niners":"San Francisco 49ers",
+    "bills":"Buffalo Bills","cowboys":"Dallas Cowboys",
+    "ravens":"Baltimore Ravens","packers":"Green Bay Packers",
+    "lions":"Detroit Lions","dolphins":"Miami Dolphins",
+    "bengals":"Cincinnati Bengals","rams":"Los Angeles Rams",
+    "chargers":"Los Angeles Chargers","steelers":"Pittsburgh Steelers",
+    "bears":"Chicago Bears","patriots":"New England Patriots",
+    "commanders":"Washington Commanders","giants":"New York Giants",
+    "jets":"New York Jets","texans":"Houston Texans",
+    "broncos":"Denver Broncos","seahawks":"Seattle Seahawks",
+    "vikings":"Minnesota Vikings","saints":"New Orleans Saints",
 }
 
 def normalize_team(name: str) -> str:
@@ -501,8 +553,9 @@ async def detect_line_movements(odds_by_sport: dict):
     """
     เปรียบเทียบ odds ใหม่กับ history
     ตรวจจับ: Line Move, Steam Move, Reverse Line Movement
+    พร้อมจัดเกรดสัญญาณ (A/B/C) และวิเคราะห์จังหวะเวลา
     """
-    new_movements: list[LineMovement] = []
+    new_movements: list[tuple[LineMovement, dict]] = []  # (lm, context)
     now = datetime.now(timezone.utc)
 
     for sport, events in odds_by_sport.items():
@@ -510,6 +563,7 @@ async def detect_line_movements(odds_by_sport: dict):
             home  = event.get("home_team","")
             away  = event.get("away_team","")
             ename = f"{home} vs {away}"
+            commence = event.get("commence_time","")
 
             for bm in event.get("bookmakers",[]):
                 bk = bm.get("key","")
@@ -536,7 +590,8 @@ async def detect_line_movements(odds_by_sport: dict):
                                         (b,t) for b,t in steam_tracker[steam_key]
                                         if (now-t).total_seconds() < 300
                                     ]
-                                    is_steam = len(steam_tracker[steam_key]) >= 2
+                                    num_bm_moved = len(steam_tracker[steam_key])
+                                    is_steam = num_bm_moved >= 2
 
                                     # 10. RLM: odds ขยับ反向กับ public bet
                                     # ถ้า odds ลง (favourite กลายเป็น underdog) = sharp money เดิน
@@ -549,7 +604,12 @@ async def detect_line_movements(odds_by_sport: dict):
                                         pct_change=pct, direction=direction,
                                         is_steam=is_steam, is_rlm=is_rlm,
                                     )
-                                    new_movements.append(lm)
+                                    ctx = {
+                                        "commence_time": commence,
+                                        "num_bm_moved": num_bm_moved,
+                                        "bm_key": bk,
+                                    }
+                                    new_movements.append((lm, ctx))
                                     line_movements.append(lm)
                                     db_save_line_movement(lm)  # 💾
                                     log.info(f"[LineMove] {ename} | {bn} {outcome} {float(old_odds):.3f}→{float(new_odds):.3f} ({pct:.1%}) {'🌊STEAM' if is_steam else ''} {'🔄RLM' if is_rlm else ''}")
@@ -568,28 +628,83 @@ async def detect_line_movements(odds_by_sport: dict):
         line_movements[:] = line_movements[-200:]
 
 
-async def send_line_move_alerts(movements: list[LineMovement]):
-    """ส่ง alert สำหรับ Line Movement"""
-    for lm in movements:
+async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
+    """
+    ส่ง alert สำหรับ Line Movement พร้อม:
+    - Signal Grade (A/B/C)
+    - Time-of-Move analysis
+    - Direct betting links
+    - Liquidity check
+    """
+    for lm, ctx in movements:
+        commence_time = ctx.get("commence_time", "")
+        num_bm_moved  = ctx.get("num_bm_moved", 1)
+        bm_key        = ctx.get("bm_key", "")
+
+        # จัดเกรดสัญญาณ
+        grade, grade_emoji, reasons = grade_signal(
+            lm, liquidity_usd=0,
+            commence_time=commence_time,
+            num_bm_moved=num_bm_moved,
+        )
+
+        # Header ตามประเภท
         tags = []
-        if lm.is_steam: tags.append("🌊 *STEAM MOVE*")
         if lm.is_rlm:   tags.append("🔄 *REVERSE LINE MOVEMENT*")
-        if not tags:     tags.append("📊 *Line Movement*")
+        if lm.is_steam:  tags.append("🌊 *STEAM MOVE*")
+        if not tags:      tags.append("📊 *Line Movement*")
 
         pct_str = f"+{lm.pct_change:.1%}" if lm.pct_change > 0 else f"{lm.pct_change:.1%}"
+        sport_emoji = SPORT_EMOJI.get(lm.sport, "🏆")
+
+        # เวลาแข่ง
+        time_info = ""
+        if commence_time:
+            try:
+                ct = datetime.fromisoformat(commence_time.replace("Z","+00:00"))
+                mins = (ct - datetime.now(timezone.utc)).total_seconds() / 60
+                if mins > 0:
+                    if mins < 60:
+                        time_info = f"⏰ เริ่มใน {int(mins)} นาที"
+                    else:
+                        time_info = f"📅 {commence_time[:16].replace('T',' ')} UTC"
+            except Exception:
+                pass
+
         msg = (
             f"{'  '.join(tags)}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏆 `{lm.event}`\n"
-            f"📡 {lm.bookmaker} — {lm.outcome}\n"
-            f"📉 {float(lm.odds_before):.3f} → {float(lm.odds_after):.3f} ({pct_str}) {lm.direction}\n"
+            f"{grade_emoji} *เกรด {grade}* {'— 🔥 สัญญาณแข็ง!' if grade == 'A' else '— สัญญาณพอใช้' if grade == 'B' else ''}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{sport_emoji} `{lm.event}`\n"
+            f"📡 {lm.bookmaker} — *{lm.outcome}*\n"
+            f"📉 `{float(lm.odds_before):.3f}` → `{float(lm.odds_after):.3f}` ({pct_str}) {lm.direction}\n"
         )
-        if lm.is_rlm:
-            msg += (f"\n💡 *Sharp Money Signal*\n"
-                    f"Pinnacle ขยับ odds ลงแรง = มีเงินใหญ่เดิน\n"
-                    f"Soft books ยังไม่ตาม → โอกาส value bet!")
-        if lm.is_steam:
-            msg += f"\n⚡ หลายเว็บขยับพร้อมกัน = สัญญาณแข็งแกร่ง"
+        if time_info:
+            msg += f"{time_info}\n"
+
+        # แสดงเหตุผลของเกรด
+        msg += f"\n📋 *วิเคราะห์สัญญาณ:*\n"
+        for reason in reasons:
+            msg += f"  {reason}\n"
+
+        # คำแนะนำสำหรับ Grade A/B
+        if grade in ("A", "B") and (lm.is_rlm or lm.is_steam):
+            action = "BET" if lm.pct_change < 0 else "FADE"
+            target = lm.outcome
+            if lm.pct_change < 0:
+                msg += (f"\n💡 *แนะนำ:* เดิมพัน *{target}* (odds ลง = เงินใหญ่เดิน)\n"
+                        f"Soft books ยังไม่ตาม → โอกาส value bet!\n")
+            else:
+                msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
+
+            # Direct betting links
+            msg += f"\n🔗 *วางเดิมพันได้ที่:*\n"
+            msg += build_betting_links(lm.event, lm.outcome, lm.sport, lm.odds_after, bm_key)
+            msg += "\n"
+
+        # H2H Focus note
+        if lm.sport in H2H_FOCUS_SPORTS:
+            msg += f"\n🎯 _กีฬานี้ Sharp money เน้นตลาด H2H — สัญญาณน่าเชื่อถือ_"
 
         for cid in ALL_CHAT_IDS:
             try:
@@ -625,6 +740,141 @@ def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float]]:
     clv1 = _clv(trade.event, trade.leg1_bm, trade.leg1_bm, trade.leg1_odds)
     clv2 = _clv(trade.event, trade.leg2_bm, trade.leg2_bm, trade.leg2_odds)
     return clv1, clv2
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SIGNAL GRADING SYSTEM (RLM + Steam)
+# ══════════════════════════════════════════════════════════════════
+def classify_move_time(move_ts: str, commence_time: str = "") -> tuple[str, str, float]:
+    """
+    จำแนกจังหวะเวลาของ Line Movement
+    Returns: (label, description, confidence_boost 0.0-1.0)
+
+    - เช้าตรู่ (00:00-08:00 UTC) → Sharp analyst money (แม่นยำสูง)
+    - ก่อนแข่ง ≤15 นาที → Insider / injury news (แม่นยำที่สุด)
+    - ช่วงกลางวัน (08:00-20:00) → อาจเป็นกระแสหน้าตั๋ว (ปานกลาง)
+    - กลางคืน (20:00-00:00) → ผสม
+    """
+    try:
+        ts = datetime.fromisoformat(move_ts.replace("Z","+00:00"))
+    except Exception:
+        ts = datetime.now(timezone.utc)
+
+    # เช็คเวลาก่อนแข่ง
+    if commence_time:
+        try:
+            ct = datetime.fromisoformat(commence_time.replace("Z","+00:00"))
+            mins_to_start = (ct - ts).total_seconds() / 60
+            if 0 < mins_to_start <= 15:
+                return "PRE-MATCH", "⏰ ก่อนแข่ง ≤15 นาที — วงในหรือข่าวบาดเจ็บ", 1.0
+            if 0 < mins_to_start <= 60:
+                return "CLOSE", f"⏰ เหลือ {int(mins_to_start)} นาที — สัญญาณแรง", 0.7
+        except Exception:
+            pass
+
+    hour = ts.hour
+    if 0 <= hour < 8:
+        return "EARLY", "🌅 เช้าตรู่ — Sharp analyst money", 0.8
+    elif 8 <= hour < 20:
+        return "MIDDAY", "☀️ กลางวัน — อาจเป็นกระแสหน้าตั๋ว", 0.3
+    else:
+        return "NIGHT", "🌙 กลางคืน — สัญญาณผสม", 0.5
+
+
+def grade_signal(lm: LineMovement, liquidity_usd: float = 0,
+                 commence_time: str = "", num_bm_moved: int = 1) -> tuple[str, str, list[str]]:
+    """
+    จัดเกรดสัญญาณ RLM/Steam
+    Returns: (grade, grade_emoji, reasons)
+
+    Grade A: RLM + (Steam หรือ High Liquidity) + จังหวะดี
+    Grade B: RLM หรือ Steam อย่างเดียว + liquidity พอใช้
+    Grade C: Line Move ธรรมดา
+    """
+    score = 0.0
+    reasons = []
+
+    # RLM = +3 คะแนน
+    if lm.is_rlm:
+        score += 3.0
+        reasons.append("🔄 RLM — Pinnacle odds ลง (Sharp money)")
+
+    # Steam = +2 คะแนน
+    if lm.is_steam:
+        score += 2.0
+        reasons.append(f"🌊 Steam Move — {num_bm_moved} เว็บขยับพร้อมกัน")
+
+    # Liquidity
+    if liquidity_usd >= RLM_MIN_LIQUIDITY_USD:
+        score += 2.0
+        reasons.append(f"💰 High Liquidity (${liquidity_usd:,.0f})")
+    elif liquidity_usd >= 5000:
+        score += 1.0
+        reasons.append(f"💵 Medium Liquidity (${liquidity_usd:,.0f})")
+    elif liquidity_usd > 0 and liquidity_usd < 5000:
+        score -= 1.0
+        reasons.append(f"⚠️ Low Liquidity (${liquidity_usd:,.0f}) — อาจเป็นสัญญาณปลอม")
+
+    # Time-of-Move
+    time_label, time_desc, time_boost = classify_move_time(lm.ts, commence_time)
+    score += time_boost * 2  # max +2 คะแนน
+    reasons.append(time_desc)
+
+    # H2H Focus — กีฬาที่ Sharp เข้ามาก
+    if lm.sport in H2H_FOCUS_SPORTS:
+        score += 0.5
+        reasons.append(f"🎯 H2H Focus Sport — Sharp money เข้ามาก")
+
+    # ขนาดการขยับ — ยิ่งแรงยิ่งดี
+    abs_pct = abs(float(lm.pct_change))
+    if abs_pct >= 0.15:
+        score += 1.0
+        reasons.append(f"📊 ขยับแรง {abs_pct:.1%}")
+    elif abs_pct >= 0.10:
+        score += 0.5
+
+    # จัดเกรด
+    if score >= 6.0:
+        return "A", "🅰️", reasons
+    elif score >= 3.5:
+        return "B", "🅱️", reasons
+    else:
+        return "C", "🅲", reasons
+
+
+def build_betting_links(event_name: str, outcome: str, sport: str,
+                        odds: Decimal, bookmaker_key: str = "") -> str:
+    """สร้างลิงค์ตรงไปหน้า betting สำหรับ RLM/Steam signal"""
+    links = []
+    parts = event_name.split(" vs ")
+
+    # Pinnacle
+    pin_sport = "basketball" if "basketball" in sport else \
+                "soccer" if "soccer" in sport else \
+                "american-football" if "americanfootball" in sport else \
+                "baseball" if "baseball" in sport else \
+                "tennis" if "tennis" in sport else \
+                "mixed-martial-arts" if "mma" in sport else "sports"
+    links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{pin_sport})")
+
+    # 1xBet
+    xbet_sport = "basketball" if "basketball" in sport else \
+                 "soccer" if "soccer" in sport else \
+                 "american-football" if "americanfootball" in sport else \
+                 "baseball" if "baseball" in sport else \
+                 "tennis" if "tennis" in sport else \
+                 "mixed-martial-arts" if "mma" in sport else "sports"
+    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{xbet_sport})")
+
+    # Dafabet
+    links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/sports)")
+
+    # Polymarket (ถ้าเป็นกีฬาที่มี market)
+    if parts:
+        search_q = parts[0].replace(" ", "+")
+        links.append(f"  🟣 [Polymarket](https://polymarket.com/search?query={search_q})")
+
+    return "\n".join(links)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -871,7 +1121,9 @@ def is_on_cooldown(event: str, bm1: str, bm2: str) -> bool:
     return False
 
 # Minimum liquidity USD สำหรับ Polymarket (ตั้งใน Railway)
-POLY_MIN_LIQUIDITY = float(os.getenv("POLY_MIN_LIQUIDITY", "1000"))
+POLY_MIN_LIQUIDITY     = float(os.getenv("POLY_MIN_LIQUIDITY", "1000"))
+# Liquidity ขั้นต่ำสำหรับ RLM signal — ต่ำกว่านี้ถือว่าสัญญาณปลอม
+RLM_MIN_LIQUIDITY_USD  = float(os.getenv("RLM_MIN_LIQUIDITY_USD", "10000"))
 
 def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     parts = [p.strip() for p in event_name.replace(" vs ","|").split("|")]
