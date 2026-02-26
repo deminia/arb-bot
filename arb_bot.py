@@ -329,6 +329,18 @@ async def turso_init():
         _turso = None
         db_init_local()
 
+def _to_positional(sql: str, params: tuple) -> tuple[str, list]:
+    """Convert ? placeholders to :1,:2,... for libsql_client HTTP mode"""
+    idx = 0
+    result = []
+    for ch in sql:
+        if ch == '?':
+            idx += 1
+            result.append(f":{idx}")
+        else:
+            result.append(ch)
+    return "".join(result), list(params)
+
 async def turso_exec(sql: str, params: tuple = ()):
     """Execute write query (Turso หรือ SQLite) — v10-5: retry 3x + API-aware"""
     if _turso:
@@ -341,8 +353,9 @@ async def turso_exec(sql: str, params: tuple = ()):
                         conn.commit()
                     await loop.run_in_executor(None, _do_sync)
                 else:
-                    # libsql_client: execute(stmt, args) — args เป็น list หรือ None
-                    await _turso.execute(sql, list(params) if params else None)
+                    # libsql_client HTTP: ต้องใช้ :1,:2,... แทน ?
+                    _sql, _args = _to_positional(sql, params) if params else (sql, None)
+                    await _turso.execute(_sql, _args)
                 return
             except BaseException as e:  # catch non-Exception errors too
                 etype = type(e).__name__
@@ -381,7 +394,8 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
                     return cur.fetchall()
                 return await loop.run_in_executor(None, _do_query)
             else:
-                rs = await _turso.execute(sql, list(params) if params else None)
+                _sql, _args = _to_positional(sql, params) if params else (sql, None)
+                rs = await _turso.execute(_sql, _args)
                 # libsql_client Row เป็น tuple-like — ใช้ tuple(row) โดยตรง
                 return [tuple(row) for row in rs.rows]
         except Exception as e:
