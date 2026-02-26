@@ -341,13 +341,15 @@ async def turso_exec(sql: str, params: tuple = ()):
                         conn.commit()
                     await loop.run_in_executor(None, _do_sync)
                 else:
-                    await _turso.execute(sql, list(params))
+                    # libsql_client: ใช้ Statement object เพื่อส่ง params อย่างถูกต้อง
+                    stmt = _libsql_mod.Statement(sql, list(params)) if params else sql
+                    await _turso.execute(stmt)
                 return
-            except Exception as e:
+            except BaseException as e:  # catch non-Exception errors too
                 if attempt < 2:
                     await asyncio.sleep(1.5 ** attempt)
                 else:
-                    log.error(f"[DB] turso_exec failed 3x: {e} — falling back to SQLite")
+                    log.error(f"[DB] turso_exec failed 3x: {e!r} — falling back to SQLite")
                     if _app:
                         try:
                             asyncio.get_running_loop().create_task(
@@ -378,9 +380,10 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
                     return cur.fetchall()
                 return await loop.run_in_executor(None, _do_query)
             else:
-                rs = await _turso.execute(sql, list(params))
-                # libsql_client Row ไม่มี .values() — ใช้ list(row) แทน
-                return [tuple(list(row)) for row in rs.rows]
+                stmt = _libsql_mod.Statement(sql, list(params)) if params else sql
+                rs = await _turso.execute(stmt)
+                # libsql_client Row เป็น tuple-like — ใช้ tuple(row) โดยตรง
+                return [tuple(row) for row in rs.rows]
         except Exception as e:
             log.error(f"[DB] turso_query: {e}")
     # SQLite fallback
