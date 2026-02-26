@@ -530,9 +530,13 @@ async def db_load_all() -> tuple[list, list, list]:
                 trades.append(TradeRecord(
                     signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
                     leg1_team=r[5] or "",leg2_team=r[6] or "",
-                    leg1_odds=r[7],leg2_odds=r[8],stake1_thb=r[9],stake2_thb=r[10],
-                    profit_pct=r[11],status=r[12],clv_leg1=r[13],clv_leg2=r[14],
-                    actual_profit_thb=r[15],settled_at=r[16],created_at=r[17],
+                    leg1_odds=float(r[7] or 0),leg2_odds=float(r[8] or 0),
+                    stake1_thb=int(float(r[9] or 0)),stake2_thb=int(float(r[10] or 0)),
+                    profit_pct=float(r[11] or 0),status=r[12],
+                    clv_leg1=float(r[13]) if r[13] is not None else None,
+                    clv_leg2=float(r[14]) if r[14] is not None else None,
+                    actual_profit_thb=int(float(r[15])) if r[15] is not None else None,
+                    settled_at=r[16],created_at=r[17],
                     commence_time=r[18] if n >= 19 else ""))
             else:
                 # DB เก่า — ไม่มี leg1_team/leg2_team
@@ -542,15 +546,20 @@ async def db_load_all() -> tuple[list, list, list]:
                     signal_id=r[0],event=ev,sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
                     leg1_team=parts[0] if parts else "",
                     leg2_team=parts[1] if len(parts)>1 else "",
-                    leg1_odds=r[5],leg2_odds=r[6],stake1_thb=r[7],stake2_thb=r[8],
-                    profit_pct=r[9],status=r[10],clv_leg1=r[11],clv_leg2=r[12],
-                    actual_profit_thb=r[13],settled_at=r[14],created_at=r[15]))
+                    leg1_odds=float(r[5] or 0),leg2_odds=float(r[6] or 0),
+                    stake1_thb=int(float(r[7] or 0)),stake2_thb=int(float(r[8] or 0)),
+                    profit_pct=float(r[9] or 0),status=r[10],
+                    clv_leg1=float(r[11]) if r[11] is not None else None,
+                    clv_leg2=float(r[12]) if r[12] is not None else None,
+                    actual_profit_thb=int(float(r[13])) if r[13] is not None else None,
+                    settled_at=r[14],created_at=r[15]))
 
         opps_rows = await turso_query(
             "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100")
-        opps = [{"id":r[0],"event":r[1],"sport":r[2],"profit_pct":r[3],
-                 "leg1_bm":r[4],"leg1_odds":r[5],"leg2_bm":r[6],"leg2_odds":r[7],
-                 "stake1_thb":r[8],"stake2_thb":r[9],"created_at":r[10],"status":r[11]}
+        opps = [{"id":r[0],"event":r[1],"sport":r[2],"profit_pct":float(r[3] or 0),
+                 "leg1_bm":r[4],"leg1_odds":float(r[5] or 0),"leg2_bm":r[6],"leg2_odds":float(r[7] or 0),
+                 "stake1_thb":int(float(r[8] or 0)),"stake2_thb":int(float(r[9] or 0)),
+                 "created_at":r[10],"status":r[11]}
                 for r in opps_rows]
 
         lm_rows = await turso_query(
@@ -559,7 +568,7 @@ async def db_load_all() -> tuple[list, list, list]:
             event=r[1],sport=r[2],bookmaker=r[3],outcome=r[4],
             odds_before=Decimal(str(r[5])),odds_after=Decimal(str(r[6])),
             pct_change=Decimal(str(r[7])),direction=r[8],
-            is_steam=bool(r[9]),is_rlm=bool(r[10]),ts=r[11])
+            is_steam=bool(int(r[9] or 0)),is_rlm=bool(int(r[10] or 0)),ts=r[11])
                for r in lm_rows]
 
         log.info(f"[DB] loaded: trades={len(trades)}, opps={len(opps)}, moves={len(lms)}")
