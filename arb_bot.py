@@ -286,8 +286,14 @@ def _turso_http(statements: list) -> list:
         headers={"Authorization": f"Bearer {_turso_token}", "Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode(errors="replace")[:500]
+        log.error(f"[DB] Turso HTTP {he.code}: {err_body}")
+        log.error(f"[DB] Request body (first 500): {body[:500].decode(errors='replace')}")
+        raise RuntimeError(f"Turso HTTP {he.code}: {err_body[:200]}") from he
     data = json.loads(raw)
     # DEBUG: log first response item type to verify format
     if data.get("results"):
