@@ -2651,7 +2651,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             health = {
                 "status":       "ok",
-                "db_mode":      "turso" if _turso else "sqlite",
+                "db_mode":      "turso" if _turso_ok else "sqlite",
                 "last_scan":    last_scan_time,
                 "pending":      len(pending),
                 "api_remaining":api_remaining,
@@ -2727,7 +2727,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "min_profit_pct":  float(MIN_PROFIT_PCT),
                 "max_odds":        float(MAX_ODDS_ALLOWED),
                 "scan_interval":   SCAN_INTERVAL,
-                "db_mode":         "turso" if _turso else "sqlite",
+                "db_mode":         "turso" if _turso_ok else "sqlite",
                 "line_move_count": len(lm_snap),
                 "confirmed_trades":len(confirmed),
                 "opportunities":   opp_snap,
@@ -2788,7 +2788,7 @@ async def post_init(app: Application):
     await turso_init()            # Turso cloud (async)
 
     # โหลด bot state จาก Turso (persistent) → fallback local SQLite
-    if _turso is not None:
+    if _turso_ok:
         scan_count     = int(await db_load_state_async("scan_count", "0"))
         last_scan_time = await db_load_state_async("last_scan_time", "ยังไม่ได้สแกน")
         api_remaining  = int(await db_load_state_async("api_remaining", "500"))
@@ -2807,9 +2807,9 @@ async def post_init(app: Application):
     opportunity_log.extend(loaded_opps)
     line_movements.extend(lms)
 
-    db_mode = "☁️ Turso" if (_turso is not None) else "💾 SQLite local (data resets on deploy!)"
+    db_mode = "☁️ Turso" if _turso_ok else "💾 SQLite local (data resets on deploy!)"
     log.info(f"[DB] {db_mode} | trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
-    if _turso is None:
+    if not _turso_ok:
         log.warning("[DB] ⚠️ Running WITHOUT Turso — all stats will reset on next deploy")
 
     # restore pending settlement — trades ที่ confirmed แต่ยังไม่มีผล
@@ -2849,7 +2849,7 @@ async def post_init(app: Application):
     threading.Thread(target=start_dashboard, daemon=True).start()
 
     is_restored = len(trade_records) > 0 or scan_count > 0
-    db_mode_str  = "☁️ Turso ✅" if (_turso is not None) else "⚠️ SQLite (resets on deploy)"
+    db_mode_str  = "☁️ Turso ✅" if _turso_ok else "⚠️ SQLite (resets on deploy)"
     restore_note = f"♻️ {db_mode_str}: {len(trade_records)} trades, {scan_count} scans" if is_restored else f"🆕 {db_mode_str}: fresh start"
 
     await app.bot.send_message(
