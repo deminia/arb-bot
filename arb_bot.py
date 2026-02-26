@@ -313,16 +313,20 @@ async def turso_init():
             _turso = conn
             log.info(f"[DB] Turso (sync API) connected ✅ | trade_records={count}")
         else:
-            # libsql_client: async API
-            client = _libsql_mod.create_client(url=http_url, auth_token=token)
-            for stmt in CREATE_TABLES_SQL.strip().split(";"):
-                s = stmt.strip()
-                if s:
-                    await client.execute(s)
-            test  = await client.execute("SELECT COUNT(*) FROM trade_records")
-            count = test.rows[0][0] if test.rows else 0
+            # libsql_client: ใช้ create_client_sync() ใน executor — รองรับ ? ปกติ
+            loop = asyncio.get_running_loop()
+            def _init_async_sync():
+                c = _libsql_mod.create_client_sync(url=http_url, auth_token=token)
+                for stmt in CREATE_TABLES_SQL.strip().split(";"):
+                    s = stmt.strip()
+                    if s:
+                        c.execute(s)
+                rs = c.execute("SELECT COUNT(*) FROM trade_records")
+                count = rs.rows[0][0] if rs.rows else 0
+                return c, count
+            client, count = await loop.run_in_executor(None, _init_async_sync)
             _turso = client
-            log.info(f"[DB] Turso (async API) connected ✅ | trade_records={count}")
+            log.info(f"[DB] Turso (libsql_client sync-in-executor) connected \u2705 | trade_records={count}")
 
     except Exception as e:
         log.error(f"[DB] Turso init failed: {e} — fallback to SQLite")
@@ -353,9 +357,11 @@ async def turso_exec(sql: str, params: tuple = ()):
                         conn.commit()
                     await loop.run_in_executor(None, _do_sync)
                 else:
-                    # libsql_client HTTP: ต้องใช้ :1,:2,... แทน ?
-                    _sql, _args = _to_positional(sql, params) if params else (sql, None)
-                    await _turso.execute(_sql, _args)
+                    # libsql_client sync-in-executor: รองรับ ? ปกติ
+                    loop = asyncio.get_running_loop()
+                    def _exec(c=_turso, s=sql, p=params):
+                        c.execute(s, list(p) if p else None)
+                    await loop.run_in_executor(None, _exec)
                 return
             except BaseException as e:  # catch non-Exception errors too
                 etype = type(e).__name__
@@ -394,10 +400,12 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
                     return cur.fetchall()
                 return await loop.run_in_executor(None, _do_query)
             else:
-                _sql, _args = _to_positional(sql, params) if params else (sql, None)
-                rs = await _turso.execute(_sql, _args)
-                # libsql_client Row เป็น tuple-like — ใช้ tuple(row) โดยตรง
-                return [tuple(row) for row in rs.rows]
+                # libsql_client sync-in-executor
+                loop = asyncio.get_running_loop()
+                def _qry(c=_turso, s=sql, p=params):
+                    rs = c.execute(s, list(p) if p else None)
+                    return [tuple(row) for row in rs.rows]
+                return await loop.run_in_executor(None, _qry)
         except Exception as e:
             log.error(f"[DB] turso_query: {e}")
     # SQLite fallback
