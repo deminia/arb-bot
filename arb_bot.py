@@ -11,15 +11,21 @@
 """
 
 import asyncio, json, logging, os, re, signal, sqlite3, threading, time, uuid
+# v10-4: ลอง libsql (new sync API) → libsql_experimental (sync) → libsql_client (async)
+_TURSO_API = None  # "sync" | "async" | None
 try:
-    import libsql_experimental as turso_client  # v10-4: libsql_experimental แทน libsql_client
-    HAS_TURSO = True
+    import libsql as _libsql_mod           # package ใหม่ล่าสุด (sync sqlite3-like)
+    HAS_TURSO = True; _TURSO_API = "sync"
 except ImportError:
     try:
-        import libsql_client as turso_client  # fallback สำหรับ env เก่า
-        HAS_TURSO = True
+        import libsql_experimental as _libsql_mod  # เก่ากว่า (sync)
+        HAS_TURSO = True; _TURSO_API = "sync"
     except ImportError:
-        HAS_TURSO = False
+        try:
+            import libsql_client as _libsql_mod    # async API
+            HAS_TURSO = True; _TURSO_API = "async"
+        except ImportError:
+            HAS_TURSO = False; _libsql_mod = None
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -274,44 +280,70 @@ _turso: Optional[object] = None
 
 async def turso_init():
     global _turso
-    # Re-read env vars at runtime (Railway injects them before process start,
-    # but USE_TURSO was computed at module load — re-check here to be safe)
     url   = os.environ.get("TURSO_URL",   TURSO_URL).strip()
     token = os.environ.get("TURSO_TOKEN", TURSO_TOKEN).strip()
-    log.info(f"[DB] TURSO_URL={'set ('+url[:30]+'...)' if url else 'NOT SET'} | HAS_TURSO={HAS_TURSO}")
+    log.info(f"[DB] TURSO_URL={'set ('+url[:30]+'...)' if url else 'NOT SET'} | HAS_TURSO={HAS_TURSO} | API={_TURSO_API}")
     if not url or not token or not HAS_TURSO:
-        log.warning("[DB] Turso not configured — using SQLite /tmp fallback (data will reset on redeploy)")
+        log.warning("[DB] Turso not configured — using SQLite /tmp fallback")
         db_init_local()
         return
     try:
-        # libsql:// ใช้ WebSocket ซึ่ง Railway block — เปลี่ยนเป็น https:// แทน
         http_url = url.replace("libsql://", "https://").replace("wss://", "https://")
-        client = turso_client.create_client(url=http_url, auth_token=token)
-        # สร้าง tables
-        for stmt in CREATE_TABLES_SQL.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                await client.execute(stmt)
-        # ทดสอบ query จริงเพื่อยืนยัน connection
-        test = await client.execute("SELECT COUNT(*) FROM trade_records")
-        count = test.rows[0][0] if test.rows else 0
-        _turso = client
-        log.info(f"[DB] Turso connected ✅ | trade_records={count}")
+
+        if _TURSO_API == "sync":
+            # libsql / libsql_experimental: sqlite3-like sync API
+            # รัน sync ใน executor เพื่อไม่ block event loop
+            loop = asyncio.get_running_loop()
+            def _init_sync():
+                conn = _libsql_mod.connect(":memory:", sync_url=http_url, auth_token=token)
+                conn.sync()  # pull latest data
+                # สร้าง tables
+                for stmt in CREATE_TABLES_SQL.strip().split(";"):
+                    s = stmt.strip()
+                    if s:
+                        conn.execute(s)
+                conn.commit()
+                # test
+                cur = conn.execute("SELECT COUNT(*) FROM trade_records")
+                row = cur.fetchone()
+                return conn, (row[0] if row else 0)
+            conn, count = await loop.run_in_executor(None, _init_sync)
+            _turso = conn
+            log.info(f"[DB] Turso (sync API) connected ✅ | trade_records={count}")
+        else:
+            # libsql_client: async API
+            client = _libsql_mod.create_client(url=http_url, auth_token=token)
+            for stmt in CREATE_TABLES_SQL.strip().split(";"):
+                s = stmt.strip()
+                if s:
+                    await client.execute(s)
+            test  = await client.execute("SELECT COUNT(*) FROM trade_records")
+            count = test.rows[0][0] if test.rows else 0
+            _turso = client
+            log.info(f"[DB] Turso (async API) connected ✅ | trade_records={count}")
+
     except Exception as e:
         log.error(f"[DB] Turso init failed: {e} — fallback to SQLite")
         _turso = None
-        db_init_local()  # ensure SQLite fallback tables exist
+        db_init_local()
 
 async def turso_exec(sql: str, params: tuple = ()):
-    """Execute write query (Turso หรือ SQLite) — v10-5: retry 3x ก่อน fallback"""
+    """Execute write query (Turso หรือ SQLite) — v10-5: retry 3x + API-aware"""
     if _turso:
         for attempt in range(3):
             try:
-                await _turso.execute(sql, list(params))
+                if _TURSO_API == "sync":
+                    loop = asyncio.get_running_loop()
+                    def _do_sync(conn=_turso, s=sql, p=params):
+                        conn.execute(s, p)
+                        conn.commit()
+                    await loop.run_in_executor(None, _do_sync)
+                else:
+                    await _turso.execute(sql, list(params))
                 return
             except Exception as e:
                 if attempt < 2:
-                    await asyncio.sleep(1.5 ** attempt)  # 1s, 1.5s
+                    await asyncio.sleep(1.5 ** attempt)
                 else:
                     log.error(f"[DB] turso_exec failed 3x: {e} — falling back to SQLite")
                     if _app:
@@ -334,11 +366,18 @@ async def turso_exec(sql: str, params: tuple = ()):
         log.error(f"[DB] sqlite_exec: {e}")
 
 async def turso_query(sql: str, params: tuple = ()) -> list:
-    """Execute read query (Turso หรือ SQLite)"""
+    """Execute read query (Turso หรือ SQLite) — API-aware"""
     if _turso:
         try:
-            rs = await _turso.execute(sql, list(params))
-            return [tuple(row.values()) for row in rs.rows]
+            if _TURSO_API == "sync":
+                loop = asyncio.get_running_loop()
+                def _do_query(conn=_turso, s=sql, p=params):
+                    cur = conn.execute(s, p)
+                    return cur.fetchall()
+                return await loop.run_in_executor(None, _do_query)
+            else:
+                rs = await _turso.execute(sql, list(params))
+                return [tuple(row.values()) for row in rs.rows]
         except Exception as e:
             log.error(f"[DB] turso_query: {e}")
     # SQLite fallback
