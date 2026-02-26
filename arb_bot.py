@@ -287,14 +287,21 @@ def _turso_http(statements: list) -> list:
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read())
+        raw = resp.read()
+    data = json.loads(raw)
+    # DEBUG: log first response item type to verify format
+    if data.get("results"):
+        first = data["results"][0]
+        log.debug(f"[DB] Turso raw result[0] keys={list(first.keys())} type={first.get('type')}")
     results = []
     for item in data.get("results", []):
-        if item.get("type") == "error":
-            raise RuntimeError(item.get("error", {}).get("message", str(item)))
-        if item.get("type") == "ok":
+        itype = item.get("type")
+        if itype == "error":
+            msg = item.get("error", {}).get("message") or str(item)
+            raise RuntimeError(msg)
+        # Turso /v2/pipeline returns {"type":"ok","response":{"type":"execute","result":{...}}}
+        if itype == "ok":
             rs = item.get("response", {}).get("result", {})
-            cols = [c["name"] for c in rs.get("cols", [])]
             rows = [tuple(v.get("value") for v in row) for row in rs.get("rows", [])]
             results.append(rows)
     return results
@@ -370,6 +377,11 @@ async def turso_exec(sql: str, params: tuple = ()):
         with sqlite3.connect(DB_PATH, timeout=10) as con:
             con.execute(sql, params)
             con.commit()
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e) or "already exists" in str(e):
+            pass  # migration ที่รันซ้ำ — ไม่ใช่ error
+        else:
+            log.error(f"[DB] sqlite_exec: {e}")
     except Exception as e:
         log.error(f"[DB] sqlite_exec: {e}")
 
