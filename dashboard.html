@@ -2,7 +2,7 @@
 <html lang="th">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ARB BOT v9.0</title>
+<title>ARB BOT v10.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -41,8 +41,8 @@ tr:hover td{background:#1c2128}
 </style>
 </head>
 <body>
-<h1>🤖 ARB BOT v9.0</h1>
-<div class="sub">รีเฟรชทุก 20 วินาที — v9.0 — Slippage Guard + CLV Benchmark + Settlement Parser + Thread-Safe</div>
+<h1>🤖 ARB BOT v10.0</h1>
+<div class="sub" id="subline">รีเฟรชทุก 20 วินาที — v10.0 — Production Ready</div>
 
 <div class="tabs">
   <div class="tab active" onclick="switchTab('overview')">📊 Overview</div>
@@ -159,9 +159,25 @@ tr:hover td{background:#1c2128}
   <div class="grid" id="pnlCards"></div>
   <div class="sec">📝 Trade History</div>
   <table>
-    <thead><tr><th>Event</th><th>Sport</th><th>Leg 1</th><th>Leg 2</th><th>Profit%</th><th>ทุน</th><th>CLV</th><th>Status</th><th>เวลา</th></tr></thead>
+    <thead><tr><th>Event</th><th>Sport</th><th>Leg 1</th><th>Leg 2</th><th>Profit%</th><th>ทุน</th><th>CLV</th><th>P&amp;L จริง</th><th>Status</th><th>เวลาแข่ง</th><th>Force Settle</th></tr></thead>
     <tbody id="tradeBody"></tbody>
   </table>
+</div>
+
+<!-- Force Settle Modal -->
+<div id="settleModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
+  <div style="background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;min-width:320px;max-width:90vw">
+    <div class="sec" style="margin-top:0">⚖️ Force Settle</div>
+    <div id="settleEventName" style="color:#e6edf3;font-size:.9rem;margin-bottom:16px"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+      <button class="btn-green" id="settleBtn1" onclick="doSettle('leg1')">✅ Leg 1 Win</button>
+      <button class="btn-blue"  id="settleBtn2" onclick="doSettle('leg2')">✅ Leg 2 Win</button>
+      <button class="btn-gray"  onclick="doSettle('draw')">🤝 Draw / Refund</button>
+      <button class="btn-gray"  onclick="doSettle('void')">🚫 Void</button>
+    </div>
+    <button onclick="closeSettle()" style="width:100%;background:#21262d;color:#8b949e;border:1px solid #30363d;padding:8px;border-radius:6px;cursor:pointer">ยกเลิก</button>
+    <div id="settleResult" style="margin-top:10px;font-size:.82rem;display:none"></div>
+  </div>
 </div>
 
 <!-- ═══ TAB 5: CONTROLS ═══ -->
@@ -434,77 +450,158 @@ function renderTab(tab, d) {
     `;
     const tRows = trades.slice(-30).reverse().map(t=>{
       const bc=t.status==='confirmed'?'bc':'br';
-      const tm=new Date(t.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      const tm=t.created_at?new Date(t.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'}):'-';
       const clvStr=(t.clv_leg1!==null&&t.clv_leg1!==undefined)?`${t.clv_leg1>0?'+':''}${t.clv_leg1.toFixed(1)}%`:'—';
+      let pnlStr='<span style="color:#8b949e">⏳ รอผล</span>';
+      if (t.actual_profit_thb!==null&&t.actual_profit_thb!==undefined) {
+        pnlStr=`<span class="${t.actual_profit_thb>=0?'profit':'loss'}">${t.actual_profit_thb>=0?'+':''}฿${t.actual_profit_thb.toLocaleString()}</span>`;
+      }
+      let ctStr='—';
+      if (t.commence_time) {
+        try { const d=new Date(t.commence_time); ctStr=d.toLocaleString('th-TH',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Bangkok'}); } catch(e){}
+      }
+      const canSettle = t.status==='confirmed' && (t.actual_profit_thb===null||t.actual_profit_thb===undefined);
+      const settleBtn = canSettle
+        ? `<button onclick="openSettle('${t.signal_id}','${t.event.replace(/'/g,'`')}','${t.leg1_team||t.leg1_bm}','${t.leg2_team||t.leg2_bm}')" style="background:#1f3d5c;color:#58a6ff;border:1px solid #30363d;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:.72rem">⚖️ Settle</button>`
+        : '—';
       return `<tr>
-        <td>${t.event}</td><td>${t.sport.split('_').pop().toUpperCase()}</td>
-        <td>${t.leg1_bm} @${t.leg1_odds.toFixed(2)}</td>
-        <td>${t.leg2_bm} @${t.leg2_odds.toFixed(2)}</td>
+        <td>${t.event}</td><td>${(t.sport||'').split('_').pop().toUpperCase()}</td>
+        <td>${t.leg1_bm} @${(t.leg1_odds||0).toFixed(2)}</td>
+        <td>${t.leg2_bm} @${(t.leg2_odds||0).toFixed(2)}</td>
         <td class="profit">+${(t.profit_pct*100).toFixed(2)}%</td>
-        <td>฿${t.stake1_thb.toLocaleString()}/฿${t.stake2_thb.toLocaleString()}</td>
+        <td>฿${(t.stake1_thb||0).toLocaleString()}/฿${(t.stake2_thb||0).toLocaleString()}</td>
         <td style="color:${(t.clv_leg1??0)>=0?'#3fb950':'#f85149'}">${clvStr}</td>
-        <td><span class="badge ${bc}">${t.status==='confirmed'?'✅ Confirmed':'❌ Rejected'}</span></td>
-        <td>${tm}</td></tr>`;
+        <td>${pnlStr}</td>
+        <td><span class="badge ${bc}">${t.status==='confirmed'?'✅':'❌'} ${t.status}</span></td>
+        <td style="font-size:.72rem">${ctStr}</td>
+        <td>${settleBtn}</td></tr>`;
     }).join('');
-    document.getElementById('tradeBody').innerHTML = tRows||'<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มี trades</td></tr>';
+    document.getElementById('tradeBody').innerHTML = tRows||'<tr><td colspan="11" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มี trades</td></tr>';
   }
 }
 
 const _qs = new URLSearchParams(location.search);
 const _tk = _qs.get('token') || '';
-function apiUrl(path) { return _tk ? path + '?token=' + encodeURIComponent(_tk) : path; }
+function apiUrl(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  return _tk ? path + sep + 'token=' + encodeURIComponent(_tk) : path;
+}
+function apiHeaders() {
+  const h = {'Content-Type':'application/json'};
+  if (_tk) h['Authorization'] = 'Bearer ' + _tk;
+  return h;
+}
 setInterval(() => { load(); }, 20000);
 
 async function action(key, value) {
-  const r = await fetch(apiUrl('/api/control'), {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({key, value})
-  });
-  const d = await r.json();
-  showMsg(d.msg, d.ok);
-  if (d.ok) load();
+  try {
+    const r = await fetch(apiUrl('/api/control'), {
+      method:'POST', headers: apiHeaders(),
+      body: JSON.stringify({key, value})
+    });
+    const d = await r.json();
+    showMsg(d.msg, d.ok);
+    if (d.ok) setTimeout(load, 500);
+  } catch(e) {
+    showMsg('Network error: '+e.message, false);
+  }
 }
 
 async function save(key, value) {
-  if (!value && value !== false) { showMsg('กรุณากรอกค่า','error'); return; }
+  if (value===''||value===null||value===undefined) { showMsg('กรุณากรอกค่า', false); return; }
   await action(key, value);
 }
 
 async function toggleScan() {
-  const r = await fetch(apiUrl('/api/state'));
+  const r = await fetch(apiUrl('/api/state'), {headers: apiHeaders()});
   const d = await r.json();
   await action('auto_scan', (!d.auto_scan).toString());
 }
 
 function showMsg(msg, ok) {
   const el = document.getElementById('ctrl-msg');
-  el.textContent = ok ? '✅ ' + msg : '❌ ' + msg;
+  el.textContent = ok===true ? '✅ ' + msg : '❌ ' + msg;
   el.style.display = 'block';
-  el.style.background = ok ? '#1a3a2a' : '#3d1f1f';
-  el.style.color = ok ? '#3fb950' : '#f85149';
-  setTimeout(() => el.style.display='none', 3000);
+  el.style.background = ok===true ? '#1a3a2a' : '#3d1f1f';
+  el.style.color = ok===true ? '#3fb950' : '#f85149';
+  setTimeout(() => el.style.display='none', 4000);
 }
 
 function renderControls(d) {
   document.getElementById('cfg-display').innerHTML = `
-    Auto Scan: <b style="color:${d.auto_scan?'#3fb950':'#f85149'}">${d.auto_scan?'ON':'OFF'}</b><br>
-    Min Profit: <b>${(d.min_profit_pct*100).toFixed(2)}%</b><br>
-    Scan Interval: <b>${d.scan_interval}s</b><br>
-    Total Stake: <b>฿${d.total_stake_thb.toLocaleString()}</b><br>
-    API Credits: <b>${d.api_remaining}/500</b>
+    Auto Scan: <b style="color:${d.auto_scan?'#3fb950':'#f85149'}">${d.auto_scan?'ON':'OFF'}</b> &nbsp;
+    Interval: <b>${d.scan_interval}s</b><br>
+    Min Profit: <b>${((d.min_profit_pct||0)*100).toFixed(2)}%</b> &nbsp;
+    Max Odds: <b>${d.max_odds||'—'}</b><br>
+    Total Stake: <b>฿${(d.total_stake_thb||0).toLocaleString()}</b> &nbsp;
+    API Credits: <b>${d.api_remaining}/500</b><br>
+    DB Mode: <b style="color:${(d.db_mode||'').includes('turso')?'#3fb950':'#d29922'}">${d.db_mode||'—'}</b>
   `;
 }
 
+// ── Force Settle ───────────────────────────────────────────────
+let _settleId = '';
+function openSettle(sid, ev, leg1, leg2) {
+  _settleId = sid;
+  document.getElementById('settleEventName').innerHTML =
+    `<b>${ev}</b><br><span style="color:#8b949e;font-size:.78rem">${leg1} vs ${leg2}</span>`;
+  document.getElementById('settleBtn1').textContent = `✅ ${leg1} ชนะ (Leg1)`;
+  document.getElementById('settleBtn2').textContent = `✅ ${leg2} ชนะ (Leg2)`;
+  document.getElementById('settleResult').style.display='none';
+  const m = document.getElementById('settleModal');
+  m.style.display='flex';
+}
+function closeSettle() {
+  document.getElementById('settleModal').style.display='none';
+  _settleId='';
+}
+async function doSettle(result) {
+  if (!_settleId) return;
+  try {
+    const r = await fetch(apiUrl('/api/settle'), {
+      method:'POST', headers: apiHeaders(),
+      body: JSON.stringify({signal_id: _settleId, result})
+    });
+    const d = await r.json();
+    const el = document.getElementById('settleResult');
+    el.textContent = d.ok ? `✅ ${d.msg}` : `❌ ${d.msg}`;
+    el.style.color  = d.ok ? '#3fb950' : '#f85149';
+    el.style.display='block';
+    if (d.ok) { setTimeout(()=>{ closeSettle(); load(); }, 1500); }
+  } catch(e) {
+    const el = document.getElementById('settleResult');
+    el.textContent='❌ Network error: '+e.message;
+    el.style.color='#f85149';
+    el.style.display='block';
+  }
+}
+// close modal on backdrop click
+document.getElementById('settleModal').addEventListener('click', function(e){
+  if(e.target===this) closeSettle();
+});
+
 async function load() {
-  const [stateRes, statsRes] = await Promise.all([
-    fetch(apiUrl('/api/state')), fetch(apiUrl('/api/stats'))
-  ]);
-  const state = await stateRes.json();
-  const stats = await statsRes.json();
-  const data  = {...state, stats};
-  data.trade_records = stats.trade_records || [];
-  lastData = data;
-  renderTab(currentTab, data);
+  try {
+    const [stateRes, statsRes] = await Promise.all([
+      fetch(apiUrl('/api/state'), {headers: apiHeaders()}),
+      fetch(apiUrl('/api/stats'), {headers: apiHeaders()})
+    ]);
+    if (!stateRes.ok) { console.warn('state', stateRes.status); return; }
+    const state = await stateRes.json();
+    const stats = statsRes.ok ? await statsRes.json() : {};
+    const data  = {...state, stats};
+    data.trade_records = stats.trade_records || [];
+    // enrich health info in subtitle
+    if (state.db_mode) {
+      document.getElementById('subline').textContent =
+        `รีเฟรชทุก 20s | DB: ${state.db_mode} | Credits: ${state.api_remaining} | สแกน: ${state.scan_count} รอบ`;
+    }
+    lastData = data;
+    renderTab(currentTab, data);
+    if (currentTab==='controls') renderControls(data);
+  } catch(e) {
+    console.error('load error', e);
+  }
 }
 load();
 </script>

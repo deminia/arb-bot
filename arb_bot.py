@@ -12,10 +12,14 @@
 
 import asyncio, json, logging, os, re, signal, sqlite3, threading, time, uuid
 try:
-    import libsql_client as turso_client
+    import libsql_experimental as turso_client  # v10-4: libsql_experimental แทน libsql_client
     HAS_TURSO = True
 except ImportError:
-    HAS_TURSO = False
+    try:
+        import libsql_client as turso_client  # fallback สำหรับ env เก่า
+        HAS_TURSO = True
+    except ImportError:
+        HAS_TURSO = False
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -72,7 +76,7 @@ USE_WEBHOOK     = bool(WEBHOOK_URL and "railway.app" in (WEBHOOK_URL or ""))
 
 # Kelly Criterion
 KELLY_FRACTION  = _d("KELLY_FRACTION", "0.25")   # คงไว้ที่ 0.25 เพื่อความปลอดภัย
-BANKROLL_THB    = _d("BANKROLL_THB", "2000000")  # แนะนำให้ตั้งไว้ที่ 2 ล้านเพื่อให้ Kelly คำนวณได้ยอดหมื่นต้นๆ
+BANKROLL_THB    = _d("BANKROLL_THB", "100000")  # v10-13: default 100k — ตั้ง env BANKROLL_THB เองถ้าใช้เงินจริงมากกว่านี้
 USE_KELLY       = _s("USE_KELLY", "true").lower() == "true"
 MIN_KELLY_STAKE = _d("MIN_KELLY_STAKE", "10000") # บังคับขั้นต่ำ 10,000 บาท
 MAX_KELLY_STAKE = _d("MAX_KELLY_STAKE", "50000") # เพดานสูงสุดต่อรอบ
@@ -203,12 +207,14 @@ class TradeRecord:
     actual_profit_thb: Optional[int] = None
     settled_at:  Optional[str] = None
     created_at:  str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    commence_time: str = ""   # v10-2: เวลาแข่งจริง เพื่อ restore settlement ถูกต้อง
 
 
 # ══════════════════════════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════════════════════════
 _main_loop: Optional[asyncio.AbstractEventLoop] = None  # #33 ref to main loop for cross-thread db saves
+_scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
 
 pending:           dict[str, ArbOpportunity] = {}
 seen_signals:      set[str]                  = set()
@@ -243,7 +249,8 @@ CREATE TABLE IF NOT EXISTS trade_records (
     leg1_odds REAL, leg2_odds REAL,
     stake1_thb INTEGER, stake2_thb INTEGER, profit_pct REAL, status TEXT,
     clv_leg1 REAL, clv_leg2 REAL, actual_profit_thb INTEGER,
-    settled_at TEXT, created_at TEXT
+    settled_at TEXT, created_at TEXT,
+    commence_time TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS opportunity_log (
     id TEXT PRIMARY KEY, event TEXT, sport TEXT, profit_pct REAL,
@@ -296,13 +303,28 @@ async def turso_init():
         db_init_local()  # ensure SQLite fallback tables exist
 
 async def turso_exec(sql: str, params: tuple = ()):
-    """Execute write query (Turso หรือ SQLite)"""
+    """Execute write query (Turso หรือ SQLite) — v10-5: retry 3x ก่อน fallback"""
     if _turso:
-        try:
-            await _turso.execute(sql, list(params))
-            return
-        except Exception as e:
-            log.error(f"[DB] turso_exec: {e}")
+        for attempt in range(3):
+            try:
+                await _turso.execute(sql, list(params))
+                return
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(1.5 ** attempt)  # 1s, 1.5s
+                else:
+                    log.error(f"[DB] turso_exec failed 3x: {e} — falling back to SQLite")
+                    if _app:
+                        try:
+                            asyncio.get_running_loop().create_task(
+                                _app.bot.send_message(
+                                    chat_id=CHAT_ID,
+                                    text=f"⚠️ *DB Warning*: Turso write failed 3x\n`{str(e)[:120]}`\nข้อมูลจะเขียนลง SQLite ชั่วคราว",
+                                    parse_mode="Markdown"
+                                )
+                            )
+                        except Exception:
+                            pass
     # SQLite fallback
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as con:
@@ -365,12 +387,13 @@ def db_save_trade(t: "TradeRecord"):
 
 async def _async_save_trade(t: "TradeRecord"):
     await turso_exec(
-        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (t.signal_id,t.event,t.sport,t.leg1_bm,t.leg2_bm,
          t.leg1_team,t.leg2_team,
          t.leg1_odds,t.leg2_odds,t.stake1_thb,t.stake2_thb,
          t.profit_pct,t.status,t.clv_leg1,t.clv_leg2,
-         t.actual_profit_thb,t.settled_at,t.created_at)
+         t.actual_profit_thb,t.settled_at,t.created_at,
+         t.commence_time)  # v10-2
     )
 
 def db_save_opportunity(opp: dict):
@@ -420,21 +443,34 @@ def db_load_state(key: str, default: str = "") -> str:
 async def db_load_all() -> tuple[list, list, list]:
     """โหลดทุกอย่างจาก DB (async)"""
     try:
+        # v10-2: migrate DB schema — เพิ่มคอลัมน์ใหม่ถ้ายังไม่มี (ไม่พังถ้ามีอยู่แล้ว)
+        for _col, _sql in [
+            ("commence_time", "ALTER TABLE trade_records ADD COLUMN commence_time TEXT DEFAULT ''"),
+        ]:
+            try: await turso_exec(_sql)
+            except Exception: pass  # column exists already
+
         trades_rows = await turso_query(
             "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500")
         trades = []
         for r in trades_rows:
-            # รองรับ DB เก่า (16 col) และใหม่ (18 col)
-            if len(r) >= 18:
+            n = len(r)
+            # col order: 0=signal_id,1=event,2=sport,3=leg1_bm,4=leg2_bm,
+            #            5=leg1_team,6=leg2_team,7=leg1_odds,8=leg2_odds,
+            #            9=stake1_thb,10=stake2_thb,11=profit_pct,12=status,
+            #            13=clv_leg1,14=clv_leg2,15=actual_profit_thb,
+            #            16=settled_at,17=created_at,18=commence_time
+            if n >= 18:
                 trades.append(TradeRecord(
                     signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
                     leg1_team=r[5] or "",leg2_team=r[6] or "",
                     leg1_odds=r[7],leg2_odds=r[8],stake1_thb=r[9],stake2_thb=r[10],
                     profit_pct=r[11],status=r[12],clv_leg1=r[13],clv_leg2=r[14],
-                    actual_profit_thb=r[15],settled_at=r[16],created_at=r[17]))
+                    actual_profit_thb=r[15],settled_at=r[16],created_at=r[17],
+                    commence_time=r[18] if n >= 19 else ""))
             else:
                 # DB เก่า — ไม่มี leg1_team/leg2_team
-                ev = r[1] if len(r)>1 else ""
+                ev = r[1] if n>1 else ""
                 parts = ev.split(" vs ")
                 trades.append(TradeRecord(
                     signal_id=r[0],event=ev,sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
@@ -1507,23 +1543,42 @@ async def execute_both(opp: ArbOpportunity) -> str:
 
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
-    # 🎭 Natural rounding — ป้องกันโดนจับว่าใช้บอท
+    # Natural rounding
     s1 = natural_round(s1_raw)
     s2 = natural_round(s2_raw)
-    # คำนวณ payout จาก stake จริงหลัง rounding (ไม่ใช่ opp.stake1 ก่อน round)
+
+    # v10-3: Profitability Guard — rebalance s2 ถ้า rounding ทำให้ arb หาย
     w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
     w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
-    tt = s1 + s2  # ใช้ stake จริง (ไม่ใช่ TOTAL_STAKE_THB)
+    tt = s1 + s2
+    rounded_profit = (min(w1, w2) - tt) / tt if tt > 0 else Decimal("0")
+    if rounded_profit < Decimal("0"):
+        # rebalance: หา s2 ที่ทำให้ w2 >= w1 (worst-case break-even)
+        s2_rebalanced = (w1 / opp.leg2.odds_raw).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
+        rebalanced_profit = (min(w1, (s2_rebalanced * opp.leg2.odds_raw).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
+        if rebalanced_profit >= Decimal("0"):
+            s2 = s2_rebalanced
+            log.info(f"[ProfitGuard] rebalanced s2: {int(s2_raw)} -> {int(s2)} | profit: {float(rounded_profit):.3%} -> {float(rebalanced_profit):.3%}")
+        else:
+            log.warning(f"[ProfitGuard] ABORT {opp.event} — arb lost after rounding (profit={float(rounded_profit):.3%})")
+            raise ValueError(
+                f"Abort: arb profit ติดลบหลัง natural rounding ({float(rounded_profit):.2%})\n"
+                f"ทุนน้อยเกินไปสำหรับ edge นี้ — รอ signal ใหม่ที่ profit สูงกว่า"
+            )
+    w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
+    w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
+    tt = s1 + s2
 
     # บันทึก trade
     tr = TradeRecord(
         signal_id=opp.signal_id, event=opp.event, sport=opp.sport,
         leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
-        leg1_team=opp.leg1.outcome,   # ✅ ชื่อทีม/นักกีฬาจริง
-        leg2_team=opp.leg2.outcome,   # ✅ ชื่อทีม/นักกีฬาจริง
+        leg1_team=opp.leg1.outcome,
+        leg2_team=opp.leg2.outcome,
         leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
         stake1_thb=int(s1), stake2_thb=int(s2),
         profit_pct=float(opp.profit_pct), status="confirmed",
+        commence_time=opp.commence,  # v10-2
     )
     with _data_lock:
         trade_records.append(tr)
@@ -1573,6 +1628,10 @@ async def execute_both(opp: ArbOpportunity) -> str:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # v10-6: เฉพาะ CHAT_ID เจ้าของบอทเท่านั้นที่ confirm/reject ได้
+    if str(query.message.chat_id) != str(CHAT_ID):
+        await query.answer("⛔ Not authorized", show_alert=True)
+        return
     try: action, sid = query.data.split(":",1)
     except Exception: return
     opp = pending.pop(sid, None)
@@ -1623,8 +1682,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """4. /pnl — ดู P&L summary"""
-    confirmed = [t for t in trade_records if t.status=="confirmed"]
-    rejected  = [t for t in trade_records if t.status=="rejected"]
+    with _data_lock:  # v10-12
+        confirmed = [t for t in trade_records if t.status=="confirmed"]
+        rejected  = [t for t in trade_records if t.status=="rejected"]
     total_profit = sum(t.profit_pct * (t.stake1_thb+t.stake2_thb) for t in confirmed)
 
     # CLV summary
@@ -1661,7 +1721,8 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """7. /lines — ดู line movements ล่าสุด"""
-    recent = line_movements[-10:][::-1]
+    with _data_lock:  # v10-12
+        recent = list(line_movements[-10:])[::-1]
     if not recent:
         await update.message.reply_text("ยังไม่มี line movement ที่น่าสนใจ")
         return
@@ -1683,9 +1744,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = "🟢 เปิด" if auto_scan else "🔴 ปิด"
     qpct = min(100, int(api_remaining/5))
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
-    confirmed = len([t for t in trade_records if t.status=="confirmed"])
+    with _data_lock:  # v10-12
+        confirmed = len([t for t in trade_records if t.status=="confirmed"])
     await update.message.reply_text(
-        f"📊 *ARB BOT v9.0*\n"
+        f"📊 *ARB BOT v10.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
@@ -1708,6 +1770,96 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = await do_scan()
     msg = f"✅ พบ *{count}* opportunity" if count else f"✅ ไม่พบ > {MIN_PROFIT_PCT:.1%}"
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v10-11: /trades — แสดง trade list รายละเอียด 10 รายการล่าสุด"""
+    with _data_lock:
+        recent = [t for t in trade_records if t.status == "confirmed"][-10:][::-1]
+    if not recent:
+        await update.message.reply_text("ยังไม่มี confirmed trade")
+        return
+    lines = []
+    for i, t in enumerate(recent, 1):
+        settled = f"✅ ฿{t.actual_profit_thb:+,}" if t.actual_profit_thb is not None else "⏳ รอผล"
+        ct_th = ""
+        if t.commence_time:
+            try:
+                _ct = datetime.fromisoformat(t.commence_time.replace(" ", "T").rstrip("Z") + "+00:00")
+                ct_th = (_ct + timedelta(hours=7)).strftime("%d/%m %H:%M")
+            except Exception:
+                pass
+        lines.append(
+            f"{i}. `{t.event[:28]}`\n"
+            f"   {SPORT_EMOJI.get(t.sport,'🏆')} {t.leg1_bm} vs {t.leg2_bm} | profit {t.profit_pct:.1%}\n"
+            f"   ฿{t.stake1_thb:,}+฿{t.stake2_thb:,} | {ct_th} | {settled}"
+        )
+    await update.message.reply_text(
+        f"📋 *Confirmed Trades ({len(recent)} ล่าสุด)*\n━━━━━━━━━━━━━━━━━━\n" + "\n\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v10-10: /settle <signal_id> <leg1|leg2|draw|void>
+    Manual settle สำหรับ MANUAL_REVIEW หรือ DRAW
+    ตัวอย่าง: /settle abc12345 leg1
+    """
+    args = context.args
+    if len(args) < 2:
+        # แสดง unsettled trades ให้เลือก
+        if not _pending_settlement:
+            await update.message.reply_text("ไม่มี trade ที่รอ settle")
+            return
+        lines = []
+        for sid, (t, dt) in list(_pending_settlement.items()):
+            dt_th = (dt + timedelta(hours=7)).strftime("%d/%m %H:%M") if dt else "?"
+            lines.append(f"`{sid}` — {t.event[:30]} ({dt_th})")
+        await update.message.reply_text(
+            f"⏳ *Trade รอ settle* ({len(_pending_settlement)} รายการ)\n"
+            + "\n".join(lines)
+            + "\n\nใช้: `/settle <signal_id> <leg1|leg2|draw|void>`",
+            parse_mode="Markdown",
+        )
+        return
+
+    sid    = args[0].strip()
+    result = args[1].strip().lower()
+    if result not in ("leg1", "leg2", "draw", "void"):
+        await update.message.reply_text("result ต้องเป็น: leg1 / leg2 / draw / void")
+        return
+
+    entry = _pending_settlement.pop(sid, None)
+    if not entry:
+        await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
+        return
+
+    t, _ = entry
+    tt = t.stake1_thb + t.stake2_thb
+
+    if result == "leg1":
+        payout = int(t.leg1_odds * t.stake1_thb)
+        actual = payout - tt
+    elif result == "leg2":
+        payout = int(t.leg2_odds * t.stake2_thb)
+        actual = payout - tt
+    elif result == "draw":
+        actual = 0
+    else:  # void
+        actual = 0
+
+    t.actual_profit_thb = actual
+    t.settled_at = datetime.now(timezone.utc).isoformat()
+    t.status = "confirmed"
+    db_save_trade(t)
+
+    emoji = "✅" if actual >= 0 else "❌"
+    await update.message.reply_text(
+        f"{emoji} *Manual Settle*\n`{t.event}`\n"
+        f"ผล: *{result.upper()}* | P&L: *฿{actual:+,}*\n"
+        f"(settled_at: {t.settled_at[:16]})",
+        parse_mode="Markdown",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2118,14 +2270,22 @@ def periodic_cleanup():
 
 
 async def scanner_loop():
+    global _scan_wakeup
+    _scan_wakeup = asyncio.Event()
     await asyncio.sleep(3)
-    log.info(f"[Scanner] v9.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
+    log.info(f"[Scanner] v10.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
     while True:
         if auto_scan:
             try: await do_scan()
             except Exception as e: log.error(f"[Scanner] {e}")
         periodic_cleanup()
-        await asyncio.sleep(SCAN_INTERVAL)
+        # v10-1: รอแบบ ถ้า apply_runtime_config เปลี่ยน interval/auto_scan จะปลุก event นี้เพื่อตื่นทันที
+        _scan_wakeup.clear()
+        try:
+            await asyncio.wait_for(_scan_wakeup.wait(), timeout=SCAN_INTERVAL)
+            log.info("[Scanner] woken up by config change")
+        except asyncio.TimeoutError:
+            pass
 
 
 async def keep_alive_ping():
@@ -2170,13 +2330,16 @@ def calc_stats_cached() -> dict:
 
 def calc_stats() -> dict:
     """คำนวณสถิติทั้งหมดสำหรับ /api/stats"""
-    confirmed = [t for t in trade_records if t.status == "confirmed"]
-    rejected  = [t for t in trade_records if t.status == "rejected"]
+    # v10-12: snapshot ด้วย lock ก่อนประมวลผล
+    with _data_lock:
+        confirmed    = [t for t in trade_records if t.status == "confirmed"]
+        rejected     = [t for t in trade_records if t.status == "rejected"]
+        rlm_moves    = [m for m in line_movements if m.is_rlm]
+        steam_moves  = [m for m in line_movements if m.is_steam]
+        lm_snap      = list(line_movements)
+        tr_snap      = list(trade_records[-30:])
 
     # ── Win Rate ──────────────────────────────────────────────────
-    # RLM win rate: นับ line movements ที่เป็น RLM
-    rlm_moves   = [m for m in line_movements if m.is_rlm]
-    steam_moves = [m for m in line_movements if m.is_steam]
 
     # เชื่อม RLM กับ trade ที่เกิดขึ้นหลังสัญญาณ (ภายใน 30 นาที)
     def signal_win_rate(moves):
@@ -2201,14 +2364,14 @@ def calc_stats() -> dict:
 
     # ── Sharp vs Public ───────────────────────────────────────────
     sharp_count  = len(rlm_moves) + len(steam_moves)
-    public_count = max(0, len(line_movements) - sharp_count)
+    public_count = max(0, len(lm_snap) - sharp_count)
 
     # ── Bookmaker Accuracy ────────────────────────────────────────
     # วัดจาก: ถ้า Pinnacle ขยับ odds ฝั่งไหน แล้ว outcome นั้นชนะบ่อยแค่ไหน
     # ใช้ line_movements เพื่อดูว่า bookmaker ไหน "รู้ก่อน" (odds ลดลง = favourite จริง)
     bm_correct = defaultdict(int)
     bm_total   = defaultdict(int)
-    for m in line_movements:
+    for m in lm_snap:
         bm_total[m.bookmaker] += 1
         # ถ้า odds ลด = เว็บเชื่อว่าจะชนะมากขึ้น = "sharp signal"
         if m.pct_change < -0.03:
@@ -2293,12 +2456,14 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
     try:
         if key == "auto_scan":
             auto_scan = value.lower() in ("true","1","on")
+            if _scan_wakeup: _scan_wakeup.set()  # v10-1: ปลุก loop ทันที
             return True, f"auto_scan = {auto_scan}"
         elif key == "min_profit_pct":
             MIN_PROFIT_PCT = Decimal(value)
             return True, f"MIN_PROFIT_PCT = {MIN_PROFIT_PCT:.3f}"
         elif key == "scan_interval":
             SCAN_INTERVAL = int(value)
+            if _scan_wakeup: _scan_wakeup.set()  # v10-1: ปลุก loop ให้ใช้ interval ใหม่ทันที
             return True, f"SCAN_INTERVAL = {SCAN_INTERVAL}s"
         elif key == "max_odds":
             MAX_ODDS_ALLOWED = Decimal(value)
@@ -2378,14 +2543,65 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length",len(err))
                 self.end_headers()
                 self.wfile.write(err)
+        elif self.path == "/api/settle":
+            # v10-9: Manual Settlement จาก Dashboard
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body   = json.loads(self.rfile.read(length))
+                sid    = body.get("signal_id", "").strip()
+                result = body.get("result", "").strip().lower()  # leg1|leg2|draw|void
+                if not sid or result not in ("leg1","leg2","draw","void"):
+                    raise ValueError("signal_id and result (leg1/leg2/draw/void) required")
+                entry = _pending_settlement.pop(sid, None)
+                if not entry:
+                    # ลอง trade_records โดยตรง
+                    with _data_lock:
+                        tr_list = [t for t in trade_records if t.signal_id == sid]
+                    if not tr_list:
+                        raise ValueError(f"signal_id '{sid}' not found")
+                    t = tr_list[0]
+                else:
+                    t, _ = entry
+                tt = t.stake1_thb + t.stake2_thb
+                if result == "leg1":
+                    actual = int(t.leg1_odds * t.stake1_thb) - tt
+                elif result == "leg2":
+                    actual = int(t.leg2_odds * t.stake2_thb) - tt
+                else:
+                    actual = 0
+                t.actual_profit_thb = actual
+                t.settled_at = datetime.now(timezone.utc).isoformat()
+                db_save_trade(t)
+                resp = json.dumps({"ok": True, "msg": f"Settled {result.upper()} | P&L: {actual:+,}", "actual": actual}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length",len(resp))
+                self.end_headers()
+                self.wfile.write(resp)
+            except Exception as e:
+                err = json.dumps({"ok": False, "msg": str(e)}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length",len(err))
+                self.end_headers()
+                self.wfile.write(err)
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_GET(self):
-        # Health check endpoint สำหรับ Railway (ไม่ต้อง auth)
+        # Health check endpoint สำหรับ Railway (ไม่ต้อง auth) — v10-8: richer
         if self.path == "/health":
-            body = b'{"status":"ok"}'
+            health = {
+                "status":       "ok",
+                "db_mode":      "turso" if _turso else "sqlite",
+                "last_scan":    last_scan_time,
+                "pending":      len(pending),
+                "api_remaining":api_remaining,
+                "trades":       len(trade_records),
+                "scan_count":   scan_count,
+            }
+            body = json.dumps(health).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
@@ -2400,9 +2616,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         clean_path = urlparse(self.path).path
 
         if clean_path == "/api/state":
+            # v10-12: lock ครอบ read ทั้งหมด
             with _data_lock:
-                confirmed = list(t for t in trade_records if t.status=="confirmed")
-                rejected  = list(t for t in trade_records if t.status=="rejected")
+                confirmed  = [t for t in trade_records if t.status=="confirmed"]
+                rejected   = [t for t in trade_records if t.status=="rejected"]
+                lm_snap    = list(line_movements[-50:])
+                opp_snap   = list(opportunity_log[-50:])
+                tr_snap    = list(trade_records[-30:])
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
             clv_values = []
             for t in confirmed:
@@ -2415,7 +2635,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "odds_before":float(m.odds_before),"odds_after":float(m.odds_after),
                         "pct_change":float(m.pct_change),"direction":m.direction,
                         "is_steam":m.is_steam,"is_rlm":m.is_rlm,"ts":m.ts}
-                       for m in line_movements[-50:]]
+                       for m in lm_snap]
+
+            # serialize trade_records for dashboard Force Settle UI
+            tr_list = [{
+                "signal_id":  t.signal_id,
+                "event":      t.event,
+                "sport":      t.sport,
+                "leg1_bm":    t.leg1_bm,
+                "leg2_bm":    t.leg2_bm,
+                "leg1_team":  t.leg1_team,
+                "leg2_team":  t.leg2_team,
+                "leg1_odds":  t.leg1_odds,
+                "leg2_odds":  t.leg2_odds,
+                "stake1_thb": t.stake1_thb,
+                "stake2_thb": t.stake2_thb,
+                "profit_pct": t.profit_pct,
+                "status":     t.status,
+                "clv_leg1":   t.clv_leg1,
+                "actual_profit_thb": t.actual_profit_thb,
+                "settled_at": t.settled_at,
+                "created_at": t.created_at,
+                "commence_time": t.commence_time,
+            } for t in tr_snap]
 
             data = {
                 "auto_scan":       auto_scan,
@@ -2426,11 +2668,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "quota_warn_at":   QUOTA_WARN_AT,
                 "total_stake_thb": int(TOTAL_STAKE_THB),
                 "min_profit_pct":  float(MIN_PROFIT_PCT),
+                "max_odds":        float(MAX_ODDS_ALLOWED),
                 "scan_interval":   SCAN_INTERVAL,
-                "line_move_count": len(line_movements),
+                "db_mode":         "turso" if _turso else "sqlite",
+                "line_move_count": len(lm_snap),
                 "confirmed_trades":len(confirmed),
-                "opportunities":   opportunity_log[-50:],
+                "opportunities":   opp_snap,
                 "line_movements":  lm_list,
+                "trade_records":   tr_list,
                 "pnl": {
                     "confirmed":  len(confirmed),
                     "rejected":   len(rejected),
@@ -2514,13 +2759,20 @@ async def post_init(app: Application):
     # #34 เรียก register_closing_watch ด้วยเพื่อให้ CLV tracking ทำงานหลัง restart
     for t in trade_records:
         if t.status == "confirmed" and t.actual_profit_thb is None and t.settled_at is None:
-            # #37 restore ด้วย (trade, commence_dt) tuple
+            # v10-2: ใช้ commence_time จริง (ไม่ต้องเดาจาก created_at+3h อีกต่อไป)
             try:
-                commence_dt = datetime.fromisoformat(
-                    t.created_at.replace("Z", "+00:00")
-                ) + timedelta(hours=3)  # ประมาณ commence = created + 3h
+                ct_str = t.commence_time or ""
+                if ct_str:
+                    commence_dt = datetime.fromisoformat(
+                        ct_str.replace(" ", "T").rstrip("Z") + ("+00:00" if "+" not in ct_str else "")
+                    )
+                else:
+                    # fallback สำหรับ trade เก่าที่ไม่มี commence_time
+                    commence_dt = datetime.fromisoformat(
+                        t.created_at.replace("Z", "+00:00")
+                    ) + timedelta(hours=3)
             except Exception:
-                commence_dt = datetime.now(timezone.utc)  # fallback: settle ได้ทันที
+                commence_dt = datetime.now(timezone.utc)
             _pending_settlement[t.signal_id] = (t, commence_dt)
             # restore CLV watch
             try:
@@ -2546,22 +2798,22 @@ async def post_init(app: Application):
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *ARB BOT v9.0 — Sharp Edition*\n"
+            "🤖 *ARB BOT v10.0 — Production Ready*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💾 Persistent Storage + Health Check\n"
             f"{restore_note}\n"
             f"Sports    : {' '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
             f"Min profit: {MIN_PROFIT_PCT:.1%} | Max odds: {MAX_ODDS_ALLOWED}\n"
-            f"ทุน/trade : ฿{int(TOTAL_STAKE_THB):,} | Cooldown: {ALERT_COOLDOWN_MIN}m\n"
+            f"ทุน/trade : ฿{int(TOTAL_STAKE_THB):,} | Kelly: {'✅' if USE_KELLY else '❌'}\n"
             f"Auto scan : {'🟢 เปิด' if auto_scan else '🔴 ปิด'} (ทุก {SCAN_INTERVAL}s)\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"/scan on·off | /now | /pnl | /lines | /status"
+            f"/scan /now /pnl /lines /status /trades /settle"
         ),
     )
     asyncio.create_task(scanner_loop())
     asyncio.create_task(watch_closing_lines())  # 📌 auto CLV
     asyncio.create_task(settle_completed_trades())  # 🏆 auto settle
-    asyncio.create_task(keep_alive_ping())  # #31 Render keep-alive
+    if os.getenv("KEEP_ALIVE", "true").lower() in ("true","1","yes"):  # v10-15: optional
+        asyncio.create_task(keep_alive_ping())
 
 
 def handle_shutdown(signum, frame):
@@ -2588,6 +2840,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("now",    cmd_now))
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
     app.add_handler(CommandHandler("lines",  cmd_lines))
+    app.add_handler(CommandHandler("trades", cmd_trades))   # v10-11
+    app.add_handler(CommandHandler("settle", cmd_settle))   # v10-10
     _app = app
 
     # Railway/Render: ใช้ polling เสมอ (single-port compatible)
