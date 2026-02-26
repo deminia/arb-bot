@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ARB BOT v9.0</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:16px}
+h1{color:#58a6ff;font-size:1.3rem;margin-bottom:2px}
+.sub{color:#8b949e;font-size:.75rem;margin-bottom:12px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #30363d;padding-bottom:0}
+.tab{padding:8px 16px;cursor:pointer;color:#8b949e;font-size:.85rem;border-radius:6px 6px 0 0;border:1px solid transparent;border-bottom:none;margin-bottom:-1px}
+.tab.active{color:#e6edf3;background:#161b22;border-color:#30363d;border-bottom-color:#161b22}
+.tab:hover:not(.active){color:#e6edf3;background:#1c2128}
+.page{display:none}.page.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:12px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+.card .lbl{color:#8b949e;font-size:.68rem;text-transform:uppercase;letter-spacing:.5px}
+.card .val{font-size:1.4rem;font-weight:700;margin-top:2px}
+.card .sub2{color:#8b949e;font-size:.7rem;margin-top:2px}
+.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}.purple{color:#bc8cff}.orange{color:#fb8f44}
+.quota-bar{background:#21262d;border-radius:3px;height:5px;overflow:hidden;margin:4px 0}
+.quota-fill{height:100%;border-radius:3px;transition:width .3s}
+.qtext{color:#8b949e;font-size:.7rem;margin-bottom:12px}
+.sec{color:#8b949e;font-size:.7rem;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:12px}
+th{background:#21262d;color:#8b949e;font-size:.68rem;text-transform:uppercase;padding:7px 10px;text-align:left}
+td{padding:7px 10px;border-top:1px solid #21262d;font-size:.8rem}
+tr:hover td{background:#1c2128}
+.badge{display:inline-block;padding:1px 6px;border-radius:10px;font-size:.65rem;font-weight:600}
+.bp{background:#1f3d5c;color:#58a6ff}.bc{background:#1a3a2a;color:#3fb950}.br{background:#3d1f1f;color:#f85149}
+.brlm{background:#2d1f4a;color:#bc8cff}.bsteam{background:#1a2d4a;color:#58a6ff}
+.profit{color:#3fb950;font-weight:700}.loss{color:#f85149;font-weight:700}
+.cw{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.wr-ring{display:flex;align-items:center;gap:12px;padding:8px 0}
+.ring{width:64px;height:64px;flex-shrink:0}
+@media(max-width:600px){.two,.three{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>🤖 ARB BOT v9.0</h1>
+<div class="sub">รีเฟรชทุก 20 วินาที — v9.0 — Slippage Guard + CLV Benchmark + Settlement Parser + Thread-Safe</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('overview')">📊 Overview</div>
+  <div class="tab" onclick="switchTab('linelog')">📡 Line Moves</div>
+  <div class="tab" onclick="switchTab('stats')">🔬 Statistics</div>
+  <div class="tab" onclick="switchTab('trades')">💰 Trades</div>
+  <div class="tab" onclick="switchTab('controls')">⚙️ Controls</div>
+</div>
+
+<!-- ═══ TAB 1: OVERVIEW ═══ -->
+<div id="page-overview" class="page active">
+  <div class="grid" id="overviewCards"></div>
+  <div class="quota-bar"><div class="quota-fill" id="qFill"></div></div>
+  <div class="qtext" id="qText"></div>
+  <div class="two">
+    <div class="cw"><div class="sec">📈 Profit Opportunity History</div><canvas id="profitChart" height="150"></canvas></div>
+    <div class="cw"><div class="sec">📡 Line Movement Flow</div><canvas id="lineFlowChart" height="150"></canvas></div>
+  </div>
+  <div class="sec">📋 Opportunity Log ล่าสุด</div>
+  <table>
+    <thead><tr><th>Event</th><th>Leg 1</th><th>Leg 2</th><th>Profit</th><th>เวลา</th><th>Status</th></tr></thead>
+    <tbody id="oppBody"></tbody>
+  </table>
+</div>
+
+<!-- ═══ TAB 2: LINE MOVES ═══ -->
+<div id="page-linelog" class="page">
+  <div class="two">
+    <div class="cw"><div class="sec">💧 Price Flow — odds เปลี่ยนตามเวลา</div><canvas id="priceFlowChart" height="180"></canvas></div>
+    <div class="cw"><div class="sec">🌊 Steam vs 🔄 RLM Count</div><canvas id="signalTypeChart" height="180"></canvas></div>
+  </div>
+  <div class="sec">🌊 Line Movement Log</div>
+  <table>
+    <thead><tr><th>Event</th><th>Bookmaker</th><th>Outcome</th><th>Before→After</th><th>Change</th><th>Signal</th><th>เวลา</th></tr></thead>
+    <tbody id="lineBody"></tbody>
+  </table>
+</div>
+
+<!-- ═══ TAB 3: STATISTICS ═══ -->
+<div id="page-stats" class="page">
+  <div class="three">
+    <div class="cw">
+      <div class="sec">🔄 RLM Win Rate</div>
+      <div class="wr-ring">
+        <svg class="ring" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#bc8cff" stroke-width="3"
+            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
+            id="rlmRing"/>
+        </svg>
+        <div>
+          <div class="val purple" id="rlmWR">—</div>
+          <div class="sub2" id="rlmCount">0 signals</div>
+          <div class="sub2" style="font-size:.65rem;margin-top:2px">Pinnacle ขยับ = sharp money</div>
+        </div>
+      </div>
+    </div>
+    <div class="cw">
+      <div class="sec">🌊 Steam Win Rate</div>
+      <div class="wr-ring">
+        <svg class="ring" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#58a6ff" stroke-width="3"
+            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
+            id="steamRing"/>
+        </svg>
+        <div>
+          <div class="val blue" id="steamWR">—</div>
+          <div class="sub2" id="steamCount">0 signals</div>
+          <div class="sub2" style="font-size:.65rem;margin-top:2px">หลายเว็บขยับพร้อมกัน</div>
+        </div>
+      </div>
+    </div>
+    <div class="cw">
+      <div class="sec">📊 Overall Arb Win Rate</div>
+      <div class="wr-ring">
+        <svg class="ring" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#3fb950" stroke-width="3"
+            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
+            id="arbRing"/>
+        </svg>
+        <div>
+          <div class="val green" id="arbWR">—</div>
+          <div class="sub2" id="arbCount">0 trades</div>
+          <div class="sub2" style="font-size:.65rem;margin-top:2px">Confirmed / total</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="two">
+    <div class="cw">
+      <div class="sec">💎 Sharp vs Public Money</div>
+      <canvas id="sharpPublicChart" height="160"></canvas>
+      <div id="sharpNote" style="color:#8b949e;font-size:.72rem;margin-top:6px"></div>
+    </div>
+    <div class="cw">
+      <div class="sec">🎯 Bookmaker Accuracy (vs closing line)</div>
+      <canvas id="bmAccChart" height="160"></canvas>
+    </div>
+  </div>
+
+  <div class="cw">
+    <div class="sec">💹 ROI ต่อ Sport</div>
+    <canvas id="roiChart" height="130"></canvas>
+  </div>
+
+  <div class="grid" id="clvCards"></div>
+</div>
+
+<!-- ═══ TAB 4: TRADES ═══ -->
+<div id="page-trades" class="page">
+  <div class="grid" id="pnlCards"></div>
+  <div class="sec">📝 Trade History</div>
+  <table>
+    <thead><tr><th>Event</th><th>Sport</th><th>Leg 1</th><th>Leg 2</th><th>Profit%</th><th>ทุน</th><th>CLV</th><th>Status</th><th>เวลา</th></tr></thead>
+    <tbody id="tradeBody"></tbody>
+  </table>
+</div>
+
+<!-- ═══ TAB 5: CONTROLS ═══ -->
+<div id="page-controls" class="page">
+  <div class="two">
+    <div class="cw">
+      <div class="sec">⚡ Quick Actions</div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
+        <button class="btn-green" onclick="action('scan_now','true')">🔍 Scan Now</button>
+        <button class="btn-blue"  onclick="toggleScan()">🔄 Toggle Auto Scan</button>
+        <button class="btn-gray"  onclick="action('clear_seen','true')">🗑️ Clear Seen Signals</button>
+      </div>
+    </div>
+    <div class="cw">
+      <div class="sec">📡 Scan Settings</div>
+      <div class="ctrl-row">
+        <label>Min Profit %</label>
+        <input type="number" id="cfg_min_profit" step="0.1" min="0.5" max="10" placeholder="1.5">
+        <button onclick="save('min_profit_pct', document.getElementById('cfg_min_profit').value/100)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Scan Interval (s)</label>
+        <input type="number" id="cfg_interval" step="60" min="60" max="3600" placeholder="300">
+        <button onclick="save('scan_interval', document.getElementById('cfg_interval').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Alert Cooldown (m)</label>
+        <input type="number" id="cfg_cooldown" step="5" min="5" max="120" placeholder="30">
+        <button onclick="save('cooldown', document.getElementById('cfg_cooldown').value)">Save</button>
+      </div>
+    </div>
+  </div>
+  <div class="two">
+    <div class="cw">
+      <div class="sec">📊 Odds Filter</div>
+      <div class="ctrl-row">
+        <label>Max Odds</label>
+        <input type="number" id="cfg_max_odds" step="1" min="2" max="50" placeholder="15">
+        <button onclick="save('max_odds', document.getElementById('cfg_max_odds').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Min Odds</label>
+        <input type="number" id="cfg_min_odds" step="0.05" min="1.01" max="2" placeholder="1.05">
+        <button onclick="save('min_odds', document.getElementById('cfg_min_odds').value)">Save</button>
+      </div>
+    </div>
+    <div class="cw">
+      <div class="sec">💵 Stake / Kelly</div>
+      <div class="ctrl-row">
+        <label>Total Stake (฿)</label>
+        <input type="number" id="cfg_stake" step="1000" min="1000" placeholder="10000">
+        <button onclick="save('total_stake', document.getElementById('cfg_stake').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Kelly Fraction</label>
+        <input type="number" id="cfg_kelly" step="0.05" min="0.1" max="1" placeholder="0.25">
+        <button onclick="save('kelly_fraction', document.getElementById('cfg_kelly').value)">Save</button>
+      </div>
+      <div class="ctrl-row">
+        <label>Use Kelly</label>
+        <select id="cfg_use_kelly">
+          <option value="true">ON</option>
+          <option value="false">OFF</option>
+        </select>
+        <button onclick="save('use_kelly', document.getElementById('cfg_use_kelly').value)">Save</button>
+      </div>
+    </div>
+  </div>
+  <div id="ctrl-msg" style="margin-top:8px;padding:10px;border-radius:6px;display:none;font-size:.85rem"></div>
+  <div class="cw" style="margin-top:12px">
+    <div class="sec">📋 Current Config</div>
+    <div id="cfg-display" style="font-size:.8rem;color:#8b949e;line-height:1.8"></div>
+  </div>
+</div>
+
+<style>
+.btn-green{background:#1a3a2a;color:#3fb950;border:1px solid #3fb950;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
+.btn-blue{background:#1f3d5c;color:#58a6ff;border:1px solid #58a6ff;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
+.btn-gray{background:#21262d;color:#8b949e;border:1px solid #30363d;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
+.ctrl-row{display:grid;grid-template-columns:140px 1fr auto;gap:6px;align-items:center;margin-bottom:8px}
+.ctrl-row label{color:#8b949e;font-size:.78rem}
+.ctrl-row input,.ctrl-row select{background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:5px 8px;font-size:.82rem;width:100%}
+.ctrl-row button{background:#21262d;color:#58a6ff;border:1px solid #30363d;border-radius:4px;padding:5px 10px;cursor:pointer;font-size:.78rem;white-space:nowrap}
+.ctrl-row button:hover{background:#1f3d5c}
+</style>
+
+<script>
+let charts = {};
+let currentTab = 'overview';
+let lastData = null;
+
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const names = ['overview','linelog','stats','trades','controls'];
+    t.classList.toggle('active', names[i]===name);
+  });
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  if (lastData) { renderTab(name, lastData); if(name==='controls') renderControls(lastData); }
+}
+
+function mkChart(id, type, labels, datasets, opts={}) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(ctx, {
+    type,
+    data:{labels, datasets},
+    options:{
+      responsive:true,
+      plugins:{legend:{display:opts.legend??false,labels:{color:'#8b949e',font:{size:10}}},
+               tooltip:{callbacks:{label: ctx => opts.tooltipFn ? opts.tooltipFn(ctx) : ctx.formattedValue}}},
+      scales: type==='pie'||type==='doughnut' ? {} : {
+        x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},
+        y:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'},
+           ...(opts.yTitle?{title:{display:true,text:opts.yTitle,color:'#8b949e',font:{size:9}}}:{})}
+      }
+    }
+  });
+}
+
+function setRing(id, pct, color) {
+  const el = document.getElementById(id);
+  if (el) el.setAttribute('stroke-dasharray', `${pct} ${100-pct}`);
+}
+
+function renderTab(tab, d) {
+  const s = d.stats || {};
+  const lm = d.line_movements || [];
+  const opps = d.opportunities || [];
+  const trades = d.trade_records || [];
+
+  if (tab === 'overview') {
+    const qPct = Math.round((d.api_remaining/500)*100);
+    const qColor = qPct>30?'#3fb950':qPct>10?'#d29922':'#f85149';
+    document.getElementById('overviewCards').innerHTML = `
+      <div class="card"><div class="lbl">Auto Scan</div><div class="val ${d.auto_scan?'green':'red'}">${d.auto_scan?'🟢 ON':'🔴 OFF'}</div></div>
+      <div class="card"><div class="lbl">สแกน</div><div class="val blue">${d.scan_count} รอบ</div></div>
+      <div class="card"><div class="lbl">รอ Confirm</div><div class="val yellow">${d.pending_count}</div></div>
+      <div class="card"><div class="lbl">API Credits</div><div class="val" style="color:${qColor}">${d.api_remaining}</div></div>
+      <div class="card"><div class="lbl">Line Moves</div><div class="val purple">${d.line_move_count}</div></div>
+      <div class="card"><div class="lbl">Trades</div><div class="val green">${d.confirmed_trades}</div></div>
+    `;
+    document.getElementById('qFill').style.cssText=`width:${qPct}%;background:${qColor}`;
+    document.getElementById('qText').textContent=`Credits ${d.api_remaining}/500 (${qPct}%) | เตือนที่ ${d.quota_warn_at} | ${d.last_scan_time}`;
+
+    const pLabels = opps.slice(-20).map(o=>o.event.split(' vs ')[0].substring(0,8));
+    const pData   = opps.slice(-20).map(o=>+(o.profit_pct*100).toFixed(2));
+    mkChart('profitChart','bar',pLabels,[{label:'Profit%',data:pData,
+      backgroundColor:pData.map(v=>v>2?'#3fb950':v>1?'#d29922':'#58a6ff'),borderRadius:3}],{yTitle:'%'});
+
+    const lmLabels = lm.slice(-20).map(m=>m.event.split(' vs ')[0].substring(0,6));
+    const lmData   = lm.slice(-20).map(m=>+(m.pct_change*100).toFixed(2));
+    mkChart('lineFlowChart','bar',lmLabels,[{label:'Move%',data:lmData,
+      backgroundColor:lmData.map(v=>v<0?'#f85149':'#3fb950'),borderRadius:3}],{yTitle:'%'});
+
+    const oppRows = opps.slice(-15).reverse().map(o=>{
+      const bc=o.status==='pending'?'bp':o.status==='confirmed'?'bc':'br';
+      const bl=o.status==='pending'?'รอ':o.status==='confirmed'?'✅':'❌';
+      const t=new Date(o.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      return `<tr><td>${o.event}</td><td>${o.leg1_bm} @${o.leg1_odds.toFixed(2)}</td>
+        <td>${o.leg2_bm} @${o.leg2_odds.toFixed(2)}</td>
+        <td class="profit">+${(o.profit_pct*100).toFixed(2)}%</td>
+        <td>${t}</td>
+        <td><span class="badge ${bc}">${bl}</span>${o.mins_to_start<=30&&o.mins_to_start>0?' <span class="badge" style="background:#3d1a1a;color:#f85149">🔴CLOSING</span>':o.mins_to_start<=120&&o.mins_to_start>0?' <span class="badge" style="background:#2d2a1a;color:#d29922">⏰120m</span>':''}</td></tr>`;
+    }).join('');
+    document.getElementById('oppBody').innerHTML = oppRows||'<tr><td colspan="6" style="text-align:center;color:#8b949e;padding:20px">ยังไม่พบ opportunity</td></tr>';
+  }
+
+  if (tab === 'linelog') {
+    const byEvent = {};
+    lm.forEach(m => {
+      const k = m.event.substring(0,20);
+      if (!byEvent[k]) byEvent[k] = [];
+      byEvent[k].push({t: new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'}),
+                       v: m.odds_after, bm: m.bookmaker});
+    });
+    const topEvents = Object.keys(byEvent).slice(-4);
+    const colors = ['#58a6ff','#3fb950','#d29922','#bc8cff'];
+    const flowDatasets = topEvents.map((ev,i)=>({
+      label: ev, borderColor: colors[i], backgroundColor: colors[i]+'33',
+      data: byEvent[ev].map(p=>p.v), fill:false, tension:0.3, pointRadius:3,
+    }));
+    const flowLabels = topEvents.length ? byEvent[topEvents[0]].map(p=>p.t) : [];
+    mkChart('priceFlowChart','line',flowLabels,flowDatasets,{legend:true,yTitle:'Odds'});
+
+    const rlmCount   = lm.filter(m=>m.is_rlm).length;
+    const steamCount = lm.filter(m=>m.is_steam).length;
+    const normalCount= lm.length - rlmCount - steamCount;
+    mkChart('signalTypeChart','doughnut',
+      ['🔄 RLM','🌊 Steam','📊 Normal'],
+      [{data:[rlmCount,steamCount,normalCount],backgroundColor:['#bc8cff','#58a6ff','#30363d'],borderWidth:0}],
+      {legend:true});
+
+    const lmRows = lm.slice(-20).reverse().map(m=>{
+      const pct=(m.pct_change*100).toFixed(1);
+      const sign=m.pct_change>0?'+':'';
+      const tags=(m.is_steam?'<span class="badge bsteam">🌊Steam</span> ':'')+(m.is_rlm?'<span class="badge brlm">🔄RLM</span>':'');
+      const t=new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      return `<tr><td>${m.event}</td><td>${m.bookmaker}</td><td>${m.outcome}</td>
+        <td>${m.odds_before.toFixed(3)}→${m.odds_after.toFixed(3)}</td>
+        <td style="color:${m.pct_change<0?'#f85149':'#3fb950'}">${sign}${pct}%</td>
+        <td>${tags||'—'}</td><td>${t}</td></tr>`;
+    }).join('');
+    document.getElementById('lineBody').innerHTML = lmRows||'<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มีข้อมูล</td></tr>';
+  }
+
+  if (tab === 'stats') {
+    const rlmWR  = s.rlm_win_rate ?? null;
+    const rlmCnt = s.rlm_count ?? 0;
+    const steamWR  = s.steam_win_rate ?? null;
+    const steamCnt = s.steam_count ?? 0;
+    const arbWR    = s.arb_win_rate ?? null;
+    const arbCnt   = s.confirmed_trades ?? 0;
+
+    document.getElementById('rlmWR').textContent   = rlmWR!==null ? rlmWR.toFixed(1)+'%' : '—';
+    document.getElementById('rlmCount').textContent = rlmCnt+' signals';
+    document.getElementById('steamWR').textContent  = steamWR!==null ? steamWR.toFixed(1)+'%' : '—';
+    document.getElementById('steamCount').textContent= steamCnt+' signals';
+    document.getElementById('arbWR').textContent    = arbWR!==null ? arbWR.toFixed(1)+'%' : '—';
+    document.getElementById('arbCount').textContent  = arbCnt+' trades';
+
+    if (rlmWR!==null)   setRing('rlmRing', rlmWR, '#bc8cff');
+    if (steamWR!==null) setRing('steamRing', steamWR, '#58a6ff');
+    if (arbWR!==null)   setRing('arbRing', arbWR, '#3fb950');
+
+    const sharpCount  = s.sharp_count ?? 0;
+    const publicCount = s.public_count ?? 0;
+    mkChart('sharpPublicChart','doughnut',
+      ['💎 Sharp (RLM+Steam)', '📢 Public (Normal)'],
+      [{data:[sharpCount,publicCount],backgroundColor:['#bc8cff','#30363d'],borderWidth:0}],
+      {legend:true});
+    document.getElementById('sharpNote').textContent =
+      `Sharp signals: ${sharpCount} | Public: ${publicCount} | Sharp ratio: ${sharpCount+publicCount>0?((sharpCount/(sharpCount+publicCount))*100).toFixed(1):'—'}%`;
+
+    const bmNames  = Object.keys(s.bm_accuracy ?? {});
+    const bmScores = bmNames.map(k=>(s.bm_accuracy[k]*100).toFixed(1));
+    mkChart('bmAccChart','bar',bmNames,
+      [{label:'Accuracy%',data:bmScores,
+        backgroundColor:bmScores.map(v=>v>60?'#3fb950':v>40?'#d29922':'#f85149'),borderRadius:3}],
+      {yTitle:'%'});
+
+    const sportNames = Object.keys(s.roi_by_sport ?? {});
+    const sportROI   = sportNames.map(k=>+(s.roi_by_sport[k]*100).toFixed(2));
+    mkChart('roiChart','bar',sportNames.map(n=>n.split('_').pop().toUpperCase()),
+      [{label:'ROI%',data:sportROI,
+        backgroundColor:sportROI.map(v=>v>0?'#3fb950':'#f85149'),borderRadius:3}],
+      {yTitle:'%'});
+
+    const clv = s.clv ?? {};
+    document.getElementById('clvCards').innerHTML = `
+      <div class="card"><div class="lbl">CLV avg</div>
+        <div class="val ${(clv.avg??0)>=0?'green':'red'}">${clv.avg!==null&&clv.avg!==undefined?clv.avg.toFixed(2)+'%':'—'}</div>
+        <div class="sub2">เอาชนะตลาด = บวก</div></div>
+      <div class="card"><div class="lbl">CLV บวก</div><div class="val green">${clv.positive??0} trades</div></div>
+      <div class="card"><div class="lbl">CLV ลบ</div><div class="val red">${clv.negative??0} trades</div></div>
+      <div class="card"><div class="lbl">Best CLV</div><div class="val green">${clv.best!==undefined?'+'+clv.best.toFixed(2)+'%':'—'}</div></div>
+    `;
+  }
+
+  if (tab === 'trades') {
+    const p = d.pnl ?? {};
+    document.getElementById('pnlCards').innerHTML = `
+      <div class="card"><div class="lbl">Confirmed</div><div class="val green">${p.confirmed??0}</div></div>
+      <div class="card"><div class="lbl">Rejected</div><div class="val red">${p.rejected??0}</div></div>
+      <div class="card"><div class="lbl">Est. Profit</div><div class="val green">฿${(p.est_profit??0).toLocaleString()}</div></div>
+      <div class="card"><div class="lbl">Avg Profit%</div><div class="val blue">${p.avg_profit?p.avg_profit.toFixed(2)+'%':'—'}</div></div>
+      <div class="card"><div class="lbl">CLV avg</div><div class="val ${(p.avg_clv??0)>=0?'green':'red'}">${p.avg_clv!==null&&p.avg_clv!==undefined?p.avg_clv.toFixed(2)+'%':'—'}</div></div>
+    `;
+    const tRows = trades.slice(-30).reverse().map(t=>{
+      const bc=t.status==='confirmed'?'bc':'br';
+      const tm=new Date(t.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
+      const clvStr=(t.clv_leg1!==null&&t.clv_leg1!==undefined)?`${t.clv_leg1>0?'+':''}${t.clv_leg1.toFixed(1)}%`:'—';
+      return `<tr>
+        <td>${t.event}</td><td>${t.sport.split('_').pop().toUpperCase()}</td>
+        <td>${t.leg1_bm} @${t.leg1_odds.toFixed(2)}</td>
+        <td>${t.leg2_bm} @${t.leg2_odds.toFixed(2)}</td>
+        <td class="profit">+${(t.profit_pct*100).toFixed(2)}%</td>
+        <td>฿${t.stake1_thb.toLocaleString()}/฿${t.stake2_thb.toLocaleString()}</td>
+        <td style="color:${(t.clv_leg1??0)>=0?'#3fb950':'#f85149'}">${clvStr}</td>
+        <td><span class="badge ${bc}">${t.status==='confirmed'?'✅ Confirmed':'❌ Rejected'}</span></td>
+        <td>${tm}</td></tr>`;
+    }).join('');
+    document.getElementById('tradeBody').innerHTML = tRows||'<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มี trades</td></tr>';
+  }
+}
+
+const _qs = new URLSearchParams(location.search);
+const _tk = _qs.get('token') || '';
+function apiUrl(path) { return _tk ? path + '?token=' + encodeURIComponent(_tk) : path; }
+setInterval(() => { load(); }, 20000);
+
+async function action(key, value) {
+  const r = await fetch(apiUrl('/api/control'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({key, value})
+  });
+  const d = await r.json();
+  showMsg(d.msg, d.ok);
+  if (d.ok) load();
+}
+
+async function save(key, value) {
+  if (!value && value !== false) { showMsg('กรุณากรอกค่า','error'); return; }
+  await action(key, value);
+}
+
+async function toggleScan() {
+  const r = await fetch(apiUrl('/api/state'));
+  const d = await r.json();
+  await action('auto_scan', (!d.auto_scan).toString());
+}
+
+function showMsg(msg, ok) {
+  const el = document.getElementById('ctrl-msg');
+  el.textContent = ok ? '✅ ' + msg : '❌ ' + msg;
+  el.style.display = 'block';
+  el.style.background = ok ? '#1a3a2a' : '#3d1f1f';
+  el.style.color = ok ? '#3fb950' : '#f85149';
+  setTimeout(() => el.style.display='none', 3000);
+}
+
+function renderControls(d) {
+  document.getElementById('cfg-display').innerHTML = `
+    Auto Scan: <b style="color:${d.auto_scan?'#3fb950':'#f85149'}">${d.auto_scan?'ON':'OFF'}</b><br>
+    Min Profit: <b>${(d.min_profit_pct*100).toFixed(2)}%</b><br>
+    Scan Interval: <b>${d.scan_interval}s</b><br>
+    Total Stake: <b>฿${d.total_stake_thb.toLocaleString()}</b><br>
+    API Credits: <b>${d.api_remaining}/500</b>
+  `;
+}
+
+async function load() {
+  const [stateRes, statsRes] = await Promise.all([
+    fetch(apiUrl('/api/state')), fetch(apiUrl('/api/stats'))
+  ]);
+  const state = await stateRes.json();
+  const stats = await statsRes.json();
+  const data  = {...state, stats};
+  data.trade_records = stats.trade_records || [];
+  lastData = data;
+  renderTab(currentTab, data);
+}
+load();
+</script>
+</body>
+</html>

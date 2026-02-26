@@ -92,6 +92,9 @@ MAX_STAKE_DAFABET  = _d("MAX_STAKE_DAFABET",  "0")
 LINE_MOVE_THRESHOLD = _d("LINE_MOVE_THRESHOLD", "0.05")  # 5%
 # 9. Multi-chat
 ALL_CHAT_IDS = [CHAT_ID] + EXTRA_CHAT_IDS
+# Polymarket liquidity filters
+POLY_MIN_LIQUIDITY    = float(os.getenv("POLY_MIN_LIQUIDITY",    "1000"))   # USD
+RLM_MIN_LIQUIDITY_USD = float(os.getenv("RLM_MIN_LIQUIDITY_USD", "10000"))  # USD — RLM signal
 
 _SPORTS_DEFAULT = (
     "basketball_nba,basketball_euroleague,basketball_ncaab,"
@@ -351,13 +354,9 @@ def _schedule_coro(coro):
         loop = asyncio.get_running_loop()
         loop.create_task(coro)
     except RuntimeError:
-        # เรียกจาก non-asyncio thread — ใช้ run_coroutine_threadsafe
-        import asyncio as _aio
-        for loop in [getattr(_aio, '_running_loop', None)]:
-            pass
-        loop = _main_loop
-        if loop and not loop.is_closed():
-            asyncio.run_coroutine_threadsafe(coro, loop)
+        # เรียกจาก non-asyncio thread (เช่น dashboard HTTP thread)
+        if _main_loop and not _main_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(coro, _main_loop)
         else:
             log.warning("[DB] _schedule_coro: no event loop available")
 
@@ -643,7 +642,8 @@ async def detect_line_movements(odds_by_sport: dict):
                                         "bm_key": bk,
                                     }
                                     new_movements.append((lm, ctx))
-                                    line_movements.append(lm)
+                                    with _data_lock:
+                                        line_movements.append(lm)
                                     db_save_line_movement(lm)  # 💾
                                     log.info(f"[LineMove] {ename} | {bn} {outcome} {float(old_odds):.3f}→{float(new_odds):.3f} ({pct:.1%}) {'🌊STEAM' if is_steam else ''} {'🔄Sharp' if is_sharp_move else ''}")
 
@@ -694,13 +694,21 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
         time_info = ""
         if commence_time:
             try:
-                ct = datetime.fromisoformat(commence_time.replace("Z","+00:00"))
+                ct   = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+                ct_th = ct + timedelta(hours=7)  # แปลงเป็น UTC+7
                 mins = (ct - datetime.now(timezone.utc)).total_seconds() / 60
-                if mins > 0:
-                    if mins < 60:
-                        time_info = f"⏰ เริ่มใน {int(mins)} นาที"
-                    else:
-                        time_info = f"📅 {commence_time[:16].replace('T',' ')} UTC"
+                date_str = ct_th.strftime("%d/%m/%Y %H:%M")
+                if mins <= 0:
+                    time_info = f"🟢 เริ่มแล้ว ({date_str} น. ไทย)"
+                elif mins < 60:
+                    time_info = f"⏰ เริ่มใน {int(mins)} นาที — {date_str} น. ไทย"
+                elif mins < 1440:
+                    h = int(mins // 60)
+                    m = int(mins % 60)
+                    time_info = f"📅 {date_str} น. ไทย (อีก {h}ชม.{m}น.)"
+                else:
+                    days = int(mins // 1440)
+                    time_info = f"📅 {date_str} น. ไทย (อีก {days} วัน)"
             except Exception:
                 pass
 
@@ -1153,11 +1161,6 @@ def is_on_cooldown(event: str, bm1: str, bm2: str) -> bool:
         return True
     return False
 
-# Minimum liquidity USD สำหรับ Polymarket (ตั้งใน Railway)
-POLY_MIN_LIQUIDITY     = float(os.getenv("POLY_MIN_LIQUIDITY", "1000"))
-# Liquidity ขั้นต่ำสำหรับ RLM signal — ต่ำกว่านี้ถือว่าสัญญาณปลอม
-RLM_MIN_LIQUIDITY_USD  = float(os.getenv("RLM_MIN_LIQUIDITY_USD", "10000"))
-
 def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     parts = [p.strip() for p in event_name.replace(" vs ","|").split("|")]
     if len(parts) < 2: return None
@@ -1359,9 +1362,10 @@ async def send_alert(opp: ArbOpportunity):
         "created_at": opp.created_at, "status": "pending",
         "mins_to_start": round(mins_to_start) if mins_to_start < 9999 else 9999,
     }
-    opportunity_log.append(entry)
+    with _data_lock:
+        opportunity_log.append(entry)
+        if len(opportunity_log) > 100: opportunity_log.pop(0)
     db_save_opportunity(entry)   # 💾 save to DB
-    if len(opportunity_log) > 100: opportunity_log.pop(0)
 
     emoji = SPORT_EMOJI.get(opp.sport,"🏆")
 
@@ -1384,12 +1388,28 @@ async def send_alert(opp: ArbOpportunity):
     w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
     tt = s1 + s2  # ใช้ stake จริง (ไม่ใช่ TOTAL_STAKE_THB) — สำคัญมากเมื่อใช้ Kelly
 
+    # แปลงเวลาแข่งเป็น UTC+7 พร้อม countdown
+    try:
+        _ct    = datetime.fromisoformat(opp.commence.replace(" ", "T") + ":00+00:00")
+        _ct_th = _ct + timedelta(hours=7)
+        _date_str = _ct_th.strftime("%d/%m/%Y %H:%M") + " น. ไทย"
+        if mins_to_start <= 0:
+            _countdown = "🟢 เริ่มแล้ว"
+        elif mins_to_start < 60:
+            _countdown = f"⏰ อีก {int(mins_to_start)} นาที"
+        else:
+            _h = int(mins_to_start // 60); _m = int(mins_to_start % 60)
+            _countdown = f"⏰ อีก {_h}ชม.{_m}น."
+        commence_line = f"📅 *{_date_str}* ({_countdown})"
+    except Exception:
+        commence_line = f"📅 {opp.commence} UTC"
+
     urgent_prefix = f"{urgency_tag}\n" if urgency_tag else ""
     msg = (
         f"{urgent_prefix}"
         f"{emoji} *ARB FOUND — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 {opp.commence} UTC {urgency_note}\n"
+        f"{commence_line}  {urgency_note}\n"
         f"🏆 `{opp.event}`\n"
         f"💵 ทุน: *฿{int(tt):,}* {'_(Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1505,9 +1525,11 @@ async def execute_both(opp: ArbOpportunity) -> str:
         stake1_thb=int(s1), stake2_thb=int(s2),
         profit_pct=float(opp.profit_pct), status="confirmed",
     )
-    trade_records.append(tr)
+    with _data_lock:
+        trade_records.append(tr)
     db_save_trade(tr)            # 💾 save to DB
     register_for_settlement(tr, opp.commence)  # 🏆 auto settle
+    register_closing_watch(opp)               # #39 CLV watch ตอนเจอ opp ใหม่
     # อัพเดท opportunity_log
     for entry in opportunity_log:
         if entry["id"] == opp.signal_id:
@@ -1570,7 +1592,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stake1_thb=int(opp.stake1*USD_TO_THB), stake2_thb=int(opp.stake2*USD_TO_THB),
             profit_pct=float(opp.profit_pct), status="rejected",
         )
-        trade_records.append(tr_rej)
+        with _data_lock:
+            trade_records.append(tr_rej)
         db_save_trade(tr_rej)    # 💾
         db_update_opp_status(sid, "rejected")  # 💾
         await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
@@ -1781,18 +1804,25 @@ def register_closing_watch(opp: "ArbOpportunity"):
 # ══════════════════════════════════════════════════════════════════
 #  🏆 AUTO SETTLEMENT — ดึงผลการแข่งขันอัตโนมัติ
 # ══════════════════════════════════════════════════════════════════
-# track trades ที่รอ settle
-_pending_settlement: dict[str, TradeRecord] = {}   # signal_id → trade
+# track trades ที่รอ settle: signal_id → (trade, commence_dt)
+_pending_settlement: dict[str, tuple] = {}   # signal_id → (TradeRecord, datetime)
 
 
 def register_for_settlement(trade: TradeRecord, commence: str):
-    """เพิ่ม trade เข้า queue รอ settle หลังแข่งเสร็จ"""
+    """เพิ่ม trade เข้า queue รอ settle — จะยิง API ก็ต่อเมื่อเลยเวลาเตะ +2h"""
     try:
-        dt = datetime.fromisoformat(commence.replace(" ", "T") + ":00+00:00")
-        _pending_settlement[trade.signal_id] = trade
-        log.info(f"[Settle] registered: {trade.event} | {dt.strftime('%d/%m %H:%M')} UTC")
+        raw = commence.strip()
+        # รองรับทั้ง "2026-02-26 18:00" และ ISO "2026-02-26T18:00:00+00:00"
+        if "T" not in raw and "+" not in raw:
+            raw = raw.replace(" ", "T") + ":00+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        _pending_settlement[trade.signal_id] = (trade, dt)
+        settle_after = dt + timedelta(hours=2)
+        log.info(f"[Settle] registered: {trade.event} | kick={dt.strftime('%d/%m %H:%M')} UTC | check after {settle_after.strftime('%d/%m %H:%M')} UTC")
     except Exception as e:
-        log.debug(f"[Settle] register error: {e}")
+        log.debug(f"[Settle] register error: {e} (commence={commence})", exc_info=True)
 
 
 async def fetch_scores(sport: str, session: Optional[aiohttp.ClientSession] = None) -> list[dict]:
@@ -1800,7 +1830,7 @@ async def fetch_scores(sport: str, session: Optional[aiohttp.ClientSession] = No
     async def _fetch(s: aiohttp.ClientSession):
         async with s.get(
             f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
-            params={"apiKey": ODDS_API_KEY, "daysFrom": 1},
+            params={"apiKey": ODDS_API_KEY, "daysFrom": 3},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             remaining = int(r.headers.get("x-requests-remaining", api_remaining))
@@ -1933,8 +1963,22 @@ async def settle_completed_trades():
                 await asyncio.sleep(300)
                 continue
 
-            # รวม sports ที่ต้องดึงผล
-            sports_needed = set(t.sport for t in _pending_settlement.values())
+            now = datetime.now(timezone.utc)
+            # #37 กรองเฉพาะ trades ที่เลยเวลาเตะ +2h แล้ว — ไม่ยิง API ก่อนถึงเวลา
+            ready = {
+                sid: (trade, cdt)
+                for sid, (trade, cdt) in _pending_settlement.items()
+                if now >= cdt + timedelta(hours=2)
+            }
+            if not ready:
+                earliest = min(cdt for _, cdt in _pending_settlement.values())
+                wait_min = max(0, int((earliest + timedelta(hours=2) - now).total_seconds() / 60))
+                log.debug(f"[Settle] {len(_pending_settlement)} trade(s) waiting — earliest ready in {wait_min}m")
+                await asyncio.sleep(300)
+                continue
+
+            # รวม sports ที่ต้องดึงผล (เฉพาะที่ ready)
+            sports_needed = set(trade.sport for trade, _ in ready.values())
             all_scores: dict[str, list] = {}
 
             async with aiohttp.ClientSession() as session:
@@ -1944,7 +1988,7 @@ async def settle_completed_trades():
                     await asyncio.sleep(1)  # ไม่ spam API
 
             settled_ids = []
-            for signal_id, trade in list(_pending_settlement.items()):
+            for signal_id, (trade, _cdt) in list(ready.items()):
                 # หา event ที่ตรงกัน
                 sport_scores = all_scores.get(trade.sport, [])
                 matched_event = None
@@ -2100,535 +2144,17 @@ async def keep_alive_ping():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  8. DASHBOARD (ปรับปรุงใหม่พร้อมกราฟ + Line Movement section)
+#  8. DASHBOARD
 # ══════════════════════════════════════════════════════════════════
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="th">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ARB BOT v9.0</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:16px}
-h1{color:#58a6ff;font-size:1.3rem;margin-bottom:2px}
-.sub{color:#8b949e;font-size:.75rem;margin-bottom:12px}
-.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #30363d;padding-bottom:0}
-.tab{padding:8px 16px;cursor:pointer;color:#8b949e;font-size:.85rem;border-radius:6px 6px 0 0;border:1px solid transparent;border-bottom:none;margin-bottom:-1px}
-.tab.active{color:#e6edf3;background:#161b22;border-color:#30363d;border-bottom-color:#161b22}
-.tab:hover:not(.active){color:#e6edf3;background:#1c2128}
-.page{display:none}.page.active{display:block}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
-.card .lbl{color:#8b949e;font-size:.68rem;text-transform:uppercase;letter-spacing:.5px}
-.card .val{font-size:1.4rem;font-weight:700;margin-top:2px}
-.card .sub2{color:#8b949e;font-size:.7rem;margin-top:2px}
-.green{color:#3fb950}.red{color:#f85149}.yellow{color:#d29922}.blue{color:#58a6ff}.purple{color:#bc8cff}.orange{color:#fb8f44}
-.quota-bar{background:#21262d;border-radius:3px;height:5px;overflow:hidden;margin:4px 0}
-.quota-fill{height:100%;border-radius:3px;transition:width .3s}
-.qtext{color:#8b949e;font-size:.7rem;margin-bottom:12px}
-.sec{color:#8b949e;font-size:.7rem;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px}
-table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:12px}
-th{background:#21262d;color:#8b949e;font-size:.68rem;text-transform:uppercase;padding:7px 10px;text-align:left}
-td{padding:7px 10px;border-top:1px solid #21262d;font-size:.8rem}
-tr:hover td{background:#1c2128}
-.badge{display:inline-block;padding:1px 6px;border-radius:10px;font-size:.65rem;font-weight:600}
-.bp{background:#1f3d5c;color:#58a6ff}.bc{background:#1a3a2a;color:#3fb950}.br{background:#3d1f1f;color:#f85149}
-.brlm{background:#2d1f4a;color:#bc8cff}.bsteam{background:#1a2d4a;color:#58a6ff}
-.profit{color:#3fb950;font-weight:700}.loss{color:#f85149;font-weight:700}
-.cw{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
-.wr-ring{display:flex;align-items:center;gap:12px;padding:8px 0}
-.ring{width:64px;height:64px;flex-shrink:0}
-@media(max-width:600px){.two,.three{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<h1>🤖 ARB BOT v9.0</h1>
-<div class="sub">รีเฟรชทุก 20 วินาที — v9.0 — Slippage Guard + CLV Benchmark + Settlement Parser + Thread-Safe</div>
+_DASH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+try:
+    with open(_DASH_PATH, "r", encoding="utf-8") as _f:
+        DASHBOARD_HTML = _f.read()
+    log.info(f"[Dashboard] loaded from {_DASH_PATH}")
+except FileNotFoundError:
+    log.warning("[Dashboard] dashboard.html not found — using empty fallback")
+    DASHBOARD_HTML = "<h1>dashboard.html not found</h1>"
 
-<div class="tabs">
-  <div class="tab active" onclick="switchTab('overview')">📊 Overview</div>
-  <div class="tab" onclick="switchTab('linelog')">📡 Line Moves</div>
-  <div class="tab" onclick="switchTab('stats')">🔬 Statistics</div>
-  <div class="tab" onclick="switchTab('trades')">💰 Trades</div>
-  <div class="tab" onclick="switchTab('controls')">⚙️ Controls</div>
-</div>
-
-<!-- ═══ TAB 1: OVERVIEW ═══ -->
-<div id="page-overview" class="page active">
-  <div class="grid" id="overviewCards"></div>
-  <div class="quota-bar"><div class="quota-fill" id="qFill"></div></div>
-  <div class="qtext" id="qText"></div>
-  <div class="two">
-    <div class="cw"><div class="sec">📈 Profit Opportunity History</div><canvas id="profitChart" height="150"></canvas></div>
-    <div class="cw"><div class="sec">📡 Line Movement Flow</div><canvas id="lineFlowChart" height="150"></canvas></div>
-  </div>
-  <div class="sec">📋 Opportunity Log ล่าสุด</div>
-  <table>
-    <thead><tr><th>Event</th><th>Leg 1</th><th>Leg 2</th><th>Profit</th><th>เวลา</th><th>Status</th></tr></thead>
-    <tbody id="oppBody"></tbody>
-  </table>
-</div>
-
-<!-- ═══ TAB 2: LINE MOVES ═══ -->
-<div id="page-linelog" class="page">
-  <div class="two">
-    <div class="cw"><div class="sec">💧 Price Flow — odds เปลี่ยนตามเวลา</div><canvas id="priceFlowChart" height="180"></canvas></div>
-    <div class="cw"><div class="sec">🌊 Steam vs 🔄 RLM Count</div><canvas id="signalTypeChart" height="180"></canvas></div>
-  </div>
-  <div class="sec">🌊 Line Movement Log</div>
-  <table>
-    <thead><tr><th>Event</th><th>Bookmaker</th><th>Outcome</th><th>Before→After</th><th>Change</th><th>Signal</th><th>เวลา</th></tr></thead>
-    <tbody id="lineBody"></tbody>
-  </table>
-</div>
-
-<!-- ═══ TAB 3: STATISTICS ═══ -->
-<div id="page-stats" class="page">
-  <!-- Win Rate Section -->
-  <div class="three">
-    <div class="cw">
-      <div class="sec">🔄 RLM Win Rate</div>
-      <div class="wr-ring">
-        <svg class="ring" viewBox="0 0 36 36">
-          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
-          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#bc8cff" stroke-width="3"
-            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
-            id="rlmRing"/>
-        </svg>
-        <div>
-          <div class="val purple" id="rlmWR">—</div>
-          <div class="sub2" id="rlmCount">0 signals</div>
-          <div class="sub2" style="font-size:.65rem;margin-top:2px">Pinnacle ขยับ = sharp money</div>
-        </div>
-      </div>
-    </div>
-    <div class="cw">
-      <div class="sec">🌊 Steam Win Rate</div>
-      <div class="wr-ring">
-        <svg class="ring" viewBox="0 0 36 36">
-          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
-          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#58a6ff" stroke-width="3"
-            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
-            id="steamRing"/>
-        </svg>
-        <div>
-          <div class="val blue" id="steamWR">—</div>
-          <div class="sub2" id="steamCount">0 signals</div>
-          <div class="sub2" style="font-size:.65rem;margin-top:2px">หลายเว็บขยับพร้อมกัน</div>
-        </div>
-      </div>
-    </div>
-    <div class="cw">
-      <div class="sec">📊 Overall Arb Win Rate</div>
-      <div class="wr-ring">
-        <svg class="ring" viewBox="0 0 36 36">
-          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#21262d" stroke-width="3"/>
-          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#3fb950" stroke-width="3"
-            stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)"
-            id="arbRing"/>
-        </svg>
-        <div>
-          <div class="val green" id="arbWR">—</div>
-          <div class="sub2" id="arbCount">0 trades</div>
-          <div class="sub2" style="font-size:.65rem;margin-top:2px">Confirmed / total</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Sharp vs Public + Bookmaker Accuracy -->
-  <div class="two">
-    <div class="cw">
-      <div class="sec">💎 Sharp vs Public Money</div>
-      <canvas id="sharpPublicChart" height="160"></canvas>
-      <div id="sharpNote" style="color:#8b949e;font-size:.72rem;margin-top:6px"></div>
-    </div>
-    <div class="cw">
-      <div class="sec">🎯 Bookmaker Accuracy (vs closing line)</div>
-      <canvas id="bmAccChart" height="160"></canvas>
-    </div>
-  </div>
-
-  <!-- ROI per Sport -->
-  <div class="cw">
-    <div class="sec">💹 ROI ต่อ Sport</div>
-    <canvas id="roiChart" height="130"></canvas>
-  </div>
-
-  <!-- CLV Summary -->
-  <div class="grid" id="clvCards"></div>
-</div>
-
-<!-- ═══ TAB 4: TRADES ═══ -->
-<div id="page-trades" class="page">
-  <div class="grid" id="pnlCards"></div>
-  <div class="sec">📝 Trade History</div>
-  <table>
-    <thead><tr><th>Event</th><th>Sport</th><th>Leg 1</th><th>Leg 2</th><th>Profit%</th><th>ทุน</th><th>CLV</th><th>Status</th><th>เวลา</th></tr></thead>
-    <tbody id="tradeBody"></tbody>
-  </table>
-</div>
-
-<!-- ═══ TAB 5: CONTROLS ═══ -->
-<div id="page-controls" class="page">
-  <div class="two">
-    <!-- Quick Actions -->
-    <div class="cw">
-      <div class="sec">⚡ Quick Actions</div>
-      <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
-        <button class="btn-green" onclick="action('scan_now','true')">🔍 Scan Now</button>
-        <button class="btn-blue"  onclick="toggleScan()">🔄 Toggle Auto Scan</button>
-        <button class="btn-gray"  onclick="action('clear_seen','true')">🗑️ Clear Seen Signals</button>
-      </div>
-    </div>
-    <!-- Scan Settings -->
-    <div class="cw">
-      <div class="sec">📡 Scan Settings</div>
-      <div class="ctrl-row">
-        <label>Min Profit %</label>
-        <input type="number" id="cfg_min_profit" step="0.1" min="0.5" max="10" placeholder="1.5">
-        <button onclick="save('min_profit_pct', document.getElementById('cfg_min_profit').value/100)">Save</button>
-      </div>
-      <div class="ctrl-row">
-        <label>Scan Interval (s)</label>
-        <input type="number" id="cfg_interval" step="60" min="60" max="3600" placeholder="300">
-        <button onclick="save('scan_interval', document.getElementById('cfg_interval').value)">Save</button>
-      </div>
-      <div class="ctrl-row">
-        <label>Alert Cooldown (m)</label>
-        <input type="number" id="cfg_cooldown" step="5" min="5" max="120" placeholder="30">
-        <button onclick="save('cooldown', document.getElementById('cfg_cooldown').value)">Save</button>
-      </div>
-    </div>
-  </div>
-  <div class="two">
-    <!-- Odds Settings -->
-    <div class="cw">
-      <div class="sec">📊 Odds Filter</div>
-      <div class="ctrl-row">
-        <label>Max Odds</label>
-        <input type="number" id="cfg_max_odds" step="1" min="2" max="50" placeholder="15">
-        <button onclick="save('max_odds', document.getElementById('cfg_max_odds').value)">Save</button>
-      </div>
-      <div class="ctrl-row">
-        <label>Min Odds</label>
-        <input type="number" id="cfg_min_odds" step="0.05" min="1.01" max="2" placeholder="1.05">
-        <button onclick="save('min_odds', document.getElementById('cfg_min_odds').value)">Save</button>
-      </div>
-    </div>
-    <!-- Stake Settings -->
-    <div class="cw">
-      <div class="sec">💵 Stake / Kelly</div>
-      <div class="ctrl-row">
-        <label>Total Stake (฿)</label>
-        <input type="number" id="cfg_stake" step="1000" min="1000" placeholder="10000">
-        <button onclick="save('total_stake', document.getElementById('cfg_stake').value)">Save</button>
-      </div>
-      <div class="ctrl-row">
-        <label>Kelly Fraction</label>
-        <input type="number" id="cfg_kelly" step="0.05" min="0.1" max="1" placeholder="0.25">
-        <button onclick="save('kelly_fraction', document.getElementById('cfg_kelly').value)">Save</button>
-      </div>
-      <div class="ctrl-row">
-        <label>Use Kelly</label>
-        <select id="cfg_use_kelly">
-          <option value="true">ON</option>
-          <option value="false">OFF</option>
-        </select>
-        <button onclick="save('use_kelly', document.getElementById('cfg_use_kelly').value)">Save</button>
-      </div>
-    </div>
-  </div>
-  <div id="ctrl-msg" style="margin-top:8px;padding:10px;border-radius:6px;display:none;font-size:.85rem"></div>
-  <div class="cw" style="margin-top:12px">
-    <div class="sec">📋 Current Config</div>
-    <div id="cfg-display" style="font-size:.8rem;color:#8b949e;line-height:1.8"></div>
-  </div>
-</div>
-
-<style>
-.btn-green{background:#1a3a2a;color:#3fb950;border:1px solid #3fb950;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
-.btn-blue{background:#1f3d5c;color:#58a6ff;border:1px solid #58a6ff;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
-.btn-gray{background:#21262d;color:#8b949e;border:1px solid #30363d;padding:10px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;width:100%}
-.ctrl-row{display:grid;grid-template-columns:140px 1fr auto;gap:6px;align-items:center;margin-bottom:8px}
-.ctrl-row label{color:#8b949e;font-size:.78rem}
-.ctrl-row input,.ctrl-row select{background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:5px 8px;font-size:.82rem;width:100%}
-.ctrl-row button{background:#21262d;color:#58a6ff;border:1px solid #30363d;border-radius:4px;padding:5px 10px;cursor:pointer;font-size:.78rem;white-space:nowrap}
-.ctrl-row button:hover{background:#1f3d5c}
-</style>
-
-<script>
-let charts = {};
-let currentTab = 'overview';
-let lastData = null;
-
-function switchTab(name) {
-  currentTab = name;
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    const names = ['overview','linelog','stats','trades','controls'];
-    t.classList.toggle('active', names[i]===name);
-  });
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.getElementById('page-'+name).classList.add('active');
-  if (lastData) { renderTab(name, lastData); if(name==='controls') renderControls(lastData); }
-}
-
-function mkChart(id, type, labels, datasets, opts={}) {
-  const ctx = document.getElementById(id);
-  if (!ctx) return;
-  if (charts[id]) charts[id].destroy();
-  charts[id] = new Chart(ctx, {
-    type,
-    data:{labels, datasets},
-    options:{
-      responsive:true,
-      plugins:{legend:{display:opts.legend??false,labels:{color:'#8b949e',font:{size:10}}},
-               tooltip:{callbacks:{label: ctx => opts.tooltipFn ? opts.tooltipFn(ctx) : ctx.formattedValue}}},
-      scales: type==='pie'||type==='doughnut' ? {} : {
-        x:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'}},
-        y:{ticks:{color:'#8b949e',font:{size:9}},grid:{color:'#21262d'},
-           ...(opts.yTitle?{title:{display:true,text:opts.yTitle,color:'#8b949e',font:{size:9}}}:{})}
-      }
-    }
-  });
-}
-
-function setRing(id, pct, color) {
-  const el = document.getElementById(id);
-  if (el) el.setAttribute('stroke-dasharray', `${pct} ${100-pct}`);
-}
-
-function renderTab(tab, d) {
-  const s = d.stats || {};
-  const lm = d.line_movements || [];
-  const opps = d.opportunities || [];
-  const trades = d.trade_records || [];
-
-  if (tab === 'overview') {
-    const qPct = Math.round((d.api_remaining/500)*100);
-    const qColor = qPct>30?'#3fb950':qPct>10?'#d29922':'#f85149';
-    document.getElementById('overviewCards').innerHTML = `
-      <div class="card"><div class="lbl">Auto Scan</div><div class="val ${d.auto_scan?'green':'red'}">${d.auto_scan?'🟢 ON':'🔴 OFF'}</div></div>
-      <div class="card"><div class="lbl">สแกน</div><div class="val blue">${d.scan_count} รอบ</div></div>
-      <div class="card"><div class="lbl">รอ Confirm</div><div class="val yellow">${d.pending_count}</div></div>
-      <div class="card"><div class="lbl">API Credits</div><div class="val" style="color:${qColor}">${d.api_remaining}</div></div>
-      <div class="card"><div class="lbl">Line Moves</div><div class="val purple">${d.line_move_count}</div></div>
-      <div class="card"><div class="lbl">Trades</div><div class="val green">${d.confirmed_trades}</div></div>
-    `;
-    document.getElementById('qFill').style.cssText=`width:${qPct}%;background:${qColor}`;
-    document.getElementById('qText').textContent=`Credits ${d.api_remaining}/500 (${qPct}%) | เตือนที่ ${d.quota_warn_at} | ${d.last_scan_time}`;
-
-    const pLabels = opps.slice(-20).map(o=>o.event.split(' vs ')[0].substring(0,8));
-    const pData   = opps.slice(-20).map(o=>+(o.profit_pct*100).toFixed(2));
-    mkChart('profitChart','bar',pLabels,[{label:'Profit%',data:pData,
-      backgroundColor:pData.map(v=>v>2?'#3fb950':v>1?'#d29922':'#58a6ff'),borderRadius:3}],{yTitle:'%'});
-
-    const lmLabels = lm.slice(-20).map(m=>m.event.split(' vs ')[0].substring(0,6));
-    const lmData   = lm.slice(-20).map(m=>+(m.pct_change*100).toFixed(2));
-    mkChart('lineFlowChart','bar',lmLabels,[{label:'Move%',data:lmData,
-      backgroundColor:lmData.map(v=>v<0?'#f85149':'#3fb950'),borderRadius:3}],{yTitle:'%'});
-
-    const oppRows = opps.slice(-15).reverse().map(o=>{
-      const bc=o.status==='pending'?'bp':o.status==='confirmed'?'bc':'br';
-      const bl=o.status==='pending'?'รอ':o.status==='confirmed'?'✅':'❌';
-      const t=new Date(o.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
-      return `<tr><td>${o.event}</td><td>${o.leg1_bm} @${o.leg1_odds.toFixed(2)}</td>
-        <td>${o.leg2_bm} @${o.leg2_odds.toFixed(2)}</td>
-        <td class="profit">+${(o.profit_pct*100).toFixed(2)}%</td>
-        <td>${t}</td>
-        <td><span class="badge ${bc}">${bl}</span>${o.mins_to_start<=30&&o.mins_to_start>0?' <span class="badge" style="background:#3d1a1a;color:#f85149">🔴CLOSING</span>':o.mins_to_start<=120&&o.mins_to_start>0?' <span class="badge" style="background:#2d2a1a;color:#d29922">⏰120m</span>':''}</td></tr>`;
-    }).join('');
-    document.getElementById('oppBody').innerHTML = oppRows||'<tr><td colspan="6" style="text-align:center;color:#8b949e;padding:20px">ยังไม่พบ opportunity</td></tr>';
-  }
-
-  if (tab === 'linelog') {
-    // Price Flow Chart — odds ของ event ล่าสุดตามเวลา
-    const byEvent = {};
-    lm.forEach(m => {
-      const k = m.event.substring(0,20);
-      if (!byEvent[k]) byEvent[k] = [];
-      byEvent[k].push({t: new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'}),
-                       v: m.odds_after, bm: m.bookmaker});
-    });
-    const topEvents = Object.keys(byEvent).slice(-4);
-    const colors = ['#58a6ff','#3fb950','#d29922','#bc8cff'];
-    const flowDatasets = topEvents.map((ev,i)=>({
-      label: ev, borderColor: colors[i], backgroundColor: colors[i]+'33',
-      data: byEvent[ev].map(p=>p.v), fill:false, tension:0.3, pointRadius:3,
-    }));
-    const flowLabels = topEvents.length ? byEvent[topEvents[0]].map(p=>p.t) : [];
-    mkChart('priceFlowChart','line',flowLabels,flowDatasets,{legend:true,yTitle:'Odds'});
-
-    // Signal type donut
-    const rlmCount   = lm.filter(m=>m.is_rlm).length;
-    const steamCount = lm.filter(m=>m.is_steam).length;
-    const normalCount= lm.length - rlmCount - steamCount;
-    mkChart('signalTypeChart','doughnut',
-      ['🔄 RLM','🌊 Steam','📊 Normal'],
-      [{data:[rlmCount,steamCount,normalCount],backgroundColor:['#bc8cff','#58a6ff','#30363d'],borderWidth:0}],
-      {legend:true});
-
-    const lmRows = lm.slice(-20).reverse().map(m=>{
-      const pct=(m.pct_change*100).toFixed(1);
-      const sign=m.pct_change>0?'+':'';
-      const tags=(m.is_steam?'<span class="badge bsteam">🌊Steam</span> ':'')+(m.is_rlm?'<span class="badge brlm">🔄RLM</span>':'');
-      const t=new Date(m.ts).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
-      return `<tr><td>${m.event}</td><td>${m.bookmaker}</td><td>${m.outcome}</td>
-        <td>${m.odds_before.toFixed(3)}→${m.odds_after.toFixed(3)}</td>
-        <td style="color:${m.pct_change<0?'#f85149':'#3fb950'}">${sign}${pct}%</td>
-        <td>${tags||'—'}</td><td>${t}</td></tr>`;
-    }).join('');
-    document.getElementById('lineBody').innerHTML = lmRows||'<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มีข้อมูล</td></tr>';
-  }
-
-  if (tab === 'stats') {
-    // RLM Win Rate
-    const rlmWR  = s.rlm_win_rate ?? null;
-    const rlmCnt = s.rlm_count ?? 0;
-    const steamWR  = s.steam_win_rate ?? null;
-    const steamCnt = s.steam_count ?? 0;
-    const arbWR    = s.arb_win_rate ?? null;
-    const arbCnt   = s.confirmed_trades ?? 0;
-
-    document.getElementById('rlmWR').textContent   = rlmWR!==null ? rlmWR.toFixed(1)+'%' : '—';
-    document.getElementById('rlmCount').textContent = rlmCnt+' signals';
-    document.getElementById('steamWR').textContent  = steamWR!==null ? steamWR.toFixed(1)+'%' : '—';
-    document.getElementById('steamCount').textContent= steamCnt+' signals';
-    document.getElementById('arbWR').textContent    = arbWR!==null ? arbWR.toFixed(1)+'%' : '—';
-    document.getElementById('arbCount').textContent  = arbCnt+' trades';
-
-    if (rlmWR!==null)   setRing('rlmRing', rlmWR, '#bc8cff');
-    if (steamWR!==null) setRing('steamRing', steamWR, '#58a6ff');
-    if (arbWR!==null)   setRing('arbRing', arbWR, '#3fb950');
-
-    // Sharp vs Public
-    const sharpCount  = s.sharp_count ?? 0;
-    const publicCount = s.public_count ?? 0;
-    mkChart('sharpPublicChart','doughnut',
-      ['💎 Sharp (RLM+Steam)', '📢 Public (Normal)'],
-      [{data:[sharpCount,publicCount],backgroundColor:['#bc8cff','#30363d'],borderWidth:0}],
-      {legend:true});
-    document.getElementById('sharpNote').textContent =
-      `Sharp signals: ${sharpCount} | Public: ${publicCount} | Sharp ratio: ${sharpCount+publicCount>0?((sharpCount/(sharpCount+publicCount))*100).toFixed(1):'—'}%`;
-
-    // Bookmaker accuracy
-    const bmNames  = Object.keys(s.bm_accuracy ?? {});
-    const bmScores = bmNames.map(k=>(s.bm_accuracy[k]*100).toFixed(1));
-    mkChart('bmAccChart','bar',bmNames,
-      [{label:'Accuracy%',data:bmScores,
-        backgroundColor:bmScores.map(v=>v>60?'#3fb950':v>40?'#d29922':'#f85149'),borderRadius:3}],
-      {yTitle:'%'});
-
-    // ROI per sport
-    const sportNames = Object.keys(s.roi_by_sport ?? {});
-    const sportROI   = sportNames.map(k=>+(s.roi_by_sport[k]*100).toFixed(2));
-    mkChart('roiChart','bar',sportNames.map(n=>n.split('_').pop().toUpperCase()),
-      [{label:'ROI%',data:sportROI,
-        backgroundColor:sportROI.map(v=>v>0?'#3fb950':'#f85149'),borderRadius:3}],
-      {yTitle:'%'});
-
-    // CLV cards
-    const clv = s.clv ?? {};
-    document.getElementById('clvCards').innerHTML = `
-      <div class="card"><div class="lbl">CLV avg</div>
-        <div class="val ${(clv.avg??0)>=0?'green':'red'}">${clv.avg!==null&&clv.avg!==undefined?clv.avg.toFixed(2)+'%':'—'}</div>
-        <div class="sub2">เอาชนะตลาด = บวก</div></div>
-      <div class="card"><div class="lbl">CLV บวก</div><div class="val green">${clv.positive??0} trades</div></div>
-      <div class="card"><div class="lbl">CLV ลบ</div><div class="val red">${clv.negative??0} trades</div></div>
-      <div class="card"><div class="lbl">Best CLV</div><div class="val green">${clv.best!==undefined?'+'+clv.best.toFixed(2)+'%':'—'}</div></div>
-    `;
-  }
-
-  if (tab === 'trades') {
-    const p = d.pnl ?? {};
-    document.getElementById('pnlCards').innerHTML = `
-      <div class="card"><div class="lbl">Confirmed</div><div class="val green">${p.confirmed??0}</div></div>
-      <div class="card"><div class="lbl">Rejected</div><div class="val red">${p.rejected??0}</div></div>
-      <div class="card"><div class="lbl">Est. Profit</div><div class="val green">฿${(p.est_profit??0).toLocaleString()}</div></div>
-      <div class="card"><div class="lbl">Avg Profit%</div><div class="val blue">${p.avg_profit?p.avg_profit.toFixed(2)+'%':'—'}</div></div>
-      <div class="card"><div class="lbl">CLV avg</div><div class="val ${(p.avg_clv??0)>=0?'green':'red'}">${p.avg_clv!==null&&p.avg_clv!==undefined?p.avg_clv.toFixed(2)+'%':'—'}</div></div>
-    `;
-    const tRows = trades.slice(-30).reverse().map(t=>{
-      const bc=t.status==='confirmed'?'bc':'br';
-      const tm=new Date(t.created_at).toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit'});
-      const clvStr=(t.clv_leg1!==null&&t.clv_leg1!==undefined)?`${t.clv_leg1>0?'+':''}${t.clv_leg1.toFixed(1)}%`:'—';
-      return `<tr>
-        <td>${t.event}</td><td>${t.sport.split('_').pop().toUpperCase()}</td>
-        <td>${t.leg1_bm} @${t.leg1_odds.toFixed(2)}</td>
-        <td>${t.leg2_bm} @${t.leg2_odds.toFixed(2)}</td>
-        <td class="profit">+${(t.profit_pct*100).toFixed(2)}%</td>
-        <td>฿${t.stake1_thb.toLocaleString()}/฿${t.stake2_thb.toLocaleString()}</td>
-        <td style="color:${(t.clv_leg1??0)>=0?'#3fb950':'#f85149'}">${clvStr}</td>
-        <td><span class="badge ${bc}">${t.status==='confirmed'?'✅ Confirmed':'❌ Rejected'}</span></td>
-        <td>${tm}</td></tr>`;
-    }).join('');
-    document.getElementById('tradeBody').innerHTML = tRows||'<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px">ยังไม่มี trades</td></tr>';
-  }
-}
-
-const _qs = new URLSearchParams(location.search);
-const _tk = _qs.get('token') || '';
-function apiUrl(path) { return _tk ? path + '?token=' + encodeURIComponent(_tk) : path; }
-setInterval(() => { load(); }, 20000);  // fetch+render เฉพาะ tab — ไม่ reload ทั้งหน้า
-
-async function action(key, value) {
-  const r = await fetch(apiUrl('/api/control'), {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({key, value})
-  });
-  const d = await r.json();
-  showMsg(d.msg, d.ok);
-  if (d.ok) load();
-}
-
-async function save(key, value) {
-  if (!value && value !== false) { showMsg('กรุณากรอกค่า','error'); return; }
-  await action(key, value);
-}
-
-async function toggleScan() {
-  const r = await fetch(apiUrl('/api/state'));
-  const d = await r.json();
-  await action('auto_scan', (!d.auto_scan).toString());
-}
-
-function showMsg(msg, ok) {
-  const el = document.getElementById('ctrl-msg');
-  el.textContent = ok ? '✅ ' + msg : '❌ ' + msg;
-  el.style.display = 'block';
-  el.style.background = ok ? '#1a3a2a' : '#3d1f1f';
-  el.style.color = ok ? '#3fb950' : '#f85149';
-  setTimeout(() => el.style.display='none', 3000);
-}
-
-function renderControls(d) {
-  document.getElementById('cfg-display').innerHTML = `
-    Auto Scan: <b style="color:${d.auto_scan?'#3fb950':'#f85149'}">${d.auto_scan?'ON':'OFF'}</b><br>
-    Min Profit: <b>${(d.min_profit_pct*100).toFixed(2)}%</b><br>
-    Scan Interval: <b>${d.scan_interval}s</b><br>
-    Total Stake: <b>฿${d.total_stake_thb.toLocaleString()}</b><br>
-    API Credits: <b>${d.api_remaining}/500</b>
-  `;
-}
-
-async function load() {
-  const [stateRes, statsRes] = await Promise.all([
-    fetch(apiUrl('/api/state')), fetch(apiUrl('/api/stats'))
-  ]);
-  const state = await stateRes.json();
-  const stats = await statsRes.json();
-  const data  = {...state, stats};
-  data.trade_records = stats.trade_records || [];
-  lastData = data;
-  renderTab(currentTab, data);
-}
-load();
-</script>
-</body>
-</html>"""
 
 
 _stats_cache: dict = {"data": None, "ts": 0}
@@ -2988,18 +2514,22 @@ async def post_init(app: Application):
     # #34 เรียก register_closing_watch ด้วยเพื่อให้ CLV tracking ทำงานหลัง restart
     for t in trade_records:
         if t.status == "confirmed" and t.actual_profit_thb is None and t.settled_at is None:
-            _pending_settlement[t.signal_id] = t
-            # restore CLV watch — สร้าง mock ArbOpportunity เพื่อ register
+            # #37 restore ด้วย (trade, commence_dt) tuple
             try:
-                mock_commence = t.created_at[:16].replace("T", " ")
+                commence_dt = datetime.fromisoformat(
+                    t.created_at.replace("Z", "+00:00")
+                ) + timedelta(hours=3)  # ประมาณ commence = created + 3h
+            except Exception:
+                commence_dt = datetime.now(timezone.utc)  # fallback: settle ได้ทันที
+            _pending_settlement[t.signal_id] = (t, commence_dt)
+            # restore CLV watch
+            try:
                 key = f"{t.event}|{t.sport}"
                 if key not in _closing_line_watch:
                     _closing_line_watch[key] = {
                         "event":       t.event,
                         "sport":       t.sport,
-                        "commence_dt": datetime.fromisoformat(
-                            t.created_at.replace("Z", "+00:00")
-                        ) + timedelta(hours=3),  # ประมาณ commence = created + 3h
+                        "commence_dt": commence_dt,
                         "done":        False,
                     }
             except Exception:
