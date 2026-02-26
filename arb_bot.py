@@ -1,12 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  ARB BOT v9.0  —  Sharp Edition                                      ║
-║  1.  Odds Staleness (last_update) 7.  Line Movement Alert (Pinnacle) ║
-║  2.  Max Odds Filter              8.  Dashboard (fetch-only refresh) ║
-║  3.  Alert Cooldown               9.  Multi-chat Support             ║
-║  4.  P&L Tracker + CLV Benchmark  10. Sharp Move (Pinnacle Down)     ║
-║  5.  Slippage Guard (re-fetch)    11. Steam Move Alert               ║
-║  6.  Polymarket Impact Cost       12. Settlement Parser (sport-aware) ║
+║  ARB BOT v10.0 —  Production Ready                                    ║
+║  1.  Odds Staleness + Slippage Guard   9.  Profitability Guard        ║
+║  2.  Max/Min Odds Filter              10.  CLV Benchmark + Settlement ║
+║  3.  Alert Cooldown + Multi-chat      11.  Manual Settle (/settle)    ║
+║  4.  P&L Tracker + /trades command   12.  Sport Rotation              ║
+║  5.  Turso persistent DB (sync+async) 13.  Thread-safe _data_lock     ║
+║  6.  Scanner asyncio.Event wakeup     14.  Dashboard Force Settle UI  ║
+║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
+║  8.  commence_time in TradeRecord     16.  keep_alive optional        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -377,7 +379,8 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
                 return await loop.run_in_executor(None, _do_query)
             else:
                 rs = await _turso.execute(sql, list(params))
-                return [tuple(row.values()) for row in rs.rows]
+                # libsql_client Row ไม่มี .values() — ใช้ list(row) แทน
+                return [tuple(list(row)) for row in rs.rows]
         except Exception as e:
             log.error(f"[DB] turso_query: {e}")
     # SQLite fallback
