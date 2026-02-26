@@ -205,6 +205,8 @@ class TradeRecord:
 # ══════════════════════════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════════════════════════
+_main_loop: Optional[asyncio.AbstractEventLoop] = None  # #33 ref to main loop for cross-thread db saves
+
 pending:           dict[str, ArbOpportunity] = {}
 seen_signals:      set[str]                  = set()
 auto_scan:         bool                      = AUTO_SCAN_START
@@ -328,8 +330,26 @@ def db_init():
         db_init_local()
 
 # ── Write helpers ─────────────────────────────────────────────────
+# #33 Thread-safe db_save_* — ใช้ get_event_loop แทน get_running_loop
+# เพราะ db_save_* อาจถูกเรียกจาก dashboard thread (ไม่ใช่ asyncio thread)
+def _schedule_coro(coro):
+    """Schedule coroutine onto the main asyncio loop from any thread safely."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+    except RuntimeError:
+        # เรียกจาก non-asyncio thread — ใช้ run_coroutine_threadsafe
+        import asyncio as _aio
+        for loop in [getattr(_aio, '_running_loop', None)]:
+            pass
+        loop = _main_loop
+        if loop and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        else:
+            log.warning("[DB] _schedule_coro: no event loop available")
+
 def db_save_trade(t: "TradeRecord"):
-    asyncio.get_running_loop().create_task(_async_save_trade(t))
+    _schedule_coro(_async_save_trade(t))
 
 async def _async_save_trade(t: "TradeRecord"):
     await turso_exec(
@@ -342,7 +362,7 @@ async def _async_save_trade(t: "TradeRecord"):
     )
 
 def db_save_opportunity(opp: dict):
-    asyncio.get_running_loop().create_task(_async_save_opp(opp))
+    _schedule_coro(_async_save_opp(opp))
 
 async def _async_save_opp(opp: dict):
     await turso_exec(
@@ -353,12 +373,10 @@ async def _async_save_opp(opp: dict):
     )
 
 def db_update_opp_status(signal_id: str, status: str):
-    asyncio.get_running_loop().create_task(
-        turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", (status, signal_id))
-    )
+    _schedule_coro(turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", (status, signal_id)))
 
 def db_save_line_movement(lm: "LineMovement"):
-    asyncio.get_running_loop().create_task(_async_save_lm(lm))
+    _schedule_coro(_async_save_lm(lm))
 
 async def _async_save_lm(lm: "LineMovement"):
     await turso_exec(
@@ -372,9 +390,7 @@ async def _async_save_lm(lm: "LineMovement"):
     )
 
 def db_save_state(key: str, value: str):
-    asyncio.get_running_loop().create_task(
-        turso_exec("INSERT OR REPLACE INTO bot_state VALUES (?,?)", (key, value))
-    )
+    _schedule_coro(turso_exec("INSERT OR REPLACE INTO bot_state VALUES (?,?)", (key, value)))
 
 async def db_load_state_async(key: str, default: str = "") -> str:
     rows = await turso_query("SELECT value FROM bot_state WHERE key=?", (key,))
@@ -1436,12 +1452,17 @@ async def execute_both(opp: ArbOpportunity) -> str:
     live1, live2 = await refetch_live_odds(opp)
     live_profit, _, _ = calc_arb(live1, live2)
 
-    if live_profit < Decimal("0"):
-        log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%}")
+    # #32 Abort ถ้า live profit ต่ำกว่า 0% หรือ ลดจาก original มากกว่า 50%
+    orig_profit = opp.profit_pct
+    drop_too_much = (orig_profit > 0 and
+                    float(orig_profit - live_profit) / float(orig_profit) > 0.50)
+    if live_profit < Decimal("0") or drop_too_much:
+        log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%} (was {float(orig_profit):.2%})")
         raise ValueError(
             f"🚫 *ABORT: Odds Dropped*\n"
-            f"ราคาเปลี่ยนขณะรอยืนยัน — arb หายแล้ว\n"
-            f"Live profit: *{live_profit:.2%}*\n"
+            f"ราคาเปลี่ยนขณะรอยืนยัน\n"
+            f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit):.2%}*\n"
+            f"{'(profit ติดลบ)' if live_profit < 0 else '(profit ลด >50%)'}\n"
             f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
         )
 
@@ -2048,6 +2069,21 @@ async def scanner_loop():
             except Exception as e: log.error(f"[Scanner] {e}")
         periodic_cleanup()
         await asyncio.sleep(SCAN_INTERVAL)
+
+
+async def keep_alive_ping():
+    """#31 Render keep-alive — self-ping /health ทุก 14 นาที เพื่อกัน Render free tier sleep"""
+    await asyncio.sleep(60)  # รอ bot start ก่อน
+    url = f"http://localhost:{PORT}/health"
+    log.info(f"[KeepAlive] self-ping loop started → {url}")
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    log.debug(f"[KeepAlive] ping {r.status}")
+        except Exception as e:
+            log.debug(f"[KeepAlive] ping failed: {e}")
+        await asyncio.sleep(14 * 60)  # ทุก 14 นาที
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2902,7 +2938,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining
+    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining, _main_loop
+    # #33 บันทึก main event loop สำหรับ cross-thread db saves
+    _main_loop = asyncio.get_running_loop()
 
     # ── init DB ──
     db_init()                     # SQLite local (sync, fallback)
@@ -2932,10 +2970,26 @@ async def post_init(app: Application):
     log.info(f"[DB] {db_mode} | trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
 
     # restore pending settlement — trades ที่ confirmed แต่ยังไม่มีผล
+    # #34 เรียก register_closing_watch ด้วยเพื่อให้ CLV tracking ทำงานหลัง restart
     for t in trade_records:
         if t.status == "confirmed" and t.actual_profit_thb is None and t.settled_at is None:
             _pending_settlement[t.signal_id] = t
-    log.info(f"[Settle] restored {len(_pending_settlement)} unsettled trades")
+            # restore CLV watch — สร้าง mock ArbOpportunity เพื่อ register
+            try:
+                mock_commence = t.created_at[:16].replace("T", " ")
+                key = f"{t.event}|{t.sport}"
+                if key not in _closing_line_watch:
+                    _closing_line_watch[key] = {
+                        "event":       t.event,
+                        "sport":       t.sport,
+                        "commence_dt": datetime.fromisoformat(
+                            t.created_at.replace("Z", "+00:00")
+                        ) + timedelta(hours=3),  # ประมาณ commence = created + 3h
+                        "done":        False,
+                    }
+            except Exception:
+                pass
+    log.info(f"[Settle] restored {len(_pending_settlement)} unsettled trades | CLV watch={len(_closing_line_watch)}")
 
     app.add_error_handler(error_handler)
     threading.Thread(target=start_dashboard, daemon=True).start()
@@ -2962,6 +3016,7 @@ async def post_init(app: Application):
     asyncio.create_task(scanner_loop())
     asyncio.create_task(watch_closing_lines())  # 📌 auto CLV
     asyncio.create_task(settle_completed_trades())  # 🏆 auto settle
+    asyncio.create_task(keep_alive_ping())  # #31 Render keep-alive
 
 
 def handle_shutdown(signum, frame):
@@ -2990,7 +3045,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("lines",  cmd_lines))
     _app = app
 
-    # Railway expose ได้แค่ 1 port — ใช้ polling เสมอ
-    # Dashboard อยู่ที่ PORT, bot ใช้ polling (stable กว่าใน Railway)
-    log.info("[Bot] Polling mode (Railway single-port compatible)")
+    # Railway/Render: ใช้ polling เสมอ (single-port compatible)
+    log.info("[Bot] Polling mode (Railway/Render single-port compatible)")
     app.run_polling(drop_pending_updates=True)
