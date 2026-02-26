@@ -264,20 +264,31 @@ _turso: Optional[object] = None
 
 async def turso_init():
     global _turso
-    if not USE_TURSO or not HAS_TURSO:
+    # Re-read env vars at runtime (Railway injects them before process start,
+    # but USE_TURSO was computed at module load — re-check here to be safe)
+    url   = os.environ.get("TURSO_URL",   TURSO_URL).strip()
+    token = os.environ.get("TURSO_TOKEN", TURSO_TOKEN).strip()
+    log.info(f"[DB] TURSO_URL={'set ('+url[:30]+'...)' if url else 'NOT SET'} | HAS_TURSO={HAS_TURSO}")
+    if not url or not token or not HAS_TURSO:
+        log.warning("[DB] Turso not configured — using SQLite /tmp fallback (data will reset on redeploy)")
+        db_init_local()
         return
     try:
-        _turso = turso_client.create_client(
-            url=TURSO_URL, auth_token=TURSO_TOKEN
-        )
+        client = turso_client.create_client(url=url, auth_token=token)
+        # สร้าง tables
         for stmt in CREATE_TABLES_SQL.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
-                await _turso.execute(stmt)
-        log.info("[DB] Turso connected ✅")
+                await client.execute(stmt)
+        # ทดสอบ query จริงเพื่อยืนยัน connection
+        test = await client.execute("SELECT COUNT(*) FROM trade_records")
+        count = test.rows[0][0] if test.rows else 0
+        _turso = client
+        log.info(f"[DB] Turso connected ✅ | trade_records={count}")
     except Exception as e:
         log.error(f"[DB] Turso init failed: {e} — fallback to SQLite")
         _turso = None
+        db_init_local()  # ensure SQLite fallback tables exist
 
 async def turso_exec(sql: str, params: tuple = ()):
     """Execute write query (Turso หรือ SQLite)"""
@@ -326,8 +337,8 @@ def db_init_local():
         log.error(f"[DB] local init: {e}")
 
 def db_init():
-    if not USE_TURSO:
-        db_init_local()
+    # SQLite always initialized as fallback (Turso init happens later async)
+    db_init_local()
 
 # ── Write helpers ─────────────────────────────────────────────────
 # #33 Thread-safe db_save_* — ใช้ get_event_loop แทน get_running_loop
@@ -451,7 +462,7 @@ async def db_load_all() -> tuple[list, list, list]:
         log.info(f"[DB] loaded: trades={len(trades)}, opps={len(opps)}, moves={len(lms)}")
         return trades, opps, lms
     except Exception as e:
-        log.error(f"[DB] load_all: {e}")
+        log.error(f"[DB] load_all: {e}", exc_info=True)
         return [], [], []
 
 def save_snapshot():
@@ -2966,8 +2977,10 @@ async def post_init(app: Application):
     opportunity_log.extend(loaded_opps)
     line_movements.extend(lms)
 
-    db_mode = "☁️ Turso" if (_turso is not None) else "💾 SQLite local"
+    db_mode = "☁️ Turso" if (_turso is not None) else "💾 SQLite local (data resets on deploy!)"
     log.info(f"[DB] {db_mode} | trades={len(trade_records)}, opps={len(opportunity_log)}, moves={len(line_movements)}, scans={scan_count}")
+    if _turso is None:
+        log.warning("[DB] ⚠️ Running WITHOUT Turso — all stats will reset on next deploy")
 
     # restore pending settlement — trades ที่ confirmed แต่ยังไม่มีผล
     # #34 เรียก register_closing_watch ด้วยเพื่อให้ CLV tracking ทำงานหลัง restart
@@ -2995,7 +3008,7 @@ async def post_init(app: Application):
     threading.Thread(target=start_dashboard, daemon=True).start()
 
     is_restored = len(trade_records) > 0 or scan_count > 0
-    db_mode_str  = "☁️ Turso" if (_turso is not None) else "💾 SQLite"
+    db_mode_str  = "☁️ Turso ✅" if (_turso is not None) else "⚠️ SQLite (resets on deploy)"
     restore_note = f"♻️ {db_mode_str}: {len(trade_records)} trades, {scan_count} scans" if is_restored else f"🆕 {db_mode_str}: fresh start"
 
     await app.bot.send_message(
