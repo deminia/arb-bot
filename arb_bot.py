@@ -274,7 +274,9 @@ async def turso_init():
         db_init_local()
         return
     try:
-        client = turso_client.create_client(url=url, auth_token=token)
+        # libsql:// ใช้ WebSocket ซึ่ง Railway block — เปลี่ยนเป็น https:// แทน
+        http_url = url.replace("libsql://", "https://").replace("wss://", "https://")
+        client = turso_client.create_client(url=http_url, auth_token=token)
         # สร้าง tables
         for stmt in CREATE_TABLES_SQL.strip().split(";"):
             stmt = stmt.strip()
