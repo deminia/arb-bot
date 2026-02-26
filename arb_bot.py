@@ -1865,9 +1865,23 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════
 #  SCAN CORE
 # ══════════════════════════════════════════════════════════════════
+_sport_rotation_idx = 0  # v10-14: pointer สำหรับ rotation
+
 async def do_scan() -> int:
-    global scan_count, last_scan_time
-    odds_by_sport, poly_markets = await fetch_all_async(SPORTS)
+    global scan_count, last_scan_time, _sport_rotation_idx
+    # v10-14: Sport Rotation — scan sports เป็นกลุ่มๆ ประหยัด quota
+    rotation_size = int(os.getenv("SPORT_ROTATION_SIZE", "0"))
+    if rotation_size > 0 and len(SPORTS) > rotation_size:
+        batch = SPORTS[_sport_rotation_idx: _sport_rotation_idx + rotation_size]
+        if not batch:  # wrap around
+            _sport_rotation_idx = 0
+            batch = SPORTS[:rotation_size]
+        _sport_rotation_idx = (_sport_rotation_idx + rotation_size) % len(SPORTS)
+        scan_sports = batch
+        log.debug(f"[Rotation] scanning {scan_sports} ({_sport_rotation_idx}/{len(SPORTS)})")
+    else:
+        scan_sports = SPORTS  # scan ทั้งหมด (default)
+    odds_by_sport, poly_markets = await fetch_all_async(scan_sports)
 
     # 7/10/11. Detect line movements (async, ไม่ block)
     asyncio.create_task(detect_line_movements(odds_by_sport))
