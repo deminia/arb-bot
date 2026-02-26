@@ -13,21 +13,11 @@
 """
 
 import asyncio, json, logging, os, re, signal, sqlite3, threading, time, uuid
-# v10-4: ลอง libsql (new sync API) → libsql_experimental (sync) → libsql_client (async)
-_TURSO_API = None  # "sync" | "async" | None
-try:
-    import libsql as _libsql_mod           # package ใหม่ล่าสุด (sync sqlite3-like)
-    HAS_TURSO = True; _TURSO_API = "sync"
-except ImportError:
-    try:
-        import libsql_experimental as _libsql_mod  # เก่ากว่า (sync)
-        HAS_TURSO = True; _TURSO_API = "sync"
-    except ImportError:
-        try:
-            import libsql_client as _libsql_mod    # async API
-            HAS_TURSO = True; _TURSO_API = "async"
-        except ImportError:
-            HAS_TURSO = False; _libsql_mod = None
+import urllib.request, urllib.error
+# v10-6: ใช้ Turso HTTP REST API ตรงๆ — ไม่พึ่ง libsql_client
+_TURSO_API = "http"  # always http mode
+_libsql_mod = None
+HAS_TURSO = True  # จะ check จริงตอน turso_init
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -277,105 +267,99 @@ CREATE TABLE IF NOT EXISTS bot_state (
 );
 """
 
-# ── Turso async client (ใช้ถ้ามี TURSO_URL) ──────────────────────
-_turso: Optional[object] = None
+# ── Turso HTTP REST API (v10-6) ───────────────────────────────────
+_turso_url:   str = ""
+_turso_token: str = ""
+_turso_ok:    bool = False
+
+def _turso_http(statements: list) -> list:
+    """POST to Turso /v2/pipeline — returns list of result rows per statement"""
+    body = json.dumps({"requests": [
+        {"type": "execute", "stmt": {
+            "sql": s["sql"],
+            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
+        }} for s in statements
+    ] + [{"type": "close"}]}).encode()
+    req = urllib.request.Request(
+        f"{_turso_url}/v2/pipeline",
+        data=body,
+        headers={"Authorization": f"Bearer {_turso_token}", "Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    results = []
+    for item in data.get("results", []):
+        if item.get("type") == "error":
+            raise RuntimeError(item.get("error", {}).get("message", str(item)))
+        if item.get("type") == "ok":
+            rs = item.get("response", {}).get("result", {})
+            cols = [c["name"] for c in rs.get("cols", [])]
+            rows = [tuple(v.get("value") for v in row) for row in rs.get("rows", [])]
+            results.append(rows)
+    return results
+
+def _turso_val_type(v) -> str:
+    if v is None:              return "null"
+    if isinstance(v, int):     return "integer"
+    if isinstance(v, float):   return "float"
+    if isinstance(v, bytes):   return "blob"
+    return "text"
+
+def _turso_val(v):
+    if v is None:    return None
+    if isinstance(v, bytes): return v.hex()
+    return str(v)
 
 async def turso_init():
-    global _turso
+    global _turso_url, _turso_token, _turso_ok
     url   = os.environ.get("TURSO_URL",   TURSO_URL).strip()
     token = os.environ.get("TURSO_TOKEN", TURSO_TOKEN).strip()
-    log.info(f"[DB] TURSO_URL={'set ('+url[:30]+'...)' if url else 'NOT SET'} | HAS_TURSO={HAS_TURSO} | API={_TURSO_API}")
-    if not url or not token or not HAS_TURSO:
+    log.info(f"[DB] TURSO_URL={'set ('+url[:30]+'...)' if url else 'NOT SET'}")
+    if not url or not token:
         log.warning("[DB] Turso not configured — using SQLite /tmp fallback")
         db_init_local()
         return
+    _turso_url   = url.replace("libsql://", "https://").replace("wss://", "https://")
+    _turso_token = token
     try:
-        http_url = url.replace("libsql://", "https://").replace("wss://", "https://")
-
-        if _TURSO_API == "sync":
-            # libsql / libsql_experimental: sqlite3-like sync API
-            # รัน sync ใน executor เพื่อไม่ block event loop
-            loop = asyncio.get_running_loop()
-            def _init_sync():
-                conn = _libsql_mod.connect(":memory:", sync_url=http_url, auth_token=token)
-                conn.sync()  # pull latest data
-                # สร้าง tables
-                for stmt in CREATE_TABLES_SQL.strip().split(";"):
-                    s = stmt.strip()
-                    if s:
-                        conn.execute(s)
-                conn.commit()
-                # test
-                cur = conn.execute("SELECT COUNT(*) FROM trade_records")
-                row = cur.fetchone()
-                return conn, (row[0] if row else 0)
-            conn, count = await loop.run_in_executor(None, _init_sync)
-            _turso = conn
-            log.info(f"[DB] Turso (sync API) connected ✅ | trade_records={count}")
-        else:
-            # libsql_client: ใช้ create_client_sync() ใน executor — รองรับ ? ปกติ
-            loop = asyncio.get_running_loop()
-            def _init_async_sync():
-                c = _libsql_mod.create_client_sync(url=http_url, auth_token=token)
-                for stmt in CREATE_TABLES_SQL.strip().split(";"):
-                    s = stmt.strip()
-                    if s:
-                        c.execute(s)
-                rs = c.execute("SELECT COUNT(*) FROM trade_records")
-                count = rs.rows[0][0] if rs.rows else 0
-                return c, count
-            client, count = await loop.run_in_executor(None, _init_async_sync)
-            _turso = client
-            log.info(f"[DB] Turso (libsql_client sync-in-executor) connected \u2705 | trade_records={count}")
-
+        loop = asyncio.get_running_loop()
+        def _init():
+            stmts = [{"sql": s.strip()} for s in CREATE_TABLES_SQL.strip().split(";") if s.strip()]
+            stmts.append({"sql": "SELECT COUNT(*) FROM trade_records"})
+            results = _turso_http(stmts)
+            count = results[-1][0][0] if results and results[-1] else 0
+            return count
+        count = await loop.run_in_executor(None, _init)
+        _turso_ok = True
+        log.info(f"[DB] Turso HTTP connected ✅ | trade_records={count}")
     except Exception as e:
-        log.error(f"[DB] Turso init failed: {e} — fallback to SQLite")
-        _turso = None
+        log.error(f"[DB] Turso init failed: {e!r} — fallback to SQLite")
+        _turso_ok = False
         db_init_local()
 
-def _to_positional(sql: str, params: tuple) -> tuple[str, list]:
-    """Convert ? placeholders to :1,:2,... for libsql_client HTTP mode"""
-    idx = 0
-    result = []
-    for ch in sql:
-        if ch == '?':
-            idx += 1
-            result.append(f":{idx}")
-        else:
-            result.append(ch)
-    return "".join(result), list(params)
-
 async def turso_exec(sql: str, params: tuple = ()):
-    """Execute write query (Turso หรือ SQLite) — v10-5: retry 3x + API-aware"""
-    if _turso:
+    """Execute write query (Turso HTTP หรือ SQLite fallback)"""
+    if _turso_ok:
         for attempt in range(3):
             try:
-                if _TURSO_API == "sync":
-                    loop = asyncio.get_running_loop()
-                    def _do_sync(conn=_turso, s=sql, p=params):
-                        conn.execute(s, p)
-                        conn.commit()
-                    await loop.run_in_executor(None, _do_sync)
-                else:
-                    # libsql_client sync-in-executor: รองรับ ? ปกติ
-                    loop = asyncio.get_running_loop()
-                    def _exec(c=_turso, s=sql, p=params):
-                        c.execute(s, list(p) if p else None)
-                    await loop.run_in_executor(None, _exec)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: _turso_http(
+                    [{"sql": sql, "args": list(params)}]
+                ))
                 return
-            except BaseException as e:  # catch non-Exception errors too
-                etype = type(e).__name__
+            except Exception as e:
                 if attempt < 2:
-                    log.warning(f"[DB] turso_exec attempt {attempt+1} failed: {etype}: {e!r}")
+                    log.warning(f"[DB] turso_exec attempt {attempt+1} failed: {e!r}")
                     await asyncio.sleep(1.5 ** attempt)
                 else:
-                    log.error(f"[DB] turso_exec failed 3x: {etype}: {e!r} — falling back to SQLite")
+                    log.error(f"[DB] turso_exec failed 3x: {e!r} — falling back to SQLite")
                     if _app:
                         try:
                             asyncio.get_running_loop().create_task(
                                 _app.bot.send_message(
                                     chat_id=CHAT_ID,
-                                    text=f"⚠️ *DB Warning*: Turso write failed 3x\n`{str(e)[:120]}`\nข้อมูลจะเขียนลง SQLite ชั่วคราว",
+                                    text=f"⚠️ *DB Warning*: Turso write failed 3x\n`{str(e)[:120]}`",
                                     parse_mode="Markdown"
                                 )
                             )
@@ -390,24 +374,16 @@ async def turso_exec(sql: str, params: tuple = ()):
         log.error(f"[DB] sqlite_exec: {e}")
 
 async def turso_query(sql: str, params: tuple = ()) -> list:
-    """Execute read query (Turso หรือ SQLite) — API-aware"""
-    if _turso:
+    """Execute read query (Turso HTTP หรือ SQLite fallback)"""
+    if _turso_ok:
         try:
-            if _TURSO_API == "sync":
-                loop = asyncio.get_running_loop()
-                def _do_query(conn=_turso, s=sql, p=params):
-                    cur = conn.execute(s, p)
-                    return cur.fetchall()
-                return await loop.run_in_executor(None, _do_query)
-            else:
-                # libsql_client sync-in-executor
-                loop = asyncio.get_running_loop()
-                def _qry(c=_turso, s=sql, p=params):
-                    rs = c.execute(s, list(p) if p else None)
-                    return [tuple(row) for row in rs.rows]
-                return await loop.run_in_executor(None, _qry)
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, lambda: _turso_http(
+                [{"sql": sql, "args": list(params)}]
+            ))
+            return results[0] if results else []
         except Exception as e:
-            log.error(f"[DB] turso_query: {e}")
+            log.error(f"[DB] turso_query: {e!r}")
     # SQLite fallback
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as con:
