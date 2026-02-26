@@ -211,7 +211,7 @@ class TradeRecord:
 # ══════════════════════════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════════════════════════
-_main_loop: Optional[asyncio.AbstractEventLoop] = None  # #33 ref to main loop for cross-thread db saves
+_main_loop: Optional[asyncio.AbstractEventLoop] = None  # ref to main loop for cross-thread calls
 _scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
 
 pending:           dict[str, ArbOpportunity] = {}
@@ -321,6 +321,9 @@ def _turso_val_type(v) -> str:
 
 def _turso_val(v):
     if v is None:    return None
+    if isinstance(v, bool):  return int(v)  # bool before int check
+    if isinstance(v, int):   return v
+    if isinstance(v, float): return v
     if isinstance(v, bytes): return v.hex()
     return str(v)
 
@@ -1202,26 +1205,27 @@ def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> D
     Fractional = Full Kelly × KELLY_FRACTION
     """
     if not USE_KELLY:
-        return TOTAL_STAKE
+        return TOTAL_STAKE  # USD
 
     edge = float(profit_pct)  # guaranteed edge
     # Kelly stake as fraction of bankroll
     # สำหรับ arb: f* = edge / (1 - min_implied_prob)
     min_prob = float(min(Decimal("1")/odds_a, Decimal("1")/odds_b))
     if min_prob >= 1 or edge <= 0:
-        return TOTAL_STAKE
+        return TOTAL_STAKE  # USD
 
     full_kelly = edge / (1 - min_prob)
     frac_kelly = full_kelly * float(KELLY_FRACTION)
 
-    # Kelly stake in THB
+    # Kelly stake in THB (clamped + rounded), then convert to USD for pipeline
     kelly_thb  = Decimal(str(frac_kelly)) * BANKROLL_THB
     kelly_thb  = max(MIN_KELLY_STAKE, min(MAX_KELLY_STAKE, kelly_thb))
     kelly_thb  = natural_round(kelly_thb)  # พรางตัว — ปัดเป็นเลขกลม 500/1000
     kelly_thb  = max(MIN_KELLY_STAKE, kelly_thb)  # ตรวจ MIN อีกรอบหลัง round
+    kelly_usd  = kelly_thb / USD_TO_THB  # คืน USD ให้ตรงกับ TOTAL_STAKE unit
 
-    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} stake=฿{int(kelly_thb):,} (natural_round)")
-    return kelly_thb
+    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} stake=฿{int(kelly_thb):,} (${float(kelly_usd):.0f})")
+    return kelly_usd
 
 
 def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
@@ -1406,10 +1410,10 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
                     if profit >= MIN_PROFIT_PCT:
                         # Kelly — ปรับ total stake ตาม edge
-                        kelly_total = calc_kelly_stake(best[a].odds, best[b].odds, profit)
+                        kelly_total = calc_kelly_stake(best[a].odds, best[b].odds, profit)  # USD
                         if kelly_total != TOTAL_STAKE:
                             profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds,
-                                                               kelly_total / USD_TO_THB)
+                                                               kelly_total)  # already USD
                         # 5. Apply max stake — recalc ใหม่ถ้าถูก cap
                         s_a_capped = apply_max_stake(s_a, best[a].bookmaker)
                         s_b_capped = apply_max_stake(s_b, best[b].bookmaker)
@@ -1554,6 +1558,8 @@ async def send_alert(opp: ArbOpportunity):
 # ══════════════════════════════════════════════════════════════════
 #  SLIPPAGE GUARD — Re-fetch live odds ก่อน execute
 # ══════════════════════════════════════════════════════════════════
+_refetch_cache: dict[str, tuple[float, list]] = {}  # C10: sport -> (ts, events)
+
 async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
     """
     Re-fetch ราคาล่าสุดจาก API ก่อนยืนยันการเดิมพัน
@@ -1561,8 +1567,14 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
     ถ้าหาไม่เจอ → คืนค่าเดิม (ไม่ abort)
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            events = await async_fetch_odds(session, opp.sport)
+        # C10: ใช้ cache ถ้าเพิ่ง fetch กีฬานี้ภายใน 15 วินาที
+        cached_ts, cached_events = _refetch_cache.get(opp.sport, (0, []))
+        if time.time() - cached_ts < 15 and cached_events:
+            events = cached_events
+        else:
+            async with aiohttp.ClientSession() as session:
+                events = await async_fetch_odds(session, opp.sport)
+            _refetch_cache[opp.sport] = (time.time(), events)
         for event in events:
             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
             if not fuzzy_match(ename, opp.event, 0.7): continue
@@ -1572,15 +1584,17 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
                 bk = bm.get("key","")
                 for mkt in bm.get("markets", []):
                     if mkt.get("key") != "h2h": continue
+                    # C4: ดึง bm_key ไว้ก่อน loop outcomes (ใช้ key ไม่ใช่ title)
+                    leg1_key = opp.leg1.raw.get("bm_key", "") if opp.leg1.raw else ""
+                    leg2_key = opp.leg2.raw.get("bm_key", "") if opp.leg2.raw else ""
                     for out in mkt.get("outcomes", []):
                         name = out.get("name","")
                         price = Decimal(str(out.get("price", 1)))
-                        bm_title = bm.get("title", bk)
                         if fuzzy_match(name, opp.leg1.outcome, 0.8) and \
-                           opp.leg1.bookmaker.lower() in bk.lower():
+                           (bk == leg1_key or opp.leg1.bookmaker.lower() in bk.lower()):
                             live1 = apply_slippage(price, bk)
                         elif fuzzy_match(name, opp.leg2.outcome, 0.8) and \
-                             opp.leg2.bookmaker.lower() in bk.lower():
+                             (bk == leg2_key or opp.leg2.bookmaker.lower() in bk.lower()):
                             live2 = apply_slippage(price, bk)
             return live1, live2
     except Exception as e:
@@ -1711,7 +1725,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: return
     opp = pending.pop(sid, None)
     if not opp:
-        await query.edit_message_text(query.message.text+"\n\n⚠️ หมดอายุ")
+        try: await query.edit_message_text(query.message.text+"\n\n⚠️ หมดอายุ")
+        except Exception: pass
         return
     for entry in opportunity_log:
         if entry["id"] == sid: entry["status"] = action
@@ -1730,14 +1745,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trade_records.append(tr_rej)
         db_save_trade(tr_rej)    # 💾
         db_update_opp_status(sid, "rejected")  # 💾
-        await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
+        try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
+        except Exception: pass  # C8: ignore 'Message is not modified'
         return
-    await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
+    try: await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
+    except Exception: pass
     try:
         result = await execute_both(opp)
-        await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
+        try: await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
+        except Exception: pass  # C8
     except ValueError as abort_msg:
-        await query.edit_message_text(orig+"\n\n"+str(abort_msg), parse_mode="Markdown")
+        try: await query.edit_message_text(orig+"\n\n"+str(abort_msg), parse_mode="Markdown")
+        except Exception: pass  # C8
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1926,6 +1945,12 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t.actual_profit_thb = actual
     t.settled_at = datetime.now(timezone.utc).isoformat()
     t.status = "confirmed"
+    # C7: update trade_records in-memory ด้วย เพื่อให้ /pnl เห็นผล settle ทันที
+    with _data_lock:
+        for idx, rec in enumerate(trade_records):
+            if rec.signal_id == t.signal_id:
+                trade_records[idx] = t
+                break
     db_save_trade(t)
 
     emoji = "✅" if actual >= 0 else "❌"
@@ -2495,7 +2520,7 @@ def calc_stats() -> dict:
 
     # ── Trade records สำหรับ table ────────────────────────────────
     trade_list = []
-    for t in trade_records[-50:]:
+    for t in tr_snap:  # C6: ใช้ tr_snap (snapshot ใน lock) ไม่ใช่ trade_records โดยตรง
         c1, c2 = calc_clv(t)
         trade_list.append({
             "signal_id": t.signal_id, "event": t.event, "sport": t.sport,
@@ -2574,8 +2599,9 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
             USE_KELLY = value.lower() in ("true","1","on")
             return True, f"USE_KELLY = {USE_KELLY}"
         elif key == "scan_now":
-            # trigger scan ทันที
-            asyncio.get_running_loop().create_task(do_scan())
+            # trigger scan ทันที — ส่งผ่าน _main_loop เพราะ HTTP thread ไม่มี running loop
+            if _main_loop and _main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(do_scan(), _main_loop)
             return True, "scan triggered"
         elif key == "clear_seen":
             seen_signals.clear()
@@ -2765,6 +2791,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "opportunities":   opp_snap,
                 "line_movements":  lm_list,
                 "trade_records":   tr_list,
+                "unsettled_trades": [  # C9: Dashboard Force Settle UI
+                    {
+                        "signal_id": t.signal_id,
+                        "event":     t.event,
+                        "leg1_bm":   t.leg1_bm,
+                        "leg2_bm":   t.leg2_bm,
+                        "profit_pct": t.profit_pct,
+                        "stake1_thb": t.stake1_thb,
+                        "stake2_thb": t.stake2_thb,
+                        "created_at": t.created_at,
+                        "commence_time": t.commence_time,
+                    }
+                    for t in tr_snap
+                    if t.status == "confirmed" and t.actual_profit_thb is None
+                ],
                 "pnl": {
                     "confirmed":  len(confirmed),
                     "rejected":   len(rejected),
@@ -2906,9 +2947,23 @@ async def post_init(app: Application):
 
 
 def handle_shutdown(signum, frame):
-    """Graceful shutdown — บันทึก state ก่อนปิด"""
+    """Graceful shutdown — บันทึก state ลง SQLite sync โดยตรง ก่อนปิด"""
     log.info("[Shutdown] กำลังบันทึก state...")
-    save_snapshot()
+    try:
+        # C2: เขียน SQLite sync ตรงๆ ไม่ผ่าน async task (ซึ่งอาจไม่ทันรัน)
+        with sqlite3.connect(DB_PATH, timeout=5) as con:
+            for k, v in [
+                ("scan_count",     str(scan_count)),
+                ("auto_scan",      str(auto_scan)),
+                ("last_scan_time", last_scan_time),
+                ("api_remaining",  str(api_remaining)),
+            ]:
+                con.execute(
+                    "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (k, v)
+                )
+            con.commit()
+    except Exception as ex:
+        log.error(f"[Shutdown] save failed: {ex}")
     log.info("[Shutdown] saved. Bye!")
     os._exit(0)
 
