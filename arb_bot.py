@@ -364,6 +364,7 @@ async def turso_init():
 
 async def turso_exec(sql: str, params: tuple = ()):
     """Execute write query (Turso HTTP หรือ SQLite fallback)"""
+    global auto_scan, _db_write_halted, _turso_ok
     # Fix 1: early bail if writes are halted
     if _db_write_halted:
         log.error("[DB] writes halted — skipping")
@@ -388,7 +389,6 @@ async def turso_exec(sql: str, params: tuple = ()):
                 else:
                     log.error(f"[DB] turso_exec failed 3x: {e!r} — halting writes")
                     # Fix 2: Turso ล่ม 3 ครั้ง → หยุด auto_scan + return ทันที ไม่เขียน SQLite
-                    global auto_scan
                     auto_scan = False
                     if _app:
                         try:
@@ -401,7 +401,6 @@ async def turso_exec(sql: str, params: tuple = ()):
                             )
                         except Exception:
                             pass
-                    global _db_write_halted, _turso_ok
                     _db_write_halted = True
                     _turso_ok = False  # Fix 1: prevent re-entry into Turso block
                     return  # ไม่ fallback ไป SQLite — ป้องกัน split-brain
