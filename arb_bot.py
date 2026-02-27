@@ -322,7 +322,7 @@ def _turso_val_type(v) -> str:
     if v is None:              return "null"
     if isinstance(v, bool):    return "integer"  # bool before int
     if isinstance(v, int):     return "integer"
-    if isinstance(v, float):   return "float"
+    if isinstance(v, (float, Decimal)): return "float"  # Decimal → f64
     if isinstance(v, bytes):   return "blob"
     return "text"
 
@@ -331,7 +331,7 @@ def _turso_val(v):
     if v is None:              return None
     if isinstance(v, bool):    return str(int(v))   # True->'1', False->'0'
     if isinstance(v, int):     return str(v)
-    if isinstance(v, float):   return str(v)
+    if isinstance(v, (float, Decimal)): return str(float(v))  # Decimal → float string
     if isinstance(v, bytes):   return v.hex()
     return str(v)
 
