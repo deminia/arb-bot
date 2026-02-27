@@ -24,6 +24,7 @@ from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass, field
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 import aiohttp
 from dotenv import load_dotenv
@@ -218,6 +219,7 @@ _scan_in_progress: bool = False  # B6: ป้องกัน scan overlap
 _now_last_ts: float = 0  # A5: timestamp ที่กด /now ล่าสุด
 _bot_start_ts: float = time.time()  # D2: uptime
 _last_error: str = ""  # D2: last error message
+_db_write_halted: bool = False  # Fix 4: set True when Turso fails 3x
 
 pending:           dict[str, tuple]           = {}  # sid -> (ArbOpportunity, created_at_ts)
 seen_signals:      set[str]                  = set()
@@ -395,9 +397,11 @@ async def turso_exec(sql: str, params: tuple = ()):
                             )
                         except Exception:
                             pass
+                    global _db_write_halted
+                    _db_write_halted = True
                     return  # Fix 2: ไม่ fallback ไป SQLite — ป้องกัน split-brain
-    # SQLite-only mode (ใช้เฉพาะตอน Turso init fail ตั้งแต่แรก)
-    if not _turso_ok:
+    # SQLite-only mode (ใช้เฉพาะตอน Turso init fail ตั้งแต่แรก หรือไม่ได้ตั้ง Turso)
+    if not _turso_ok and not _db_write_halted:
         try:
             with sqlite3.connect(DB_PATH, timeout=10) as con:
                 con.execute(sql, params)
@@ -1228,6 +1232,16 @@ def natural_round(amount: Decimal) -> Decimal:
     return base + jitter
 
 
+def get_current_bankroll() -> Decimal:
+    """Fix 8: Return BANKROLL_THB + cumulative actual PNL from settled trades."""
+    with _data_lock:
+        actual_pnl = sum(
+            t.actual_profit_thb for t in trade_records
+            if t.actual_profit_thb is not None
+        )
+    return BANKROLL_THB + Decimal(str(actual_pnl))
+
+
 def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> Decimal:
     """
     Kelly Criterion สำหรับ Arbitrage
@@ -1241,8 +1255,6 @@ def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> D
         return TOTAL_STAKE  # USD
 
     edge = float(profit_pct)  # guaranteed edge
-    # Kelly stake as fraction of bankroll
-    # สำหรับ arb: f* = edge / (1 - min_implied_prob)
     min_prob = float(min(Decimal("1")/odds_a, Decimal("1")/odds_b))
     if min_prob >= 1 or edge <= 0:
         return TOTAL_STAKE  # USD
@@ -1250,14 +1262,15 @@ def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> D
     full_kelly = edge / (1 - min_prob)
     frac_kelly = full_kelly * float(KELLY_FRACTION)
 
-    # Kelly stake in THB (clamped + rounded), then convert to USD for pipeline
-    kelly_thb  = Decimal(str(frac_kelly)) * BANKROLL_THB
+    # Fix 8: use live bankroll (BANKROLL_THB + actual PNL)
+    current_bankroll = get_current_bankroll()
+    kelly_thb  = Decimal(str(frac_kelly)) * current_bankroll
     kelly_thb  = max(MIN_KELLY_STAKE, min(MAX_KELLY_STAKE, kelly_thb))
     kelly_thb  = natural_round(kelly_thb)  # พรางตัว — ปัดเป็นเลขกลม 500/1000
     kelly_thb  = max(MIN_KELLY_STAKE, kelly_thb)  # ตรวจ MIN อีกรอบหลัง round
-    kelly_usd  = kelly_thb / USD_TO_THB  # คืน USD ให้ตรงกับ TOTAL_STAKE unit
+    kelly_usd  = kelly_thb / USD_TO_THB
 
-    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} stake=฿{int(kelly_thb):,} (${float(kelly_usd):.0f})")
+    log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} bankroll=฿{int(current_bankroll):,} stake=฿{int(kelly_thb):,} (${float(kelly_usd):.0f})")
     return kelly_usd
 
 
@@ -1571,7 +1584,7 @@ async def send_alert(opp: ArbOpportunity):
         f"📊 ไม่ว่าใครชนะ\n"
         f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
         f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
-        f"🔗 {opp.leg1.market_url or ''}{' | ' if opp.leg1.market_url and opp.leg2.market_url else ''}{opp.leg2.market_url or '' if not opp.leg1.market_url else ''}\n"
+        f"🔗 {' | '.join(u for u in [opp.leg1.market_url, opp.leg2.market_url] if u) or '—'}\n"
         f"🆔 `{opp.signal_id}`"
     )
     keyboard = InlineKeyboardMarkup([[
@@ -1997,16 +2010,18 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     args = context.args
     if len(args) < 2:
-        # แสดง unsettled trades ให้เลือก
-        if not _pending_settlement:
+        # Fix 5: snapshot _pending_settlement before reading
+        with _data_lock:
+            ps_snap = dict(_pending_settlement)
+        if not ps_snap:
             await update.message.reply_text("ไม่มี trade ที่รอ settle")
             return
         lines = []
-        for sid, (t, dt) in list(_pending_settlement.items()):
+        for sid, (t, dt) in ps_snap.items():
             dt_th = (dt + timedelta(hours=7)).strftime("%d/%m %H:%M") if dt else "?"
-            lines.append(f"`{sid}` — {t.event[:30]} ({dt_th})")
+            lines.append(f"`{sid}` — {md_escape(t.event[:30])} ({dt_th})")
         await update.message.reply_text(
-            f"⏳ *Trade รอ settle* ({len(_pending_settlement)} รายการ)\n"
+            f"⏳ *Trade รอ settle* ({len(ps_snap)} รายการ)\n"
             + "\n".join(lines)
             + "\n\nใช้: `/settle <signal_id> <leg1|leg2|draw|void>`",
             parse_mode="Markdown",
@@ -2147,18 +2162,21 @@ async def watch_closing_lines():
             now = datetime.now(timezone.utc)
             to_fetch = []
 
-            for key, info in list(_closing_line_watch.items()):
+            with _data_lock:
+                watch_snapshot = list(_closing_line_watch.items())
+
+            for key, info in watch_snapshot:
                 if info.get("done"): continue
                 mins_left = (info["commence_dt"] - now).total_seconds() / 60
                 if mins_left <= 1:
-                    to_fetch.append((key, info))
-                    _closing_line_watch[key]["done"] = True
+                    to_fetch.append((key, info))  # Fix 3: do NOT mark done yet
 
             if to_fetch:
                 async with aiohttp.ClientSession() as session:
                     for key, info in to_fetch:
                         sport = info["sport"]
                         events = await async_fetch_odds(session, sport)
+                        fetch_ok = False
                         for event in events:
                             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
                             if ename != info["event"]: continue
@@ -2169,13 +2187,20 @@ async def watch_closing_lines():
                                     if mkt.get("key") != "h2h": continue
                                     for out in mkt.get("outcomes",[]):
                                         price = Decimal(str(out.get("price",1)))
-                                        # #27 บังคับเก็บ Pinnacle เป็น benchmark เสมอ
                                         update_clv(ename, out["name"], bk, price)
                                         if bk == "pinnacle":
                                             pinnacle_found = True
+                            fetch_ok = True
                             if not pinnacle_found:
                                 log.warning(f"[CLV] ⚠️ Pinnacle closing line missing for {ename} — CLV benchmark unreliable")
                             log.info(f"[CLV] closing line saved: {ename} (pinnacle={'✅' if pinnacle_found else '❌'})")
+                        # Fix 3: mark done ONLY after successful fetch
+                        if fetch_ok:
+                            with _data_lock:
+                                if key in _closing_line_watch:
+                                    _closing_line_watch[key]["done"] = True
+                        else:
+                            log.warning(f"[CLV] fetch returned no match for {info['event']} — will retry")
         except Exception as e:
             log.error(f"[CLV] watch_closing_lines crash: {e}", exc_info=True)
 
@@ -2187,14 +2212,15 @@ def register_closing_watch(opp: "ArbOpportunity"):
     try:
         commence_dt = parse_commence(opp.commence)
         key = f"{opp.event}|{opp.sport}"
-        if key not in _closing_line_watch:
-            _closing_line_watch[key] = {
-                "event":       opp.event,
-                "sport":       opp.sport,
-                "commence_dt": commence_dt,
-                "done":        False,
-            }
-            log.info(f"[CLV] watching closing line: {opp.event}")
+        with _data_lock:
+            if key not in _closing_line_watch:
+                _closing_line_watch[key] = {
+                    "event":       opp.event,
+                    "sport":       opp.sport,
+                    "commence_dt": commence_dt,
+                    "done":        False,
+                }
+                log.info(f"[CLV] watching closing line: {opp.event}")
     except Exception as e:
         log.debug(f"[CLV] register watch: {e}")
 
@@ -2403,10 +2429,17 @@ async def settle_completed_trades():
                 if not matched_event.get("completed", False):
                     # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
                     try:
-                        ct = datetime.fromisoformat(
-                            matched_event.get("commence_time","").replace("Z","+00:00"))
+                        ct = parse_commence(matched_event.get("commence_time",""))
                         if (datetime.now(timezone.utc) - ct).total_seconds() > 6 * 3600:
                             log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
+                            if _app:
+                                asyncio.get_running_loop().create_task(
+                                    _app.bot.send_message(
+                                        chat_id=CHAT_ID,
+                                        text=f"⏰ *Postponed?* `{md_escape(trade.event)}`\nเลยเวลาแข่งกว่า 6h แต่ยังไม่ completed\nแนะนำ settle ด้วยตนเอง: `/settle {trade.signal_id} draw`",
+                                        parse_mode="Markdown"
+                                    )
+                                )
                     except Exception:
                         pass
                     continue
@@ -2890,10 +2923,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             with _data_lock:
                 confirmed_ct = len([t for t in trade_records if t.status=="confirmed"])
             health = {
-                "status":            "ok",
+                "status":            "ok" if not _db_write_halted else "degraded",
                 "uptime":            uptime_str,
-                "db_mode":           "turso" if _turso_ok else "sqlite",
+                "db_mode":           "turso" if _turso_ok else ("halted" if _db_write_halted else "sqlite"),
                 "turso_ok":          _turso_ok,
+                "db_write_halted":   _db_write_halted,
                 "last_scan":         last_scan_time,
                 "scan_in_progress":  _scan_in_progress,
                 "scan_count":        scan_count,
@@ -3023,9 +3057,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Thread-per-request HTTP server — prevents Dashboard from blocking"""
+    daemon_threads = True
+
 def start_dashboard():
-    server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
-    log.info(f"[Dashboard] http://0.0.0.0:{PORT}")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), DashboardHandler)
+    log.info(f"[Dashboard] http://0.0.0.0:{PORT} (ThreadingHTTPServer)")
     server.serve_forever()
 
 
@@ -3114,7 +3152,7 @@ async def post_init(app: Application):
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *ARB BOT v10.0 — Production Ready*\n"
+            "🤖 *Deminia Bot V.1 — Production Ready*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{restore_note}\n"
             f"Sports    : {' '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
