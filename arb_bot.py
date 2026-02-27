@@ -78,6 +78,7 @@ BANKROLL_THB    = _d("BANKROLL_THB", "100000")  # v10-13: default 100k — ต�
 USE_KELLY       = _s("USE_KELLY", "true").lower() == "true"
 MIN_KELLY_STAKE = _d("MIN_KELLY_STAKE", "10000") # บังคับขั้นต่ำ 10,000 บาท
 MAX_KELLY_STAKE = _d("MAX_KELLY_STAKE", "50000") # เพดานสูงสุดต่อรอบ
+MAX_DAILY_LOSS_THB = _d("MAX_DAILY_LOSS_THB", "0")  # 0 = ไม่จำกัด
 
 # 1. Odds staleness — ไม่รับ odds ที่เก่ากว่านี้ (นาที)
 MAX_ODDS_AGE_MIN   = _i("MAX_ODDS_AGE_MIN",  5)
@@ -213,8 +214,13 @@ class TradeRecord:
 # ══════════════════════════════════════════════════════════════════
 _main_loop: Optional[asyncio.AbstractEventLoop] = None  # ref to main loop for cross-thread calls
 _scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
+_scan_lock: Optional[asyncio.Lock] = None  # B6: ป้องกัน scan overlap
+_scan_in_progress: bool = False  # สถานะใช้แสดง scan
+_now_last_ts: float = 0  # A5: timestamp ที่กด /now ล่าสุด
+_bot_start_ts: float = time.time()  # D2: uptime
+_last_error: str = ""  # D2: last error message
 
-pending:           dict[str, ArbOpportunity] = {}
+pending:           dict[str, tuple]           = {}  # sid -> (ArbOpportunity, created_at_ts)
 seen_signals:      set[str]                  = set()
 auto_scan:         bool                      = AUTO_SCAN_START
 scan_count:        int                       = 0
@@ -292,8 +298,7 @@ def _turso_http(statements: list) -> list:
     except urllib.error.HTTPError as he:
         err_body = he.read().decode(errors="replace")[:500]
         log.error(f"[DB] Turso HTTP {he.code}: {err_body}")
-        log.error(f"[DB] Request body (first 500): {body[:500].decode(errors='replace')}")
-        raise RuntimeError(f"Turso HTTP {he.code}: {err_body[:200]}") from he
+        raise RuntimeError(f"Turso HTTP {he.code}: {err_body[:200]}") from he  # B9: removed raw body log
     data = json.loads(raw)
     # DEBUG: log first response item type to verify format
     if data.get("results"):
@@ -377,12 +382,15 @@ async def turso_exec(sql: str, params: tuple = ()):
                     await asyncio.sleep(1.5 ** attempt)
                 else:
                     log.error(f"[DB] turso_exec failed 3x: {e!r} — falling back to SQLite")
+                    # B8: Turso ล่ม → หยุด auto_scan ทันที เพื่อป้องกัน split-brain
+                    global auto_scan
+                    auto_scan = False
                     if _app:
                         try:
                             asyncio.get_running_loop().create_task(
                                 _app.bot.send_message(
                                     chat_id=CHAT_ID,
-                                    text=f"⚠️ *DB Warning*: Turso write failed 3x\n`{str(e)[:120]}`",
+                                    text=f"🚨 *DB CRITICAL*: Turso write failed 3x\n`{str(e)[:120]}`\n❌ *Auto scan หยุดแล้ว* — บอทไม่เขียน DB ต่อเนื่อง",
                                     parse_mode="Markdown"
                                 )
                             )
@@ -1463,6 +1471,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                 continue
                         else:
                             s_a, s_b = s_a_capped, s_b_capped
+                        # B1: สร้าง opp นอก if/else cap block — ทั้ง cap และไม่ cap ถ้า profit ผ่าน
                         opp = ArbOpportunity(
                             signal_id=str(uuid.uuid4())[:8], sport=sport_key,
                             event=event_name, commence=commence,
@@ -1480,7 +1489,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
 #  SEND ALERT
 # ══════════════════════════════════════════════════════════════════
 async def send_alert(opp: ArbOpportunity):
-    pending[opp.signal_id] = opp
+    pending[opp.signal_id] = (opp, time.time())  # A2: store with timestamp
 
     # ── คำนวณ mins_to_start ก่อนใช้ ──
     try:
@@ -1754,15 +1763,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try: action, sid = query.data.split(":",1)
     except Exception: return
-    opp = pending.pop(sid, None)
-    if not opp:
+    # A2: Signal TTL — ไม่ให้ confirm signal ที่เก่าเกิน 15 นาที
+    SIGNAL_TTL = int(os.getenv("SIGNAL_TTL_SEC", "900"))  # default 15m
+    entry = pending.get(sid)
+    if not entry:
         try: await query.edit_message_text(query.message.text+"\n\n⚠️ หมดอายุ")
+        except Exception: pass
+        return
+    opp, sig_ts = entry
+    if time.time() - sig_ts > SIGNAL_TTL:
+        pending.pop(sid, None)
+        try: await query.edit_message_text(query.message.text+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
     for entry in opportunity_log:
         if entry["id"] == sid: entry["status"] = action
     orig = query.message.text
     if action == "reject":
+        pending.pop(sid, None)  # B2: pop ตอน reject จริง
         tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
             leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
@@ -1777,16 +1795,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_save_trade(tr_rej)    # 💾
         db_update_opp_status(sid, "rejected")  # 💾
         try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
-        except Exception: pass  # C8: ignore 'Message is not modified'
+        except Exception: pass  # C8
         return
     try: await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
     except Exception: pass
     try:
         result = await execute_both(opp)
+        pending.pop(sid, None)  # B2: pop หลัง execute สำเร็จเท่านั้น
         try: await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
         except Exception: pass  # C8
     except ValueError as abort_msg:
-        try: await query.edit_message_text(orig+"\n\n"+str(abort_msg), parse_mode="Markdown")
+        # B2: ไม่ pop pending ถ้า execute abort — user ยังกดอีกครั้งได้
+        try: await query.edit_message_text(orig+"\n\n"+str(abort_msg)+"\n\n_กด Confirm ใหม่ได้_", parse_mode="Markdown")
         except Exception: pass  # C8
 
 
@@ -1905,6 +1925,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _now_last_ts
+    # A5: Rate limit /now — ไม่ให้กดซ้ำภายใน 60 วินาที
+    NOW_COOLDOWN = int(os.getenv("NOW_COOLDOWN_SEC", "60"))
+    elapsed = time.time() - _now_last_ts
+    if elapsed < NOW_COOLDOWN:
+        remaining = int(NOW_COOLDOWN - elapsed)
+        await update.message.reply_text(
+            f"⏳ รออีก *{remaining}s* ก่อนใช้ /now อีกครั้ง", parse_mode="Markdown"
+        )
+        return
+    _now_last_ts = time.time()
+    if _scan_in_progress:
+        await update.message.reply_text("⏳ *กำลัง scan อยู่แล้ว* — รอสักครู่", parse_mode="Markdown")
+        return
     await update.message.reply_text("🔍 *กำลังสแกน...*", parse_mode="Markdown")
     count = await do_scan()
     msg = f"✅ พบ *{count}* opportunity" if count else f"✅ ไม่พบ > {MIN_PROFIT_PCT:.1%}"
@@ -2013,38 +2047,74 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _sport_rotation_idx = 0  # v10-14: pointer สำหรับ rotation
 
 async def do_scan() -> int:
-    global scan_count, last_scan_time, _sport_rotation_idx
-    # v10-14: Sport Rotation — scan sports เป็นกลุ่มๆ ประหยัด quota
-    rotation_size = int(os.getenv("SPORT_ROTATION_SIZE", "0"))
-    if rotation_size > 0 and len(SPORTS) > rotation_size:
-        batch = SPORTS[_sport_rotation_idx: _sport_rotation_idx + rotation_size]
-        if not batch:  # wrap around
-            _sport_rotation_idx = 0
-            batch = SPORTS[:rotation_size]
-        _sport_rotation_idx = (_sport_rotation_idx + rotation_size) % len(SPORTS)
-        scan_sports = batch
-        log.debug(f"[Rotation] scanning {scan_sports} ({_sport_rotation_idx}/{len(SPORTS)})")
-    else:
-        scan_sports = SPORTS  # scan ทั้งหมด (default)
-    odds_by_sport, poly_markets = await fetch_all_async(scan_sports)
+    global scan_count, last_scan_time, _sport_rotation_idx, _scan_in_progress, auto_scan, _last_error
+    # B6: ป้องกัน scan ซ้อน — ถ้า scan กำลังสแกนอยู่ ให้รอ
+    if _scan_in_progress:
+        log.debug("[Scan] อยู่ระหว่าง scan ทิ้ง request นี้")
+        return 0
+    _scan_in_progress = True
+    try:
+        # A4: Daily Loss Limit
+        if MAX_DAILY_LOSS_THB > 0:
+            today = datetime.now(timezone.utc).date()
+            with _data_lock:
+                daily_loss = sum(
+                    t.actual_profit_thb for t in trade_records
+                    if t.actual_profit_thb is not None
+                    and t.settled_at
+                    and datetime.fromisoformat(t.settled_at).date() == today
+                )
+            if daily_loss < -int(MAX_DAILY_LOSS_THB):
+                if auto_scan:
+                    auto_scan = False
+                    log.warning(f"[DailyLoss] ขาดทุนวันนี้ ฿{abs(daily_loss):,} เกิน MAX ฿{int(MAX_DAILY_LOSS_THB):,} — หยุด scan")
+                    if _app:
+                        asyncio.get_running_loop().create_task(
+                            _app.bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=f"🚨 *Daily Loss Limit*\nขาดทุนวันนี้ *฿{abs(daily_loss):,}* เกินสูงสุด\n❌ Auto scan หยุดอัตโนมัติ",
+                                parse_mode="Markdown"
+                            )
+                        )
+                return 0
 
-    # 7/10/11. Detect line movements (async, ไม่ block)
-    asyncio.create_task(detect_line_movements(odds_by_sport))
+        # v10-14: Sport Rotation — scan sports เป็นกลุ่มๆ ประหยัด quota
+        rotation_size = int(os.getenv("SPORT_ROTATION_SIZE", "0"))
+        if rotation_size > 0 and len(SPORTS) > rotation_size:
+            batch = SPORTS[_sport_rotation_idx: _sport_rotation_idx + rotation_size]
+            if not batch:  # wrap around
+                _sport_rotation_idx = 0
+                batch = SPORTS[:rotation_size]
+            _sport_rotation_idx = (_sport_rotation_idx + rotation_size) % len(SPORTS)
+            scan_sports = batch
+            log.debug(f"[Rotation] scanning {scan_sports} ({_sport_rotation_idx}/{len(SPORTS)})")
+        else:
+            scan_sports = SPORTS  # scan ทั้งหมด (default)
+        odds_by_sport, poly_markets = await fetch_all_async(scan_sports)
 
-    all_opps = scan_all(odds_by_sport, poly_markets)
-    sent = 0
-    for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
-        key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
-        if key not in seen_signals:
-            seen_signals.add(key)
-            await send_alert(opp)
-            await asyncio.sleep(1)
-            sent += 1
-    if len(seen_signals) > 500: seen_signals.clear()
-    scan_count    += 1
-    last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
-    save_snapshot()   # 💾 บันทึก state
-    return sent
+        # B7: await detect_line_movements ไม่ใช้ create_task — ป้องกัน race condition
+        await detect_line_movements(odds_by_sport)
+
+        all_opps = scan_all(odds_by_sport, poly_markets)
+        sent = 0
+        for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
+            key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
+            if key not in seen_signals:
+                seen_signals.add(key)
+                await send_alert(opp)
+                await asyncio.sleep(1)
+                sent += 1
+        if len(seen_signals) > 500: seen_signals.clear()
+        scan_count    += 1
+        last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
+        save_snapshot()   # 💾 บันทึก state
+        return sent
+    except Exception as e:
+        _last_error = f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {e!r}"
+        log.error(f"[Scan] error: {e}", exc_info=True)
+        return 0
+    finally:
+        _scan_in_progress = False
 
 
 # track events ที่รอดึง closing line
@@ -2333,11 +2403,20 @@ async def settle_completed_trades():
 
                 # #28 Handle special outcomes
                 if winner == "DRAW":
-                    log.info(f"[Settle] {trade.event} — DRAW, marking manual review")
+                    log.info(f"[Settle] {trade.event} — DRAW, profit=0")
+                    # A1: DRAW ต้อง set actual_profit_thb=0 และ update in-memory
+                    trade.actual_profit_thb = 0
+                    trade.settled_at = datetime.now(timezone.utc).isoformat()
+                    db_save_trade(trade)
+                    with _data_lock:
+                        for idx, rec in enumerate(trade_records):
+                            if rec.signal_id == trade.signal_id:
+                                trade_records[idx] = trade
+                                break
                     for cid in ALL_CHAT_IDS:
                         try:
                             await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                text=f"🤝 *DRAW — Manual Review*\n`{trade.event}`\n"
+                                text=f"🤝 *DRAW — P&L: ฿0*\n`{trade.event}`\n"
                                      f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเปล่า")
                         except Exception: pass
                     settled_ids.append(signal_id)
@@ -2361,10 +2440,15 @@ async def settle_completed_trades():
                 emoji_result  = "✅" if actual_profit >= 0 else "❌"
                 sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
 
-                # อัพเดท trade record
+                # อัพเดท trade record + in-memory
                 trade.actual_profit_thb = actual_profit
                 trade.settled_at        = datetime.now(timezone.utc).isoformat()
                 db_save_trade(trade)
+                with _data_lock:
+                    for idx, rec in enumerate(trade_records):
+                        if rec.signal_id == trade.signal_id:
+                            trade_records[idx] = trade
+                            break
                 settled_ids.append(signal_id)
 
                 log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
@@ -2438,6 +2522,28 @@ async def scanner_loop():
             try: await do_scan()
             except Exception as e: log.error(f"[Scanner] {e}")
         periodic_cleanup()
+        # D1: pending TTL cleanup — ลบ signal เก่าเกิน TTL หรือเลยเวลาแข่งแล้ว
+        _ttl = int(os.getenv("SIGNAL_TTL_SEC", "900"))
+        _now_ts = time.time()
+        _now_dt = datetime.now(timezone.utc)
+        expired = []
+        for _sid, (_opp, _ts) in list(pending.items()):
+            if _now_ts - _ts > _ttl:
+                expired.append(_sid)
+                continue
+            try:
+                _cdt = datetime.fromisoformat(
+                    _opp.commence.replace(" ", "T") + ":00+00:00"
+                )
+                if _cdt.tzinfo is None: _cdt = _cdt.replace(tzinfo=timezone.utc)
+                if _now_dt > _cdt + timedelta(minutes=5):  # เลยเวลาแข่ง +5m
+                    expired.append(_sid)
+            except Exception:
+                pass
+        for _sid in expired:
+            pending.pop(_sid, None)
+        if expired:
+            log.info(f"[Pending] expired {len(expired)} signal(s)")
         # v10-1: รอแบบ ถ้า apply_runtime_config เปลี่ยน interval/auto_scan จะปลุก event นี้เพื่อตื่นทันที
         _scan_wakeup.clear()
         try:
@@ -2731,7 +2837,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     actual = 0
                 t.actual_profit_thb = actual
                 t.settled_at = datetime.now(timezone.utc).isoformat()
+                t.status = "confirmed"
                 db_save_trade(t)
+                # A3: update in-memory trade_records
+                with _data_lock:
+                    for idx, rec in enumerate(trade_records):
+                        if rec.signal_id == t.signal_id:
+                            trade_records[idx] = t
+                            break
                 resp = json.dumps({"ok": True, "msg": f"Settled {result.upper()} | P&L: {actual:+,}", "actual": actual}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type","application/json")
@@ -2750,16 +2863,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        # Health check endpoint สำหรับ Railway (ไม่ต้อง auth) — v10-8: richer
+        # Health check endpoint สำหรับ Railway (ไม่ต้อง auth) — D2: richer
         if self.path == "/health":
+            uptime_s = int(time.time() - _bot_start_ts)
+            uptime_str = f"{uptime_s//3600}h{(uptime_s%3600)//60}m"
+            ready_to_settle = sum(
+                1 for sid, (trade, cdt) in _pending_settlement.items()
+                if datetime.now(timezone.utc) >= cdt + timedelta(hours=2)
+            )
+            with _data_lock:
+                confirmed_ct = len([t for t in trade_records if t.status=="confirmed"])
             health = {
-                "status":       "ok",
-                "db_mode":      "turso" if _turso_ok else "sqlite",
-                "last_scan":    last_scan_time,
-                "pending":      len(pending),
-                "api_remaining":api_remaining,
-                "trades":       len(trade_records),
-                "scan_count":   scan_count,
+                "status":            "ok",
+                "uptime":            uptime_str,
+                "db_mode":           "turso" if _turso_ok else "sqlite",
+                "turso_ok":          _turso_ok,
+                "last_scan":         last_scan_time,
+                "scan_in_progress":  _scan_in_progress,
+                "scan_count":        scan_count,
+                "pending":           len(pending),
+                "api_remaining":     api_remaining,
+                "auto_scan":         auto_scan,
+                "confirmed_trades":  confirmed_ct,
+                "ready_to_settle":   ready_to_settle,
+                "last_error":        _last_error or None,
             }
             body = json.dumps(health).encode()
             self.send_response(200)
