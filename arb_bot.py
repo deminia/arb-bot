@@ -314,17 +314,19 @@ def _turso_http(statements: list) -> list:
 
 def _turso_val_type(v) -> str:
     if v is None:              return "null"
+    if isinstance(v, bool):    return "integer"  # bool before int
     if isinstance(v, int):     return "integer"
     if isinstance(v, float):   return "float"
     if isinstance(v, bytes):   return "blob"
     return "text"
 
 def _turso_val(v):
-    if v is None:    return None
-    if isinstance(v, bool):  return int(v)  # bool before int check
-    if isinstance(v, int):   return v
-    if isinstance(v, float): return v
-    if isinstance(v, bytes): return v.hex()
+    """Turso /v2/pipeline: value must always be a string (or null for NULL)"""
+    if v is None:              return None
+    if isinstance(v, bool):    return str(int(v))   # True->'1', False->'0'
+    if isinstance(v, int):     return str(v)
+    if isinstance(v, float):   return str(v)
+    if isinstance(v, bytes):   return v.hex()
     return str(v)
 
 async def turso_init():
