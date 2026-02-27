@@ -433,7 +433,8 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
             return results[0] if results else []
         except Exception as e:
             log.error(f"[DB] turso_query: {e!r}")
-    # SQLite fallback
+            return []  # Fix 1: no SQLite fallback when Turso is/was active
+    # SQLite fallback — only when Turso was never configured
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as con:
             rows = con.execute(sql, params).fetchall()
@@ -1866,7 +1867,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Auto scan: {s}\n/scan on หรือ /scan off")
         return
     if args[0].lower()=="on":
-        auto_scan=True; quota_warned=False; seen_signals.clear()
+        auto_scan=True; quota_warned=False
+        with _data_lock:  # Fix 3
+            seen_signals.clear()
         await update.message.reply_text(f"🟢 *Auto scan เปิด* — ทุก {SCAN_INTERVAL}s", parse_mode="Markdown")
     elif args[0].lower()=="off":
         auto_scan=False
@@ -1937,11 +1940,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = "🟢 เปิด" if auto_scan else "🔴 ปิด"
     qpct = min(100, int(api_remaining/5))
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
-    with _data_lock:  # v10-12
-        confirmed  = len([t for t in trade_records if t.status=="confirmed"])
-        settled    = len([t for t in trade_records if t.status=="confirmed" and t.actual_profit_thb is not None])
-        actual_pnl = sum(t.actual_profit_thb for t in trade_records
-                         if t.status=="confirmed" and t.actual_profit_thb is not None)
+    with _data_lock:  # v10-12 — Fix 4: also snapshot lens under lock
+        confirmed    = len([t for t in trade_records if t.status=="confirmed"])
+        settled      = len([t for t in trade_records if t.status=="confirmed" and t.actual_profit_thb is not None])
+        actual_pnl   = sum(t.actual_profit_thb for t in trade_records
+                           if t.status=="confirmed" and t.actual_profit_thb is not None)
+        _pending_ct  = len(pending)
+        _unsettled_ct = len(_pending_settlement)
+        _lm_ct       = len(line_movements)
     # C13: rotation info
     rotation_size = int(os.getenv("SPORT_ROTATION_SIZE", "0"))
     if rotation_size > 0 and len(SPORTS) > rotation_size:
@@ -1955,9 +1961,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
         f"ล่าสุด      : {last_scan_time}\n"
         f"{rot_str}"
-        f"รอ confirm  : {len(pending)} | trade: {confirmed} | unsettled: {len(_pending_settlement)}\n"
+        f"รอ confirm  : {_pending_ct} | trade: {confirmed} | unsettled: {_unsettled_ct}\n"
         f"Settled P&L : ฿{actual_pnl:+,} ({settled} เกม)\n"
-        f"Line moves  : {len(line_movements)} events\n"
+        f"Line moves  : {_lm_ct} events\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Min profit  : {MIN_PROFIT_PCT:.1%} | Max odds: {MAX_ODDS_ALLOWED}\n"
         f"ทุน/trade   : ฿{int(TOTAL_STAKE_THB):,} | Bankroll: ฿{int(get_current_bankroll()):,}\n"
@@ -2905,6 +2911,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if not tr_list:
                         raise ValueError(f"signal_id '{sid}' not found")
                     t = tr_list[0]
+                    # Fix 2: prevent re-settling an already-settled trade
+                    if t.actual_profit_thb is not None or t.settled_at is not None:
+                        raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
                 else:
                     t, _ = entry
                 tt = t.stake1_thb + t.stake2_thb
@@ -2963,7 +2972,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "last_scan":         last_scan_time,
                 "scan_in_progress":  _scan_in_progress,
                 "scan_count":        scan_count,
-                "pending":           len(pending),
+                "pending":           len(pending),  # health: minor race ok (atomic int read)
                 "api_remaining":     api_remaining,
                 "auto_scan":         auto_scan,
                 "confirmed_trades":  confirmed_ct,
