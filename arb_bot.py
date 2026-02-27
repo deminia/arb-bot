@@ -420,6 +420,10 @@ async def turso_exec(sql: str, params: tuple = ()):
 
 async def turso_query(sql: str, params: tuple = ()) -> list:
     """Execute read query (Turso HTTP หรือ SQLite fallback)"""
+    # Fix 5: if Turso was live and then died, refuse SQLite fallback read
+    if _db_write_halted:
+        log.error("[DB] reads halted after Turso failure — refusing SQLite fallback")
+        return []
     if _turso_ok:
         try:
             loop = asyncio.get_running_loop()
@@ -1813,9 +1817,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await query.edit_message_text(query.message.text+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
+    # Fix 1: map action string to canonical status
+    new_status = "confirmed" if action == "confirm" else "rejected"
     with _data_lock:
         for entry in opportunity_log:
-            if entry["id"] == sid: entry["status"] = action
+            if entry["id"] == sid:
+                entry["status"] = new_status
+                break
     orig = query.message.text
     if action == "reject":
         with _data_lock:
@@ -2179,8 +2187,14 @@ async def watch_closing_lines():
             for key, info in watch_snapshot:
                 if info.get("done"): continue
                 mins_left = (info["commence_dt"] - now).total_seconds() / 60
-                if mins_left <= 1:
-                    to_fetch.append((key, info))  # Fix 3: do NOT mark done yet
+                if -10 <= mins_left <= 1:
+                    to_fetch.append((key, info))  # fetch window: 1 min before to 10 min after
+                elif mins_left < -10:
+                    # Fix 3: event is well past — mark done to stop retrying
+                    with _data_lock:
+                        if key in _closing_line_watch:
+                            _closing_line_watch[key]["done"] = True
+                    log.info(f"[CLV] auto-expired stale watch: {info['event']}")
 
             if to_fetch:
                 async with aiohttp.ClientSession() as session:
@@ -2815,7 +2829,8 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
                 asyncio.run_coroutine_threadsafe(do_scan(), _main_loop)
             return True, "scan triggered"
         elif key == "clear_seen":
-            seen_signals.clear()
+            with _data_lock:
+                seen_signals.clear()
             return True, "seen_signals cleared"
         else:
             return False, f"unknown key: {key}"
@@ -2846,7 +2861,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         """รับ POST จาก Dashboard UI Controls"""
         if not self._check_auth(): return
-        if self.path == "/api/control":
+        # Fix 2: strip query params so ?token=xxx doesn't break path matching
+        from urllib.parse import urlparse as _urlparse
+        _clean = _urlparse(self.path).path
+        if _clean == "/api/control":
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body   = json.loads(self.rfile.read(length))
@@ -2869,7 +2887,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length",len(err))
                 self.end_headers()
                 self.wfile.write(err)
-        elif self.path == "/api/settle":
+        elif _clean == "/api/settle":
             # v10-9: Manual Settlement จาก Dashboard
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -2974,6 +2992,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 lm_snap    = list(line_movements[-50:])
                 opp_snap   = list(opportunity_log[-50:])
                 tr_snap    = list(trade_records[-30:])
+                ps_snap    = list(_pending_settlement.values())  # Fix 4: full unsettled list
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
             clv_values = []
             for t in confirmed:
@@ -3028,7 +3047,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "opportunities":   opp_snap,
                 "line_movements":  lm_list,
                 "trade_records":   tr_list,
-                "unsettled_trades": [  # C9: Dashboard Force Settle UI
+                "unsettled_trades": [  # Fix 4: from _pending_settlement (not tr_snap) — full list
                     {
                         "signal_id": t.signal_id,
                         "event":     t.event,
@@ -3040,8 +3059,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "created_at": t.created_at,
                         "commence_time": t.commence_time,
                     }
-                    for t in tr_snap
-                    if t.status == "confirmed" and t.actual_profit_thb is None
+                    for t, _dt in ps_snap
                 ],
                 "pnl": {
                     "confirmed":  len(confirmed),
