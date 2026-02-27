@@ -284,7 +284,7 @@ def _turso_http(statements: list) -> list:
     body = json.dumps({"requests": [
         {"type": "execute", "stmt": {
             "sql": s["sql"],
-            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
+            "args": [{"type": _turso_val_type(v), "value": _turso_val_json(v)} for v in s.get("args", [])]
         }} for s in statements
     ] + [{"type": "close"}]}).encode()
     req = urllib.request.Request(
@@ -332,6 +332,17 @@ def _turso_val(v):
     if isinstance(v, bool):    return str(int(v))   # True->'1', False->'0'
     if isinstance(v, int):     return str(v)
     if isinstance(v, (float, Decimal)): return str(float(v))  # Decimal → float string
+    if isinstance(v, bytes):   return v.hex()
+    return str(v)
+
+def _turso_val_json(v):
+    """Turso /v2/pipeline: return native JSON type for integer/float, string for text/blob, None for null.
+    Some Turso versions reject string-encoded numerics for REAL/INTEGER columns."""
+    if v is None:              return None
+    if isinstance(v, bool):    return int(v)         # True->1, False->0
+    if isinstance(v, int):     return v
+    if isinstance(v, Decimal): return float(v)
+    if isinstance(v, float):   return v
     if isinstance(v, bytes):   return v.hex()
     return str(v)
 
