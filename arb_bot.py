@@ -1389,7 +1389,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
             home       = event.get("home_team","")
             away       = event.get("away_team","")
             event_name = f"{home} vs {away}"
-            commence   = event.get("commence_time","")[:16].replace("T"," ")
+            commence   = event.get("commence_time","").replace("T"," ").rstrip("Z")  # B10: keep full ISO, no [:16]
 
             # 1. Staleness check
             if is_stale(event.get("commence_time","")):
@@ -1558,7 +1558,7 @@ async def send_alert(opp: ArbOpportunity):
         f"{emoji} *ARB FOUND — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{commence_line}  {urgency_note}\n"
-        f"🏆 `{opp.event}`\n"
+        f"🏆 `{opp.event.replace('`', "'")} `\n"
         f"💵 ทุน: *฿{int(tt):,}* {'_(Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"```\n"
@@ -1570,8 +1570,8 @@ async def send_alert(opp: ArbOpportunity):
         f"{'รวม':<34} {'฿'+str(int(tt)):>8}\n"
         f"```\n"
         f"📊 ไม่ว่าใครชนะ\n"
-        f"   {md_escape(opp.leg1.outcome)} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
-        f"   {md_escape(opp.leg2.outcome)} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
+        f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
+        f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
         f"🔗 {opp.leg1.market_url or '—'}\n"
         f"🆔 `{opp.signal_id}`"
     )
@@ -1589,8 +1589,10 @@ async def send_alert(opp: ArbOpportunity):
 
 
 def md_escape(text: str) -> str:
-    """C12: escape Telegram Markdown special chars in dynamic text (team/event names)"""
-    for ch in ("\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
+    """B3: escape Telegram legacy-Markdown special chars in dynamic text.
+    Legacy Markdown only treats _ * backtick [ as special, plus backslash."""
+    # Legacy parse_mode="Markdown" only special-cases: _ * ` [
+    for ch in ("\\", "_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
 
@@ -1740,14 +1742,14 @@ async def execute_both(opp: ArbOpportunity) -> str:
         return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
 
     return (
-        f"📋 *วางเงิน — {opp.event}*{slippage_warn}\n"
+        f"📋 *วางเงิน — {md_escape(opp.event)}*{slippage_warn}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔵 *{opp.leg1.bookmaker}*\n{steps(opp.leg1, s1)}\n\n"
-        f"🟠 *{opp.leg2.bookmaker}*\n{steps(opp.leg2, s2)}\n"
+        f"🔵 *{md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1)}\n\n"
+        f"🟠 *{md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 ทุน ฿{int(tt):,}  _(Live profit: {float(live_profit):.2%})_\n"
-        f"   {opp.leg1.outcome} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
-        f"   {opp.leg2.outcome} ชนะ → ฿{int(w2):,} (+฿{int(w2-tt):,})"
+        f"   {md_escape(str(opp.leg1.outcome))} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
+        f"   {md_escape(str(opp.leg2.outcome))} ชนะ → ฿{int(w2):,} (+฿{int(w2-tt):,})"
     )
 
 
@@ -2100,11 +2102,13 @@ async def do_scan() -> int:
         for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
             key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
             if key not in seen_signals:
-                seen_signals.add(key)
+                with _data_lock:
+                    seen_signals.add(key)
                 await send_alert(opp)
                 await asyncio.sleep(1)
                 sent += 1
-        if len(seen_signals) > 500: seen_signals.clear()
+        with _data_lock:
+            if len(seen_signals) > 500: seen_signals.clear()
         scan_count    += 1
         last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
         save_snapshot()   # 💾 บันทึก state
@@ -2427,8 +2431,8 @@ async def settle_completed_trades():
                     for cid in ALL_CHAT_IDS:
                         try:
                             await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                text=f"⚠️ *Manual Review Required*\n`{trade.event}`\n"
-                                     f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({trade.sport})\n"
+                                text=f"⚠️ *Manual Review Required*\n`{md_escape(trade.event)}`\n"
+                                     f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(trade.sport)})\n"
                                      f"กรุณาตรวจสอบผลเองใน Dashboard")
                         except Exception: pass
                     settled_ids.append(signal_id)
@@ -2455,9 +2459,9 @@ async def settle_completed_trades():
 
                 # แจ้ง Telegram
                 msg = (
-                    f"{sport_emoji} *SETTLED* \u2014 {trade.event}\n"
+                    f"{sport_emoji} *SETTLED* \u2014 {md_escape(trade.event)}\n"
                     f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{winner}*\n"
+                    f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{md_escape(winner)}*\n"
                     f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
                     f"\U0001f4ca \u0e01\u0e33\u0e44\u0e23\u0e08\u0e23\u0e34\u0e07: {emoji_result} *\u0e3f{actual_profit:+,}*\n"
                     f"\U0001f4c8 ROI     : *{actual_profit/total_staked*100:+.2f}%*\n"
