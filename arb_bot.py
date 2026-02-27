@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  ARB BOT v10.0 —  Production Ready                                    ║
+║  DEMINIA BOT V.1 —  Production Ready                                  ║
 ║  1.  Odds Staleness + Slippage Guard   9.  Profitability Guard        ║
 ║  2.  Max/Min Odds Filter              10.  CLV Benchmark + Settlement ║
 ║  3.  Alert Cooldown + Multi-chat      11.  Manual Settle (/settle)    ║
@@ -214,8 +214,7 @@ class TradeRecord:
 # ══════════════════════════════════════════════════════════════════
 _main_loop: Optional[asyncio.AbstractEventLoop] = None  # ref to main loop for cross-thread calls
 _scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
-_scan_lock: Optional[asyncio.Lock] = None  # B6: ป้องกัน scan overlap
-_scan_in_progress: bool = False  # สถานะใช้แสดง scan
+_scan_in_progress: bool = False  # B6: ป้องกัน scan overlap
 _now_last_ts: float = 0  # A5: timestamp ที่กด /now ล่าสุด
 _bot_start_ts: float = time.time()  # D2: uptime
 _last_error: str = ""  # D2: last error message
@@ -381,8 +380,8 @@ async def turso_exec(sql: str, params: tuple = ()):
                     log.warning(f"[DB] turso_exec attempt {attempt+1} failed: {e!r}")
                     await asyncio.sleep(1.5 ** attempt)
                 else:
-                    log.error(f"[DB] turso_exec failed 3x: {e!r} — falling back to SQLite")
-                    # B8: Turso ล่ม → หยุด auto_scan ทันที เพื่อป้องกัน split-brain
+                    log.error(f"[DB] turso_exec failed 3x: {e!r} — halting writes")
+                    # Fix 2: Turso ล่ม 3 ครั้ง → หยุด auto_scan + return ทันที ไม่เขียน SQLite
                     global auto_scan
                     auto_scan = False
                     if _app:
@@ -390,24 +389,26 @@ async def turso_exec(sql: str, params: tuple = ()):
                             asyncio.get_running_loop().create_task(
                                 _app.bot.send_message(
                                     chat_id=CHAT_ID,
-                                    text=f"🚨 *DB CRITICAL*: Turso write failed 3x\n`{str(e)[:120]}`\n❌ *Auto scan หยุดแล้ว* — บอทไม่เขียน DB ต่อเนื่อง",
+                                    text=f"🚨 *DB CRITICAL*: Turso write failed 3x\n`{str(e)[:120]}`\n❌ *Auto scan หยุดแล้ว* — หยุดเขียน DB ทั้งหมด",
                                     parse_mode="Markdown"
                                 )
                             )
                         except Exception:
                             pass
-    # SQLite fallback
-    try:
-        with sqlite3.connect(DB_PATH, timeout=10) as con:
-            con.execute(sql, params)
-            con.commit()
-    except sqlite3.OperationalError as e:
-        if "duplicate column" in str(e) or "already exists" in str(e):
-            pass  # migration ที่รันซ้ำ — ไม่ใช่ error
-        else:
+                    return  # Fix 2: ไม่ fallback ไป SQLite — ป้องกัน split-brain
+    # SQLite-only mode (ใช้เฉพาะตอน Turso init fail ตั้งแต่แรก)
+    if not _turso_ok:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=10) as con:
+                con.execute(sql, params)
+                con.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e) or "already exists" in str(e):
+                pass
+            else:
+                log.error(f"[DB] sqlite_exec: {e}")
+        except Exception as e:
             log.error(f"[DB] sqlite_exec: {e}")
-    except Exception as e:
-        log.error(f"[DB] sqlite_exec: {e}")
 
 async def turso_query(sql: str, params: tuple = ()) -> list:
     """Execute read query (Turso HTTP หรือ SQLite fallback)"""
@@ -840,8 +841,8 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             f"{'  '.join(tags)}\n"
             f"{grade_emoji} *เกรด {grade}* {'— 🔥 สัญญาณแข็ง!' if grade == 'A' else '— สัญญาณพอใช้' if grade == 'B' else ''}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{sport_emoji} `{lm.event}`\n"
-            f"📡 {lm.bookmaker} — *{lm.outcome}*\n"
+            f"{sport_emoji} `{lm.event.replace('`', "'")}`\n"
+            f"📡 {md_escape(lm.bookmaker)} — *{md_escape(lm.outcome)}*\n"
             f"📉 `{float(lm.odds_before):.3f}` → `{float(lm.odds_after):.3f}` ({pct_str}) {lm.direction}\n"
         )
         if time_info:
@@ -857,7 +858,7 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             action = "BET" if lm.pct_change < 0 else "FADE"
             target = lm.outcome
             if lm.pct_change < 0:
-                msg += (f"\n💡 *แนะนำ:* เดิมพัน *{target}* (odds ลง = เงินใหญ่เดิน)\n"
+                msg += (f"\n💡 *แนะนำ:* เดิมพัน *{md_escape(target)}* (odds ลง = เงินใหญ่เดิน)\n"
                         f"Soft books ยังไม่ตาม → โอกาส value bet!\n")
             else:
                 msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
@@ -1493,9 +1494,7 @@ async def send_alert(opp: ArbOpportunity):
 
     # ── คำนวณ mins_to_start ก่อนใช้ ──
     try:
-        commence_dt = datetime.fromisoformat(
-            opp.commence.replace(" ","T") + ":00+00:00"
-        )
+        commence_dt = parse_commence(opp.commence)
         mins_to_start = (commence_dt - datetime.now(timezone.utc)).total_seconds() / 60
     except Exception:
         mins_to_start = 999
@@ -1538,7 +1537,7 @@ async def send_alert(opp: ArbOpportunity):
 
     # แปลงเวลาแข่งเป็น UTC+7 พร้อม countdown
     try:
-        _ct    = datetime.fromisoformat(opp.commence.replace(" ", "T") + ":00+00:00")
+        _ct    = parse_commence(opp.commence)
         _ct_th = _ct + timedelta(hours=7)
         _date_str = _ct_th.strftime("%d/%m/%Y %H:%M") + " น. ไทย"
         if mins_to_start <= 0:
@@ -1572,7 +1571,7 @@ async def send_alert(opp: ArbOpportunity):
         f"📊 ไม่ว่าใครชนะ\n"
         f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
         f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
-        f"🔗 {opp.leg1.market_url or '—'}\n"
+        f"🔗 {opp.leg1.market_url or ''}{' | ' if opp.leg1.market_url and opp.leg2.market_url else ''}{opp.leg2.market_url or '' if not opp.leg1.market_url else ''}\n"
         f"🆔 `{opp.signal_id}`"
     )
     keyboard = InlineKeyboardMarkup([[
@@ -1591,10 +1590,24 @@ async def send_alert(opp: ArbOpportunity):
 def md_escape(text: str) -> str:
     """B3: escape Telegram legacy-Markdown special chars in dynamic text.
     Legacy Markdown only treats _ * backtick [ as special, plus backslash."""
-    # Legacy parse_mode="Markdown" only special-cases: _ * ` [
     for ch in ("\\", "_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+def parse_commence(raw: str) -> datetime:
+    """Fix 1: Parse commence_time string — handles all formats robustly.
+    Returns UTC-aware datetime. Never appends ':00+00:00' blindly."""
+    s = raw.strip().replace(" ", "T")
+    # Already has tz info (+00:00 / Z)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    if "+" in s[10:] or (len(s) > 10 and s[-3] == ":"):
+        dt = datetime.fromisoformat(s)
+    else:
+        # No tz — assume UTC
+        dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1730,7 +1743,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
         cap_note = f"\n  ⚠️ Capped ที่ ฿{int(cap):,}" if cap < stake else ""
         if "polymarket" in bm:
             link = leg.market_url or "https://polymarket.com"
-            return f"  🔗 [เปิด Polymarket]({link})\n  2. เลือก *{leg.outcome}*\n  3. วาง ฿{int(stake)} USDC{cap_note}"
+            usdc_amt = round(stake / USD_TO_THB, 2)
+            return f"  🔗 [เปิด Polymarket]({link})\n  2. เลือก *{leg.outcome}*\n  3. วาง *{usdc_amt} USDC* (≈฿{int(stake)}){cap_note}"
         elif "pinnacle" in bk:
             link = f"https://www.pinnacle.com/en/mixed-martial-arts/matchup/{eid}" if eid else "https://www.pinnacle.com"
             return f"  🔗 [เปิด Pinnacle]({link})\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
@@ -1928,7 +1942,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _now_last_ts
-    # A5: Rate limit /now — ไม่ให้กดซ้ำภายใน 60 วินาที
+    # Fix 4: check scan-in-progress BEFORE burning cooldown
+    if _scan_in_progress:
+        await update.message.reply_text("⏳ *กำลัง scan อยู่แล้ว* — รอสักครู่", parse_mode="Markdown")
+        return
+    # A5: Rate limit /now — ไม่ให้กดซ้ำภายใน NOW_COOLDOWN_SEC
     NOW_COOLDOWN = int(os.getenv("NOW_COOLDOWN_SEC", "60"))
     elapsed = time.time() - _now_last_ts
     if elapsed < NOW_COOLDOWN:
@@ -1938,9 +1956,6 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     _now_last_ts = time.time()
-    if _scan_in_progress:
-        await update.message.reply_text("⏳ *กำลัง scan อยู่แล้ว* — รอสักครู่", parse_mode="Markdown")
-        return
     await update.message.reply_text("🔍 *กำลังสแกน...*", parse_mode="Markdown")
     count = await do_scan()
     msg = f"✅ พบ *{count}* opportunity" if count else f"✅ ไม่พบ > {MIN_PROFIT_PCT:.1%}"
@@ -1960,7 +1975,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ct_th = ""
         if t.commence_time:
             try:
-                _ct = datetime.fromisoformat(t.commence_time.replace(" ", "T").rstrip("Z") + "+00:00")
+                _ct = parse_commence(t.commence_time)
                 ct_th = (_ct + timedelta(hours=7)).strftime("%d/%m %H:%M")
             except Exception:
                 pass
@@ -2004,7 +2019,8 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("result ต้องเป็น: leg1 / leg2 / draw / void")
         return
 
-    entry = _pending_settlement.pop(sid, None)
+    with _data_lock:
+        entry = _pending_settlement.pop(sid, None)
     if not entry:
         await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
         return
@@ -2066,7 +2082,7 @@ async def do_scan() -> int:
                     and t.settled_at
                     and datetime.fromisoformat(t.settled_at).date() == today
                 )
-            if daily_loss < -int(MAX_DAILY_LOSS_THB):
+            if daily_loss <= -int(MAX_DAILY_LOSS_THB):
                 if auto_scan:
                     auto_scan = False
                     log.warning(f"[DailyLoss] ขาดทุนวันนี้ ฿{abs(daily_loss):,} เกิน MAX ฿{int(MAX_DAILY_LOSS_THB):,} — หยุด scan")
@@ -2169,9 +2185,7 @@ async def watch_closing_lines():
 def register_closing_watch(opp: "ArbOpportunity"):
     """เพิ่ม event เข้า watchlist สำหรับ closing line"""
     try:
-        commence_dt = datetime.fromisoformat(
-            opp.commence.replace(" ","T") + ":00+00:00"
-        )
+        commence_dt = parse_commence(opp.commence)
         key = f"{opp.event}|{opp.sport}"
         if key not in _closing_line_watch:
             _closing_line_watch[key] = {
@@ -2196,14 +2210,9 @@ _pending_settlement: dict[str, tuple] = {}   # signal_id → (TradeRecord, datet
 def register_for_settlement(trade: TradeRecord, commence: str):
     """เพิ่ม trade เข้า queue รอ settle — จะยิง API ก็ต่อเมื่อเลยเวลาเตะ +2h"""
     try:
-        raw = commence.strip()
-        # รองรับทั้ง "2026-02-26 18:00" และ ISO "2026-02-26T18:00:00+00:00"
-        if "T" not in raw and "+" not in raw:
-            raw = raw.replace(" ", "T") + ":00+00:00"
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        _pending_settlement[trade.signal_id] = (trade, dt)
+        dt = parse_commence(commence)
+        with _data_lock:
+            _pending_settlement[trade.signal_id] = (trade, dt)
         settle_after = dt + timedelta(hours=2)
         log.info(f"[Settle] registered: {trade.event} | kick={dt.strftime('%d/%m %H:%M')} UTC | check after {settle_after.strftime('%d/%m %H:%M')} UTC")
     except Exception as e:
@@ -2344,7 +2353,9 @@ async def settle_completed_trades():
 
     while True:
         try:
-            if not _pending_settlement:
+            with _data_lock:
+                ps_snapshot = dict(_pending_settlement)
+            if not ps_snapshot:
                 await asyncio.sleep(300)
                 continue
 
@@ -2352,13 +2363,13 @@ async def settle_completed_trades():
             # #37 กรองเฉพาะ trades ที่เลยเวลาเตะ +2h แล้ว — ไม่ยิง API ก่อนถึงเวลา
             ready = {
                 sid: (trade, cdt)
-                for sid, (trade, cdt) in _pending_settlement.items()
+                for sid, (trade, cdt) in ps_snapshot.items()
                 if now >= cdt + timedelta(hours=2)
             }
             if not ready:
-                earliest = min(cdt for _, cdt in _pending_settlement.values())
+                earliest = min(cdt for _, cdt in ps_snapshot.values())
                 wait_min = max(0, int((earliest + timedelta(hours=2) - now).total_seconds() / 60))
-                log.debug(f"[Settle] {len(_pending_settlement)} trade(s) waiting — earliest ready in {wait_min}m")
+                log.debug(f"[Settle] {len(ps_snapshot)} trade(s) waiting — earliest ready in {wait_min}m")
                 await asyncio.sleep(300)
                 continue
 
@@ -2476,8 +2487,9 @@ async def settle_completed_trades():
                             log.error(f"[Settle] notify {cid}: {e}")
 
             # ลบ trades ที่ settle แล้ว
-            for sid in settled_ids:
-                _pending_settlement.pop(sid, None)
+            with _data_lock:
+                for sid in settled_ids:
+                    _pending_settlement.pop(sid, None)
 
         except Exception as e:
             log.error(f"[Settle] crash in loop: {e}", exc_info=True)
@@ -2536,10 +2548,7 @@ async def scanner_loop():
                 expired.append(_sid)
                 continue
             try:
-                _cdt = datetime.fromisoformat(
-                    _opp.commence.replace(" ", "T") + ":00+00:00"
-                )
-                if _cdt.tzinfo is None: _cdt = _cdt.replace(tzinfo=timezone.utc)
+                _cdt = parse_commence(_opp.commence)
                 if _now_dt > _cdt + timedelta(minutes=5):  # เลยเวลาแข่ง +5m
                     expired.append(_sid)
             except Exception:
@@ -2822,7 +2831,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = body.get("result", "").strip().lower()  # leg1|leg2|draw|void
                 if not sid or result not in ("leg1","leg2","draw","void"):
                     raise ValueError("signal_id and result (leg1/leg2/draw/void) required")
-                entry = _pending_settlement.pop(sid, None)
+                with _data_lock:
+                    entry = _pending_settlement.pop(sid, None)
                 if not entry:
                     # ลอง trade_records โดยตรง
                     with _data_lock:
@@ -2871,8 +2881,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             uptime_s = int(time.time() - _bot_start_ts)
             uptime_str = f"{uptime_s//3600}h{(uptime_s%3600)//60}m"
+            with _data_lock:
+                ps_snap = dict(_pending_settlement)
             ready_to_settle = sum(
-                1 for sid, (trade, cdt) in _pending_settlement.items()
+                1 for sid, (trade, cdt) in ps_snap.items()
                 if datetime.now(timezone.utc) >= cdt + timedelta(hours=2)
             )
             with _data_lock:
@@ -3069,9 +3081,7 @@ async def post_init(app: Application):
             try:
                 ct_str = t.commence_time or ""
                 if ct_str:
-                    commence_dt = datetime.fromisoformat(
-                        ct_str.replace(" ", "T").rstrip("Z") + ("+00:00" if "+" not in ct_str else "")
-                    )
+                    commence_dt = parse_commence(ct_str)
                 else:
                     # fallback สำหรับ trade เก่าที่ไม่มี commence_time
                     commence_dt = datetime.fromisoformat(
