@@ -364,6 +364,10 @@ async def turso_init():
 
 async def turso_exec(sql: str, params: tuple = ()):
     """Execute write query (Turso HTTP หรือ SQLite fallback)"""
+    # Fix 1: early bail if writes are halted
+    if _db_write_halted:
+        log.error("[DB] writes halted — skipping")
+        return
     if _turso_ok:
         for attempt in range(3):
             try:
@@ -397,9 +401,10 @@ async def turso_exec(sql: str, params: tuple = ()):
                             )
                         except Exception:
                             pass
-                    global _db_write_halted
+                    global _db_write_halted, _turso_ok
                     _db_write_halted = True
-                    return  # Fix 2: ไม่ fallback ไป SQLite — ป้องกัน split-brain
+                    _turso_ok = False  # Fix 1: prevent re-entry into Turso block
+                    return  # ไม่ fallback ไป SQLite — ป้องกัน split-brain
     # SQLite-only mode (ใช้เฉพาะตอน Turso init fail ตั้งแต่แรก หรือไม่ได้ตั้ง Turso)
     if not _turso_ok and not _db_write_halted:
         try:
@@ -845,7 +850,7 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             f"{'  '.join(tags)}\n"
             f"{grade_emoji} *เกรด {grade}* {'— 🔥 สัญญาณแข็ง!' if grade == 'A' else '— สัญญาณพอใช้' if grade == 'B' else ''}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{sport_emoji} `{lm.event.replace('`', "'")}`\n"
+            f"{sport_emoji} {md_escape(lm.event)}\n"
             f"📡 {md_escape(lm.bookmaker)} — *{md_escape(lm.outcome)}*\n"
             f"📉 `{float(lm.odds_before):.3f}` → `{float(lm.odds_after):.3f}` ({pct_str}) {lm.direction}\n"
         )
@@ -1503,7 +1508,8 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
 #  SEND ALERT
 # ══════════════════════════════════════════════════════════════════
 async def send_alert(opp: ArbOpportunity):
-    pending[opp.signal_id] = (opp, time.time())  # A2: store with timestamp
+    with _data_lock:
+        pending[opp.signal_id] = (opp, time.time())  # A2: store with timestamp
 
     # ── คำนวณ mins_to_start ก่อนใช้ ──
     try:
@@ -1570,7 +1576,7 @@ async def send_alert(opp: ArbOpportunity):
         f"{emoji} *ARB FOUND — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{commence_line}  {urgency_note}\n"
-        f"🏆 `{opp.event.replace('`', "'")} `\n"
+        f"🏆 {md_escape(opp.event)}\n"
         f"💵 ทุน: *฿{int(tt):,}* {'_(Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"```\n"
@@ -1742,10 +1748,11 @@ async def execute_both(opp: ArbOpportunity) -> str:
     db_save_trade(tr)            # 💾 save to DB
     register_for_settlement(tr, opp.commence)  # 🏆 auto settle
     register_closing_watch(opp)               # #39 CLV watch ตอนเจอ opp ใหม่
-    # อัพเดท opportunity_log
-    for entry in opportunity_log:
-        if entry["id"] == opp.signal_id:
-            entry["status"] = "confirmed"
+    # Fix 3: lock opportunity_log update
+    with _data_lock:
+        for entry in opportunity_log:
+            if entry["id"] == opp.signal_id:
+                entry["status"] = "confirmed"
     db_update_opp_status(opp.signal_id, "confirmed")  # 💾
 
     def steps(leg, stake):
@@ -1794,22 +1801,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: return
     # A2: Signal TTL — ไม่ให้ confirm signal ที่เก่าเกิน 15 นาที
     SIGNAL_TTL = int(os.getenv("SIGNAL_TTL_SEC", "900"))  # default 15m
-    entry = pending.get(sid)
+    with _data_lock:
+        entry = pending.get(sid)
     if not entry:
         try: await query.edit_message_text(query.message.text+"\n\n⚠️ หมดอายุ")
         except Exception: pass
         return
     opp, sig_ts = entry
     if time.time() - sig_ts > SIGNAL_TTL:
-        pending.pop(sid, None)
+        with _data_lock:
+            pending.pop(sid, None)
         try: await query.edit_message_text(query.message.text+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
-    for entry in opportunity_log:
-        if entry["id"] == sid: entry["status"] = action
+    with _data_lock:
+        for entry in opportunity_log:
+            if entry["id"] == sid: entry["status"] = action
     orig = query.message.text
     if action == "reject":
-        pending.pop(sid, None)  # B2: pop ตอน reject จริง
+        with _data_lock:
+            pending.pop(sid, None)  # B2: pop ตอน reject จริง
         tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
             leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
@@ -1830,7 +1841,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     try:
         result = await execute_both(opp)
-        pending.pop(sid, None)  # B2: pop หลัง execute สำเร็จเท่านั้น
+        with _data_lock:
+            pending.pop(sid, None)  # B2: pop หลัง execute สำเร็จเท่านั้น
         try: await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
         except Exception: pass  # C8
     except ValueError as abort_msg:
@@ -1906,7 +1918,7 @@ async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lm.is_steam: tags += "🌊"
         if lm.is_rlm:   tags += "🔄"
         pct = f"{lm.pct_change:+.1%}"
-        lines_text += f"{tags} `{lm.event[:25]}` {lm.bookmaker} {pct}\n"
+        lines_text += f"{tags} {md_escape(lm.event[:25])} {md_escape(lm.bookmaker)} {pct}\n"
     await update.message.reply_text(
         f"📊 *Line Movements ล่าสุด*\n━━━━━━━━━━━━━━━━━━\n{lines_text}\n"
         f"🌊=Steam 🔄=RLM",
@@ -1930,7 +1942,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         rot_str = f"Sports      : {len(SPORTS)} (all)\n"
     await update.message.reply_text(
-        f"📊 *ARB BOT v10.0*\n"
+        f"📊 *Deminia Bot V.1*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
@@ -1941,7 +1953,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Line moves  : {len(line_movements)} events\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Min profit  : {MIN_PROFIT_PCT:.1%} | Max odds: {MAX_ODDS_ALLOWED}\n"
-        f"ทุน/trade   : ฿{int(TOTAL_STAKE_THB):,} | Bankroll: ฿{int(BANKROLL_THB):,}\n"
+        f"ทุน/trade   : ฿{int(TOTAL_STAKE_THB):,} | Bankroll: ฿{int(get_current_bankroll()):,}\n"
         f"Kelly       : {'✅ ON' if USE_KELLY else '❌ OFF'} (f={KELLY_FRACTION})\n"
         f"Cooldown    : {ALERT_COOLDOWN_MIN}m | Staleness: {MAX_ODDS_AGE_MIN}m\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1993,8 +2005,8 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         lines.append(
-            f"{i}. `{t.event[:28]}`\n"
-            f"   {SPORT_EMOJI.get(t.sport,'🏆')} {t.leg1_bm} vs {t.leg2_bm} | profit {t.profit_pct:.1%}\n"
+            f"{i}. {md_escape(t.event[:28])}\n"
+            f"   {SPORT_EMOJI.get(t.sport,'🏆')} {md_escape(t.leg1_bm)} vs {md_escape(t.leg2_bm)} | profit {t.profit_pct:.1%}\n"
             f"   ฿{t.stake1_thb:,}+฿{t.stake2_thb:,} | {ct_th} | {settled}"
         )
     await update.message.reply_text(
@@ -2576,7 +2588,9 @@ async def scanner_loop():
         _now_ts = time.time()
         _now_dt = datetime.now(timezone.utc)
         expired = []
-        for _sid, (_opp, _ts) in list(pending.items()):
+        with _data_lock:
+            pending_snapshot = list(pending.items())
+        for _sid, (_opp, _ts) in pending_snapshot:
             if _now_ts - _ts > _ttl:
                 expired.append(_sid)
                 continue
@@ -2586,9 +2600,10 @@ async def scanner_loop():
                     expired.append(_sid)
             except Exception:
                 pass
-        for _sid in expired:
-            pending.pop(_sid, None)
         if expired:
+            with _data_lock:
+                for _sid in expired:
+                    pending.pop(_sid, None)
             log.info(f"[Pending] expired {len(expired)} signal(s)")
         # v10-1: รอแบบ ถ้า apply_runtime_config เปลี่ยน interval/auto_scan จะปลุก event นี้เพื่อตื่นทันที
         _scan_wakeup.clear()
@@ -3007,7 +3022,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "min_profit_pct":  float(MIN_PROFIT_PCT),
                 "max_odds":        float(MAX_ODDS_ALLOWED),
                 "scan_interval":   SCAN_INTERVAL,
-                "db_mode":         "turso" if _turso_ok else "sqlite",
+                "db_mode":         "turso" if _turso_ok else ("halted" if _db_write_halted else "sqlite"),
+                "db_write_halted": _db_write_halted,
                 "line_move_count": len(lm_snap),
                 "confirmed_trades":len(confirmed),
                 "opportunities":   opp_snap,
