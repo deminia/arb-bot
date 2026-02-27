@@ -1142,7 +1142,29 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
             m["_liquidity"]  = min(volume_24h, total_vol / 30)  # est. daily liquidity
             enriched.append(m)
 
-        log.info(f"[Polymarket] markets={len(markets)} | filtered={len(enriched)} | sports only")
+        # C11: enrich top 20 markets with real orderbook liquidity
+        enriched.sort(key=lambda x: x.get("_liquidity", 0), reverse=True)
+        top = enriched[:20]
+        rest = enriched[20:]
+        async def _empty_book(): return {}
+        book_tasks = []
+        for m in top:
+            toks = m.get("tokens", [])
+            if toks:
+                book_tasks.append(fetch_poly_market_detail(session, toks[0].get("token_id", "")))
+            else:
+                book_tasks.append(_empty_book())
+        books = await asyncio.gather(*book_tasks, return_exceptions=True)
+        for m, book in zip(top, books):
+            if isinstance(book, dict) and book:
+                # override liquidity with real orderbook depth
+                real_liq = book.get("bid_liquidity", 0) + book.get("ask_liquidity", 0)
+                if real_liq > 0:
+                    m["_liquidity"] = real_liq
+                m["_orderbook"] = book
+        enriched = top + rest
+
+        log.info(f"[Polymarket] markets={len(markets)} | filtered={len(enriched)} | enriched orderbook={len(top)}")
         return enriched
 
     except Exception as e:
@@ -1533,14 +1555,14 @@ async def send_alert(opp: ArbOpportunity):
         f"```\n"
         f"{'ช่องทาง':<12} {'ฝั่ง':<15} {'Odds':>5} {'วาง':>8} {'ได้':>8}\n"
         f"{'─'*51}\n"
-        f"{'🔵 '+opp.leg1.bookmaker:<12} {opp.leg1.outcome:<15} {float(opp.leg1.odds):>5.3f} {'฿'+str(int(s1)):>8} {'฿'+str(int(w1)):>8}\n"
-        f"{'🟠 '+opp.leg2.bookmaker:<12} {opp.leg2.outcome:<15} {float(opp.leg2.odds):>5.3f} {'฿'+str(int(s2)):>8} {'฿'+str(int(w2)):>8}\n"
+        f"{'🔵 '+opp.leg1.bookmaker[:10]:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'฿'+str(int(s1)):>8} {'฿'+str(int(w1)):>8}\n"
+        f"{'🟠 '+opp.leg2.bookmaker[:10]:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'฿'+str(int(s2)):>8} {'฿'+str(int(w2)):>8}\n"
         f"{'─'*51}\n"
         f"{'รวม':<34} {'฿'+str(int(tt)):>8}\n"
         f"```\n"
         f"📊 ไม่ว่าใครชนะ\n"
-        f"   {opp.leg1.outcome} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
-        f"   {opp.leg2.outcome} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
+        f"   {md_escape(opp.leg1.outcome)} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
+        f"   {md_escape(opp.leg2.outcome)} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
         f"🔗 {opp.leg1.market_url or '—'}\n"
         f"🆔 `{opp.signal_id}`"
     )
@@ -1555,6 +1577,13 @@ async def send_alert(opp: ArbOpportunity):
                                         reply_markup=keyboard if cid==CHAT_ID else None)
         except Exception as e:
             log.error(f"[Alert] chat {cid}: {e}")
+
+
+def md_escape(text: str) -> str:
+    """C12: escape Telegram Markdown special chars in dynamic text (team/event names)"""
+    for ch in ("\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1841,16 +1870,30 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qpct = min(100, int(api_remaining/5))
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
     with _data_lock:  # v10-12
-        confirmed = len([t for t in trade_records if t.status=="confirmed"])
+        confirmed  = len([t for t in trade_records if t.status=="confirmed"])
+        settled    = len([t for t in trade_records if t.status=="confirmed" and t.actual_profit_thb is not None])
+        actual_pnl = sum(t.actual_profit_thb for t in trade_records
+                         if t.status=="confirmed" and t.actual_profit_thb is not None)
+    # C13: rotation info
+    rotation_size = int(os.getenv("SPORT_ROTATION_SIZE", "0"))
+    if rotation_size > 0 and len(SPORTS) > rotation_size:
+        rot_str = f"Rotation    : {_sport_rotation_idx}/{len(SPORTS)} (batch {rotation_size})\n"
+    else:
+        rot_str = f"Sports      : {len(SPORTS)} (all)\n"
     await update.message.reply_text(
         f"📊 *ARB BOT v10.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
         f"ล่าสุด      : {last_scan_time}\n"
+        f"{rot_str}"
         f"รอ confirm  : {len(pending)} | trade: {confirmed} | unsettled: {len(_pending_settlement)}\n"
+        f"Settled P&L : ฿{actual_pnl:+,} ({settled} เกม)\n"
         f"Line moves  : {len(line_movements)} events\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Min profit  : {MIN_PROFIT_PCT:.1%} | Max odds: {MAX_ODDS_ALLOWED}\n"
+        f"ทุน/trade   : ฿{int(TOTAL_STAKE_THB):,} | Bankroll: ฿{int(BANKROLL_THB):,}\n"
+        f"Kelly       : {'✅ ON' if USE_KELLY else '❌ OFF'} (f={KELLY_FRACTION})\n"
         f"Cooldown    : {ALERT_COOLDOWN_MIN}m | Staleness: {MAX_ODDS_AGE_MIN}m\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 Credits: *{api_remaining}*/500\n"
