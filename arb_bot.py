@@ -795,8 +795,9 @@ async def detect_line_movements(odds_by_sport: dict):
         await send_line_move_alerts(new_movements)
 
     # จำกัด history
-    if len(line_movements) > 200:
-        line_movements[:] = line_movements[-200:]
+    with _data_lock:
+        if len(line_movements) > 200:
+            line_movements[:] = line_movements[-200:]
 
 
 async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
@@ -2157,9 +2158,11 @@ async def do_scan() -> int:
         sent = 0
         for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
             key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
-            if key not in seen_signals:
-                with _data_lock:
+            with _data_lock:
+                is_new = key not in seen_signals
+                if is_new:
                     seen_signals.add(key)
+            if is_new:
                 await send_alert(opp)
                 await asyncio.sleep(1)
                 sent += 1
@@ -2510,8 +2513,7 @@ async def settle_completed_trades():
                                      f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(trade.sport)})\n"
                                      f"กรุณาตรวจสอบผลเองใน Dashboard")
                         except Exception: pass
-                    settled_ids.append(signal_id)
-                    continue
+                    continue  # ไม่ append settled_ids — ค้างใน _pending_settlement จนคนกด settle เอง
 
                 # คำนวณ P&L จริง
                 actual_profit = calc_actual_pnl(trade, winner)
@@ -2952,7 +2954,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # Health check endpoint สำหรับ Railway (ไม่ต้อง auth) — D2: richer
-        if self.path == "/health":
+        from urllib.parse import urlparse as _up_health
+        if _up_health(self.path).path == "/health":
             uptime_s = int(time.time() - _bot_start_ts)
             uptime_str = f"{uptime_s//3600}h{(uptime_s%3600)//60}m"
             with _data_lock:
@@ -2963,6 +2966,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             with _data_lock:
                 confirmed_ct = len([t for t in trade_records if t.status=="confirmed"])
+                pending_snap = len(pending)
             health = {
                 "status":            "ok" if not _db_write_halted else "degraded",
                 "uptime":            uptime_str,
@@ -2972,7 +2976,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "last_scan":         last_scan_time,
                 "scan_in_progress":  _scan_in_progress,
                 "scan_count":        scan_count,
-                "pending":           len(pending),  # health: minor race ok (atomic int read)
+                "pending":           pending_snap,
                 "api_remaining":     api_remaining,
                 "auto_scan":         auto_scan,
                 "confirmed_trades":  confirmed_ct,
@@ -3002,6 +3006,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 opp_snap   = list(opportunity_log[-50:])
                 tr_snap    = list(trade_records[-30:])
                 ps_snap    = list(_pending_settlement.values())  # Fix 4: full unsettled list
+                pending_ct = len(pending)
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
             clv_values = []
             for t in confirmed:
@@ -3042,7 +3047,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "auto_scan":       auto_scan,
                 "scan_count":      scan_count,
                 "last_scan_time":  last_scan_time,
-                "pending_count":   len(pending),
+                "pending_count":   pending_ct,
                 "api_remaining":   api_remaining,
                 "quota_warn_at":   QUOTA_WARN_AT,
                 "total_stake_thb": int(TOTAL_STAKE_THB),
