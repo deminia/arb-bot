@@ -135,13 +135,22 @@ COMMISSION = {
     "onexbet":    _d("FEE_1XBET",     "0.00"),
     "1xbet":      _d("FEE_1XBET",     "0.00"),
     "dafabet":    _d("FEE_DAFABET",   "0.00"),
+    "kalshi":     _d("FEE_KALSHI",    "0.07"),  # Kalshi ~7% maker/taker
+    "stake":      _d("FEE_STAKE",     "0.00"),
+    "cloudbet":   _d("FEE_CLOUDBET",  "0.00"),
 }
 
+MAX_STAKE_KALSHI   = _d("MAX_STAKE_KALSHI",   "0")
+MAX_STAKE_STAKE    = _d("MAX_STAKE_STAKE",    "0")
+MAX_STAKE_CLOUDBET = _d("MAX_STAKE_CLOUDBET", "0")
 MAX_STAKE_MAP = {
-    "pinnacle": MAX_STAKE_PINNACLE,
-    "onexbet":  MAX_STAKE_1XBET,
-    "1xbet":    MAX_STAKE_1XBET,
-    "dafabet":  MAX_STAKE_DAFABET,
+    "pinnacle":  MAX_STAKE_PINNACLE,
+    "onexbet":   MAX_STAKE_1XBET,
+    "1xbet":     MAX_STAKE_1XBET,
+    "dafabet":   MAX_STAKE_DAFABET,
+    "kalshi":    MAX_STAKE_KALSHI,
+    "stake":     MAX_STAKE_STAKE,
+    "cloudbet":  MAX_STAKE_CLOUDBET,
 }
 
 
@@ -1062,10 +1071,21 @@ def build_betting_links(event_name: str, outcome: str, sport: str,
     # Dafabet
     links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/sports)")
 
-    # Polymarket (ถ้าเป็นกีฬาที่มี market)
+    # Polymarket
     if parts:
         search_q = parts[0].replace(" ", "+")
         links.append(f"  🟣 [Polymarket](https://polymarket.com/search?query={search_q})")
+
+    # Kalshi (US regulated prediction market)
+    if KALSHI_API_KEY:
+        links.append(f"  🔵 [Kalshi](https://kalshi.com/sports)")
+
+    # Stake.com + Cloudbet (ถ้าตั้ง EXTRA_BOOKMAKERS)
+    extra = _s("EXTRA_BOOKMAKERS", "")
+    if "stake" in extra:
+        links.append(f"  ⚫ [Stake.com](https://stake.com/sports)")
+    if "cloudbet" in extra:
+        links.append(f"  ☁️ [Cloudbet](https://www.cloudbet.com/en/sports)")
 
     return "\n".join(links)
 
@@ -1127,92 +1147,258 @@ async def fetch_poly_market_detail(session: aiohttp.ClientSession, condition_id:
 
 
 async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
-    """ดึง Polymarket markets พร้อม liquidity จริง"""
+    """ดึง Polymarket sports events ผ่าน Gamma API (แม่นยำกว่า CLOB /markets)"""
     try:
-        # Step 1: ดึง sports markets เท่านั้น
+        # Step 1: ดึง sports series list จาก Gamma API
+        gamma_markets: list[dict] = []
         async with session.get(
-            "https://clob.polymarket.com/markets",
-            params={"active": True, "closed": False, "tag_slug": "sports"},
+            "https://gamma-api.polymarket.com/events",
+            params={"active": "true", "closed": "false", "limit": 100,
+                    "tag_slug": "sports", "order": "volume24hr", "ascending": "false"},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
-            data = await r.json(content_type=None)
-            markets = data.get("data", [])
+            if r.status == 200:
+                gamma_markets = await r.json(content_type=None)
 
-        if not markets:
-            # fallback — ดึงทั้งหมดถ้า tag ไม่ work
+        if not gamma_markets:
+            # fallback ถ้า Gamma ไม่ตอบ — ลอง CLOB เดิม
             async with session.get(
                 "https://clob.polymarket.com/markets",
-                params={"active": True, "closed": False},
+                params={"active": True, "closed": False, "tag_slug": "sports"},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
                 data = await r.json(content_type=None)
-                markets = data.get("data", [])
+                raw = data.get("data", [])
+            enriched = []
+            for m in raw[:80]:
+                tokens = m.get("tokens", [])
+                if len(tokens) < 2: continue
+                fee_rate = float(m.get("maker_base_fee", 0)) + float(m.get("taker_base_fee", 200))
+                volume_24h = float(m.get("volume_num_24hr", 0) or 0)
+                total_vol  = float(m.get("volume", 0) or 0)
+                if volume_24h < 500 and total_vol < 5000: continue
+                p_a = float(tokens[0].get("price", 0))
+                p_b = float(tokens[1].get("price", 0))
+                if p_a <= 0.01 or p_b <= 0.01: continue
+                m["_fee_pct"]    = fee_rate / 10000
+                m["_volume_24h"] = volume_24h
+                m["_liquidity"]  = min(volume_24h, total_vol / 30)
+                enriched.append(m)
+            log.info(f"[Polymarket] CLOB fallback: {len(enriched)} markets")
+            return enriched
 
-        # Step 2: ดึง fee จริง (Polymarket fee 2% standard แต่บาง market ต่างกัน)
+        # Step 2: แปลง Gamma events → format เดิมที่ find_polymarket ใช้
         enriched = []
-        for m in markets[:80]:  # limit 80 เพื่อไม่ให้ช้า
-            tokens = m.get("tokens", [])
-            if len(tokens) < 2: continue
+        for ev in gamma_markets[:100]:
+            markets_in_ev = ev.get("markets", [])
+            # เอาเฉพาะ binary market (2 outcomes)
+            binary = [m for m in markets_in_ev if len(m.get("outcomes", [])) == 2
+                      or len(m.get("tokens", [])) == 2]
+            if not binary:
+                # Gamma event อาจเก็บ tokens ที่ระดับ event
+                tokens = ev.get("tokens", [])
+                if len(tokens) == 2:
+                    binary = [ev]
+            for m in binary:
+                tokens = m.get("tokens", [])
+                # Gamma API: tokens อาจอยู่ที่ market level หรือ event level
+                if not tokens:
+                    # สร้าง synthetic tokens จาก outcomes + prices
+                    outcomes = m.get("outcomes", [])
+                    out_prices = m.get("outcomePrices", m.get("outcome_prices", []))
+                    if len(outcomes) == 2 and len(out_prices) == 2:
+                        tokens = [
+                            {"outcome": outcomes[0], "price": out_prices[0],
+                             "token_id": m.get("clobTokenIds", ["",""])[0] if m.get("clobTokenIds") else ""},
+                            {"outcome": outcomes[1], "price": out_prices[1],
+                             "token_id": m.get("clobTokenIds", ["",""])[1] if m.get("clobTokenIds") else ""},
+                        ]
+                if len(tokens) < 2: continue
 
-            # ดึง fee rate จาก market data
-            fee_rate = float(m.get("maker_base_fee", 0)) + float(m.get("taker_base_fee", 200))
-            fee_pct  = fee_rate / 10000  # basis points → decimal
+                p_a = float(tokens[0].get("price", 0) or 0)
+                p_b = float(tokens[1].get("price", 0) or 0)
+                if p_a <= 0.01 or p_b <= 0.01: continue
 
-            # ดึง volume 24h เป็น proxy ของ liquidity
-            volume_24h = float(m.get("volume_num_24hr", 0) or 0)
-            total_vol  = float(m.get("volume", 0) or 0)
+                volume_24h = float(m.get("volume24hr", ev.get("volume24hr", 0)) or 0)
+                total_vol  = float(m.get("volume",    ev.get("volume",    0)) or 0)
+                if volume_24h < 200 and total_vol < 2000: continue
 
-            # กรอง market ที่ volume ต่ำเกินไป (< $500 USD)
-            MIN_VOLUME = 500
-            if volume_24h < MIN_VOLUME and total_vol < MIN_VOLUME * 10:
-                continue
+                fee_rate = float(m.get("makerBaseFee", 0) or 0) + float(m.get("takerBaseFee", 200) or 200)
 
-            # คำนวณ mid price จาก token prices
-            p_a = float(tokens[0].get("price", 0))
-            p_b = float(tokens[1].get("price", 0))
-            if p_a <= 0.01 or p_b <= 0.01: continue  # กรอง odds ที่สูงเกิน (>100x)
+                enriched.append({
+                    "question":        m.get("question", ev.get("title", ev.get("question", ""))),
+                    "slug":            m.get("slug", ev.get("slug", "")),
+                    "tokens":          tokens,
+                    "_fee_pct":        fee_rate / 10000,
+                    "_volume_24h":     volume_24h,
+                    "_liquidity":      max(volume_24h, total_vol / 30),
+                    "_gamma":          True,
+                })
 
-            m["_fee_pct"]    = fee_pct
-            m["_volume_24h"] = volume_24h
-            m["_liquidity"]  = min(volume_24h, total_vol / 30)  # est. daily liquidity
-            enriched.append(m)
-
-        # C11: enrich top 20 markets with real orderbook liquidity
+        # Step 3: enrich top 20 ด้วย real orderbook liquidity
         enriched.sort(key=lambda x: x.get("_liquidity", 0), reverse=True)
-        top = enriched[:20]
-        rest = enriched[20:]
+        top, rest = enriched[:20], enriched[20:]
         async def _empty_book(): return {}
-        book_tasks = []
-        for m in top:
-            toks = m.get("tokens", [])
-            if toks:
-                book_tasks.append(fetch_poly_market_detail(session, toks[0].get("token_id", "")))
-            else:
-                book_tasks.append(_empty_book())
+        book_tasks = [
+            fetch_poly_market_detail(session, m["tokens"][0].get("token_id", ""))
+            if m["tokens"][0].get("token_id") else _empty_book()
+            for m in top
+        ]
         books = await asyncio.gather(*book_tasks, return_exceptions=True)
         for m, book in zip(top, books):
             if isinstance(book, dict) and book:
-                # override liquidity with real orderbook depth
                 real_liq = book.get("bid_liquidity", 0) + book.get("ask_liquidity", 0)
                 if real_liq > 0:
                     m["_liquidity"] = real_liq
                 m["_orderbook"] = book
         enriched = top + rest
 
-        log.info(f"[Polymarket] markets={len(markets)} | filtered={len(enriched)} | enriched orderbook={len(top)}")
+        log.info(f"[Polymarket] Gamma API: events={len(gamma_markets)} | filtered={len(enriched)} | enriched={len(top)}")
         return enriched
 
     except Exception as e:
-        log.debug(f"[Polymarket] {e}")
+        log.warning(f"[Polymarket] {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════
+#  KALSHI FETCH
+# ══════════════════════════════════════════════════════════════════
+KALSHI_API_KEY = _s("KALSHI_API_KEY", "")  # ต้องตั้งใน .env
+
+async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
+    """ดึง Kalshi sports markets — binary prediction markets (US regulated)
+    Docs: https://trading-api.kalshi.com/trade-api/v2
+    """
+    if not KALSHI_API_KEY:
+        return []
+    try:
+        headers = {"Authorization": f"Bearer {KALSHI_API_KEY}"}
+        sport_categories = ["sports", "basketball", "football", "soccer", "baseball", "mma"]
+        all_markets: list[dict] = []
+        for cat in sport_categories:
+            async with session.get(
+                "https://trading-api.kalshi.com/trade-api/v2/markets",
+                params={"status": "open", "category": cat, "limit": 100},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200: continue
+                data = await r.json(content_type=None)
+                all_markets.extend(data.get("markets", []))
+
+        enriched = []
+        seen_ids = set()
+        for m in all_markets:
+            mid = m.get("ticker", "")
+            if mid in seen_ids: continue
+            seen_ids.add(mid)
+
+            # Kalshi binary: yes_bid/yes_ask ใน cents (0-100)
+            yes_bid = float(m.get("yes_bid", 0) or 0) / 100
+            yes_ask = float(m.get("yes_ask", 0) or 0) / 100
+            if yes_bid <= 0 or yes_ask <= 0: continue
+            no_bid  = 1 - yes_ask
+            no_ask  = 1 - yes_bid
+            if no_bid <= 0.01 or yes_bid <= 0.01: continue
+
+            # mid price → decimal odds
+            yes_mid = (yes_bid + yes_ask) / 2
+            no_mid  = (no_bid  + no_ask)  / 2
+
+            volume = float(m.get("volume", 0) or 0)
+            open_interest = float(m.get("open_interest", 0) or 0)
+            liquidity = max(volume / 30, open_interest / 10)
+            if liquidity < 500: continue  # กรอง thin markets
+
+            title    = m.get("title", "")
+            subtitle = m.get("subtitle", "")
+            question = f"{title} — {subtitle}" if subtitle else title
+
+            enriched.append({
+                "question":    question,
+                "slug":        mid,
+                "tokens": [
+                    {"outcome": "Yes", "price": yes_mid, "token_id": f"{mid}_yes"},
+                    {"outcome": "No",  "price": no_mid,  "token_id": f"{mid}_no"},
+                ],
+                "_fee_pct":    float(COMMISSION.get("kalshi", Decimal("0.07"))),
+                "_volume_24h": float(m.get("volume_24h", 0) or 0),
+                "_liquidity":  liquidity,
+                "_kalshi":     True,
+                "_market_url": f"https://kalshi.com/markets/{mid}",
+                "_ticker":     mid,
+            })
+
+        log.info(f"[Kalshi] markets={len(all_markets)} | filtered={len(enriched)}")
+        return enriched
+
+    except Exception as e:
+        log.warning(f"[Kalshi] {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════
+#  STAKE.COM + CLOUDBET FETCH (ผ่าน The Odds API — ถ้ามี)
+# ══════════════════════════════════════════════════════════════════
+async def async_fetch_extra_books(session: aiohttp.ClientSession, sport_key: str) -> list[dict]:
+    """ดึง odds จาก Stake.com และ Cloudbet ผ่าน The Odds API
+    ต้องเพิ่ม stake,cloudbet ใน EXTRA_BOOKMAKERS env var
+    """
+    extra = _s("EXTRA_BOOKMAKERS", "")
+    if not extra:
+        return []
+    try:
+        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+        params = {
+            "apiKey": ODDS_API_KEY, "regions": "eu,uk,au,us",
+            "markets": "h2h", "oddsFormat": "decimal",
+            "bookmakers": extra,
+        }
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200: return []
+            data = await r.json(content_type=None)
+            if isinstance(data, list):
+                log.debug(f"[ExtraBooks] {sport_key} extra={extra} events={len(data)}")
+                return data
+        return []
+    except Exception as e:
+        log.debug(f"[ExtraBooks] {sport_key}: {e}")
         return []
 
 async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
     async with aiohttp.ClientSession() as session:
+        n = len(sports)
         results = await asyncio.gather(
             *[async_fetch_odds(session, s) for s in sports],
             async_fetch_polymarket(session),
+            async_fetch_kalshi(session),
+            *([async_fetch_extra_books(session, s) for s in sports] if _s("EXTRA_BOOKMAKERS","") else []),
         )
-    return {s: results[i] for i,s in enumerate(sports)}, results[-1]
+    odds_by_sport = {s: results[i] for i, s in enumerate(sports)}
+    poly_markets  = results[n]       # Polymarket
+    kalshi_markets = results[n + 1]  # Kalshi
+
+    # Merge extra bookmaker events into odds_by_sport
+    if _s("EXTRA_BOOKMAKERS", ""):
+        for i, s in enumerate(sports):
+            extra_events = results[n + 2 + i]
+            if not extra_events: continue
+            existing = {(e.get("home_team",""), e.get("away_team","")): e for e in odds_by_sport[s]}
+            for ev in extra_events:
+                key = (ev.get("home_team",""), ev.get("away_team",""))
+                if key in existing:
+                    # merge bookmakers into existing event
+                    existing_bms = {bm["key"] for bm in existing[key].get("bookmakers", [])}
+                    for bm in ev.get("bookmakers", []):
+                        if bm["key"] not in existing_bms:
+                            existing[key].setdefault("bookmakers", []).append(bm)
+                else:
+                    odds_by_sport[s].append(ev)
+
+    # Combine Polymarket + Kalshi into single alt-markets list
+    all_alt_markets = list(poly_markets) + list(kalshi_markets)
+    return odds_by_sport, all_alt_markets
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1404,18 +1590,28 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     if impact_ratio > 0.03:
         log.info(f"[PolyImpact] {best.get('question','?')[:40]} liq=${liq_usd:.0f} impact={impact_ratio:.1%} adj={float(impact_adj):.3f}")
 
+    is_kalshi = best.get("_kalshi", False)
+    if is_kalshi:
+        ticker = best.get("_ticker", slug)
+        market_url = best.get("_market_url", f"https://kalshi.com/markets/{ticker}")
+        bm_name = "Kalshi"
+    else:
+        market_url = f"https://polymarket.com/event/{slug}"
+        bm_name = "Polymarket"
+
     return {
-        "market_url":   f"https://polymarket.com/event/{slug}",
+        "market_url":   market_url,
+        "bookmaker":    bm_name,
         "fee_pct":      float(fee_pct),
         "liquidity":    liq_usd,
         "volume_24h":   vol_24h,
         "impact_ratio": impact_ratio,
-        "team_a": {"name": tokens[0].get("outcome",ta),
+        "team_a": {"name": tokens[0].get("outcome", ta),
                    "odds_raw": odds_raw_a, "odds": odds_a,
-                   "token_id": tokens[0].get("token_id","")},
-        "team_b": {"name": tokens[1].get("outcome",tb),
+                   "token_id": tokens[0].get("token_id", "")},
+        "team_b": {"name": tokens[1].get("outcome", tb),
                    "odds_raw": odds_raw_b, "odds": odds_b,
-                   "token_id": tokens[1].get("token_id","")},
+                   "token_id": tokens[1].get("token_id", "")},
     }
 
 def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
@@ -1463,10 +1659,11 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     if not is_valid_odds(p["odds"]): continue
                     matched = next((k for k in best if fuzzy_match(p["name"],k)), team)
                     if matched not in best or p["odds"] > best[matched].odds:
-                        best[matched] = OddsLine(bookmaker="Polymarket", outcome=matched,
+                        bm_name = poly.get("bookmaker", "Polymarket")
+                        best[matched] = OddsLine(bookmaker=bm_name, outcome=matched,
                                                  odds=p["odds"], odds_raw=p["odds_raw"],
                                                  market_url=poly["market_url"],
-                                                 raw={"token_id":p["token_id"]})
+                                                 raw={"token_id": p["token_id"]})
 
             outcomes = list(best.keys())
             for i in range(len(outcomes)):
@@ -1778,9 +1975,13 @@ async def execute_both(opp: ArbOpportunity) -> str:
         bk  = leg.raw.get("bm_key", bm)
         cap = apply_max_stake(stake/USD_TO_THB, leg.bookmaker)*USD_TO_THB
         cap_note = f"\n  ⚠️ Capped ที่ ฿{int(cap):,}" if cap < stake else ""
-        if "polymarket" in bm:
+        if "kalshi" in bm:
+            link = leg.market_url or "https://kalshi.com"
+            usd_amt = round(stake / float(USD_TO_THB), 2)
+            return f"  🔗 [เปิด Kalshi]({link})\n  2. เลือก *{leg.outcome}*\n  3. วาง *${usd_amt}* (≈฿{int(stake)}){cap_note}"
+        elif "polymarket" in bm:
             link = leg.market_url or "https://polymarket.com"
-            usdc_amt = round(stake / USD_TO_THB, 2)
+            usdc_amt = round(stake / float(USD_TO_THB), 2)
             return f"  🔗 [เปิด Polymarket]({link})\n  2. เลือก *{leg.outcome}*\n  3. วาง *{usdc_amt} USDC* (≈฿{int(stake)}){cap_note}"
         elif "pinnacle" in bk:
             link = f"https://www.pinnacle.com/en/mixed-martial-arts/matchup/{eid}" if eid else "https://www.pinnacle.com"
