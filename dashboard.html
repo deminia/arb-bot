@@ -373,7 +373,7 @@ function renderTab(tab, d) {
       [{data:[rlmCount,steamCount,normalCount],backgroundColor:['#bc8cff','#58a6ff','#30363d'],borderWidth:0}],
       {legend:true});
 
-    const lmRows = lm.slice(-20).reverse().map(m=>{
+    const lmRows = lm.slice().reverse().map(m=>{
       const pct=(m.pct_change*100).toFixed(1);
       const sign=m.pct_change>0?'+':'';
       const tags=(m.is_steam?'<span class="badge bsteam">🌊Steam</span> ':'')+(m.is_rlm?'<span class="badge brlm">🔄RLM</span>':'');
