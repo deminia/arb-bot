@@ -104,8 +104,11 @@ _SPORTS_DEFAULT = (
     "basketball_nba,basketball_euroleague,basketball_ncaab,"
     "americanfootball_nfl,"
     "soccer_epl,soccer_uefa_champs_league,soccer_spain_la_liga,soccer_germany_bundesliga,"
-    "soccer_fifa_world_cup,"
-    "baseball_mlb,mma_mixed_martial_arts"
+    "soccer_italy_serie_a,soccer_france_ligue_one,soccer_fifa_world_cup,"
+    "baseball_mlb,"
+    "icehockey_nhl,"
+    "cricket_test_match,cricket_odi,"
+    "mma_mixed_martial_arts"
 )
 SPORTS     = [s.strip() for s in _s("SPORTS",_SPORTS_DEFAULT).split(",") if s.strip()]
 BOOKMAKERS = _s("BOOKMAKERS","pinnacle,onexbet,dafabet")
@@ -115,9 +118,13 @@ SPORT_EMOJI = {
     "americanfootball_nfl":"🏈","americanfootball_nfl_super_bowl_winner":"🏈",
     "soccer_epl":"⚽","soccer_uefa_champs_league":"⚽",
     "soccer_spain_la_liga":"⚽","soccer_germany_bundesliga":"⚽",
+    "soccer_italy_serie_a":"⚽","soccer_france_ligue_one":"⚽",
     "soccer_fifa_world_cup":"⚽",
     "tennis_atp_wimbledon":"🎾","tennis_wta":"🎾",
-    "baseball_mlb":"⚾","mma_mixed_martial_arts":"🥊",
+    "baseball_mlb":"⚾",
+    "icehockey_nhl":"🏒",
+    "cricket_test_match":"🏏","cricket_odi":"🏏",
+    "mma_mixed_martial_arts":"🥊",
     "esports_csgo":"🎮","esports_dota2":"🎮","esports_lol":"🎮",
 }
 
@@ -126,7 +133,12 @@ H2H_FOCUS_SPORTS = {
     "basketball_nba", "basketball_euroleague", "basketball_ncaab",
     "tennis_atp_wimbledon", "tennis_wta",
     "americanfootball_nfl",
+    "baseball_mlb", "icehockey_nhl",
 }
+
+# กีฬา 3-way (Home/Draw/Away) — ต้องประมวลผลต่างกัน
+SOCCER_SPORTS = {s for s in ["soccer"] if True}  # prefix match
+THREE_WAY_SPORTS_PREFIX = "soccer"  # sport_key ที่ขึ้นต้นด้วยนี้คือ 3-way market
 
 # 6. Commission แบบ dynamic (อ่านจาก env ได้)
 COMMISSION = {
@@ -1530,6 +1542,74 @@ def is_on_cooldown(event: str, bm1: str, bm2: str) -> bool:
         return True
     return False
 
+def find_draw_market(event_name: str, alt_markets: list) -> Optional[dict]:
+    """ค้นหา Draw/X market บน Polymarket หรือ Kalshi สำหรับ soccer 3-way
+    ค้นหา market ที่พูดถึง Draw หรือ X ของ event นี้
+    Returns: dict เดียวกับ find_polymarket แต่สำหรับ outcome Draw
+    """
+    parts = [p.strip() for p in event_name.replace(" vs ", "|").split("|")]
+    if len(parts) < 2: return None
+    ta, tb = parts[0], parts[1]
+
+    DRAW_KEYWORDS = ("draw", " x ", "tie", "no winner", "drawn")
+
+    best, best_score = None, 0
+    for m in alt_markets:
+        tokens = m.get("tokens", [])
+        if len(tokens) < 2: continue
+        liquidity = m.get("_liquidity", 0)
+        if liquidity < POLY_MIN_LIQUIDITY: continue
+
+        title = m.get("question", "").lower()
+        # ต้องพูดถึงทีมทั้งสอง + คำว่า draw/x/tie
+        has_ta  = fuzzy_match(ta, title, 0.3)
+        has_tb  = fuzzy_match(tb, title, 0.3)
+        has_draw = any(kw in title for kw in DRAW_KEYWORDS)
+        if not (has_ta and has_tb and has_draw): continue
+
+        score = (1 if has_ta else 0) + (1 if has_tb else 0) + min(3, liquidity / 10000)
+        if score > best_score:
+            best_score, best = score, m
+
+    if not best: return None
+
+    tokens  = best.get("tokens", [])
+    # หา token ที่เป็น "Yes" (Draw จะเกิด) — token[0] มักเป็น Yes
+    # ราคาของ Yes = probability draw → odds = 1/price
+    pa = Decimal(str(tokens[0].get("price", 0) or 0))
+    if pa <= 0.01: return None
+
+    fee_pct = Decimal(str(best.get("_fee_pct", 0.02)))
+    liq_usd = best.get("_liquidity", 0)
+    est_stake_usd = float(MIN_KELLY_STAKE) / float(USD_TO_THB)
+    impact_ratio = min(est_stake_usd / liq_usd, 0.10) if liq_usd > 0 else 0.05
+    impact_adj = Decimal(str(1 - impact_ratio * 0.5))
+
+    odds_raw = (Decimal("1") / pa).quantize(Decimal("0.001"))
+    odds_eff = (odds_raw * (Decimal("1") - fee_pct) * impact_adj).quantize(Decimal("0.001"))
+
+    is_kalshi = best.get("_kalshi", False)
+    slug = best.get("slug", "")
+    if is_kalshi:
+        ticker = best.get("_ticker", slug)
+        market_url = best.get("_market_url", f"https://kalshi.com/markets/{ticker}")
+        bm_name = "Kalshi"
+    else:
+        market_url = f"https://polymarket.com/event/{slug}"
+        bm_name = "Polymarket"
+
+    return {
+        "market_url": market_url,
+        "bookmaker":  bm_name,
+        "fee_pct":    float(fee_pct),
+        "liquidity":  liq_usd,
+        "outcome":    "Draw",
+        "odds_raw":   odds_raw,
+        "odds":       odds_eff,
+        "token_id":   tokens[0].get("token_id", ""),
+    }
+
+
 def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     parts = [p.strip() for p in event_name.replace(" vs ","|").split("|")]
     if len(parts) < 2: return None
@@ -1628,6 +1708,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                 log.debug(f"[Stale] {event_name}")
                 continue
 
+            is_soccer = sport_key.startswith(THREE_WAY_SPORTS_PREFIX)
             best: dict[str, OddsLine] = {}
             for bm in event.get("bookmakers",[]):
                 bk, bn = bm.get("key",""), bm.get("title", bm.get("key",""))
@@ -1636,8 +1717,11 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     mkt_last_update = mkt.get("last_update", "")
                     for out in mkt.get("outcomes",[]):
                         name     = out.get("name","")
-                        # กรอง Draw/Tie
-                        if name.lower() in ("draw","tie","no contest","nc"): continue
+                        is_draw  = name.lower() in ("draw","tie","no contest","nc")
+                        # กรอง Draw สำหรับกีฬา 2-way เท่านั้น — soccer เก็บไว้
+                        if is_draw and not is_soccer: continue
+                        # กรอง "no contest"/"nc" เสมอ (ไม่ใช่ outcome ที่ bet ได้)
+                        if name.lower() in ("no contest","nc"): continue
                         odds_raw = Decimal(str(out.get("price",1)))
                         # 2. Odds filter
                         if not is_valid_odds(odds_raw): continue
@@ -1646,11 +1730,13 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                             log.debug(f"[Stale-odds] {event_name} {bn} last_update={mkt_last_update}")
                             continue
                         odds_eff = apply_slippage(odds_raw, bk)
-                        if name not in best or odds_eff > best[name].odds:
-                            best[name] = OddsLine(bookmaker=bn, outcome=name,
-                                                  odds=odds_eff, odds_raw=odds_raw,
-                                                  raw={"bm_key":bk,"event_id":event.get("id","")},
-                                                  last_update=mkt_last_update or commence)
+                        # Normalize Draw → "Draw" เพื่อให้ merge ได้ถูกต้อง
+                        key_name = "Draw" if is_draw else name
+                        if key_name not in best or odds_eff > best[key_name].odds:
+                            best[key_name] = OddsLine(bookmaker=bn, outcome=key_name,
+                                                      odds=odds_eff, odds_raw=odds_raw,
+                                                      raw={"bm_key":bk,"event_id":event.get("id","")},
+                                                      last_update=mkt_last_update or commence)
 
             poly = find_polymarket(event_name, poly_markets)
             if poly:
@@ -1664,6 +1750,21 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                                  odds=p["odds"], odds_raw=p["odds_raw"],
                                                  market_url=poly["market_url"],
                                                  raw={"token_id": p["token_id"]})
+
+            # Soccer 3-way: ค้นหา Draw market บน alt-markets
+            if is_soccer:
+                draw_mkt = find_draw_market(event_name, poly_markets)
+                if draw_mkt and is_valid_odds(draw_mkt["odds"]):
+                    # เปรียบกับ Draw ที่ดีที่สุดจาก bookmakers
+                    if "Draw" not in best or draw_mkt["odds"] > best["Draw"].odds:
+                        best["Draw"] = OddsLine(
+                            bookmaker=draw_mkt["bookmaker"],
+                            outcome="Draw",
+                            odds=draw_mkt["odds"],
+                            odds_raw=draw_mkt["odds_raw"],
+                            market_url=draw_mkt["market_url"],
+                            raw={"token_id": draw_mkt["token_id"]},
+                        )
 
             outcomes = list(best.keys())
             for i in range(len(outcomes)):
