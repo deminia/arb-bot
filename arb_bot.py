@@ -138,12 +138,12 @@ H2H_FOCUS_SPORTS = {
 }
 
 # กีฬา 3-way (Home/Draw/Away) — ต้องประมวลผลต่างกัน
-SOCCER_SPORTS = {s for s in ["soccer"] if True}  # prefix match
 THREE_WAY_SPORTS_PREFIX = "soccer"  # sport_key ที่ขึ้นต้นด้วยนี้คือ 3-way market
 
 KALSHI_API_KEY    = _s("KALSHI_API_KEY",    "")
-KALSHI_API_SECRET = _s("KALSHI_API_SECRET", "")
+KALSHI_API_SECRET = _s("KALSHI_API_SECRET", "")  # reserved for signed/private endpoints
 USE_KALSHI        = bool(KALSHI_API_KEY)  # secret optional for read-only endpoints
+SEEN_TTL_SEC      = int(os.getenv("SEEN_TTL_SEC", str(4 * 3600)))  # default 4h
 
 # 6. Commission แบบ dynamic (อ่านจาก env ได้)
 COMMISSION = {
@@ -485,12 +485,14 @@ async def turso_query(sql: str, params: tuple = ()) -> list:
 def db_init_local():
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as con:
+            con.execute("PRAGMA journal_mode=WAL;")  # ลด database-locked errors ใน 24/7 mode
+            con.execute("PRAGMA synchronous=NORMAL;")  # เร็วขึ้น ยังปลอดภัย
             for stmt in CREATE_TABLES_SQL.strip().split(";"):
                 stmt = stmt.strip()
                 if stmt:
                     con.execute(stmt)
             con.commit()
-        log.info(f"[DB] SQLite local at {DB_PATH}")
+        log.info(f"[DB] SQLite local at {DB_PATH} (WAL mode)")
     except Exception as e:
         log.error(f"[DB] local init: {e}")
 
@@ -814,10 +816,14 @@ async def detect_line_movements(odds_by_sport: dict):
                                         pct_change=pct, direction=direction,
                                         is_steam=is_steam, is_rlm=is_sharp_move,
                                     )
+                                    # ผนวม liquidity จาก odds_history ถ้ามี (Polymarket tracks it)
+                                    liq_key = f"{ename}|{outcome}"
+                                    liq_usd = getattr(odds_history.get(liq_key, {}).get("_liquidity", None), 'real', 0) or 0
                                     ctx = {
                                         "commence_time": commence,
                                         "num_bm_moved": num_bm_moved,
                                         "bm_key": bk,
+                                        "liquidity_usd": float(liq_usd),
                                     }
                                     new_movements.append((lm, ctx))
                                     with _data_lock:
@@ -1448,6 +1454,23 @@ def calc_arb(odds_a: Decimal, odds_b: Decimal):
     s_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_a, (TOTAL_STAKE - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
+def calc_arb_3way(odds_h: Decimal, odds_d: Decimal, odds_a: Decimal):
+    """คำนวณ 3-way arb (soccer 1X2): Home / Draw / Away
+    Returns: (profit_pct, stake_h, stake_d, stake_a) ทั้งหมดใน USD (TOTAL_STAKE)
+    """
+    inv_h = Decimal("1") / odds_h
+    inv_d = Decimal("1") / odds_d
+    inv_a = Decimal("1") / odds_a
+    margin = inv_h + inv_d + inv_a
+    if margin >= 1:
+        return Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0")
+    profit = (Decimal("1") - margin) / margin
+    s_h = (TOTAL_STAKE * inv_h / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    s_d = (TOTAL_STAKE * inv_d / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    s_a = (TOTAL_STAKE - s_h - s_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return profit, s_h, s_d, s_a
+
+
 def calc_arb_fixed(odds_a: Decimal, odds_b: Decimal, total: Decimal):
     """Calc arb with custom total stake (ใช้หลัง cap)"""
     inv_a, inv_b = Decimal("1")/odds_a, Decimal("1")/odds_b
@@ -1464,7 +1487,6 @@ def natural_round(amount: Decimal) -> Decimal:
     >= 50,000 → ปัดเป็นทวีคูณ 1,000 (เช่น 52,300 → 52,000)
     + random jitter ±1 step เพื่อให้ไม่ซ้ำกันทุกครั้ง
     """
-    import random
     step = Decimal("500") if amount < Decimal("50000") else Decimal("1000")
     # ปัดลงก่อน แล้วสุ่ม +0 หรือ +1 step (50/50)
     base = (amount // step) * step
@@ -1661,12 +1683,12 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     out_a = tokens[0].get("outcome","").lower()
     out_b = tokens[1].get("outcome","").lower()
     if out_a in ("yes","no") and out_b in ("yes","no"):
-        # ยอมรับเฉพาะ question รูปแบบ "Will [Team A] win?" ในกีฬา  2-way (NBA/NFL/etc.)
+        # Yes/No market — รับเฉพาะถ้า question พูดถึงทั้งสองทีม ("Will A beat B?")
+        # ถ้ามีแค่ทีมเดียวใน question → skip (ไม่รู้ว่า No = ทีมไหน)
         question = best.get("question","").lower()
-        is_soccer_mkt = best.get("_gamma") and any(kw in question for kw in ("draw"," tie","vs"))
-        team_in_question = fuzzy_match(ta, question, 0.5) and not fuzzy_match(tb, question, 0.5)
-        if not team_in_question:
-            log.debug(f"[PolyYesNo] skip ambiguous Yes/No market: {best.get('question','')[:50]}")
+        both_teams = fuzzy_match(ta, question, 0.5) and fuzzy_match(tb, question, 0.5)
+        if not both_teams:
+            log.debug(f"[PolyYesNo] skip single-team Yes/No market: {best.get('question','')[:50]}")
             return None
     pa       = Decimal(str(tokens[0].get("price",0)))
     pb       = Decimal(str(tokens[1].get("price",0)))
@@ -1783,11 +1805,10 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                                  market_url=poly["market_url"],
                                                  raw={"token_id": p["token_id"]})
 
-            # Soccer 3-way: ค้นหา Draw market บน alt-markets
+            # Soccer 3-way: ค้นหา Draw market บน alt-markets ถ้ายังไม่มีใน best
             if is_soccer:
                 draw_mkt = find_draw_market(event_name, poly_markets)
                 if draw_mkt and is_valid_odds(draw_mkt["odds"]):
-                    # เปรียบกับ Draw ที่ดีที่สุดจาก bookmakers
                     if "Draw" not in best or draw_mkt["odds"] > best["Draw"].odds:
                         best["Draw"] = OddsLine(
                             bookmaker=draw_mkt["bookmaker"],
@@ -1798,56 +1819,94 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                             raw={"token_id": draw_mkt["token_id"]},
                         )
 
-            outcomes = list(best.keys())
-            for i in range(len(outcomes)):
-                for j in range(i+1, len(outcomes)):
-                    a, b = outcomes[i], outcomes[j]
-                    if best[a].bookmaker == best[b].bookmaker: continue
-                    # 3. Cooldown check
-                    if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
-                    profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
-                    if profit >= MIN_PROFIT_PCT:
-                        # Kelly — ปรับ total stake ตาม edge
-                        kelly_total = calc_kelly_stake(best[a].odds, best[b].odds, profit)  # USD
-                        if kelly_total != TOTAL_STAKE:
-                            profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds,
-                                                               kelly_total)  # already USD
-                        # 5. Apply max stake — recalc ใหม่ถ้าถูก cap
-                        s_a_capped = apply_max_stake(s_a, best[a].bookmaker)
-                        s_b_capped = apply_max_stake(s_b, best[b].bookmaker)
-                        # ถ้า cap ทำให้ stake เปลี่ยน → recalculate อีกรอบ
-                        if s_a_capped != s_a or s_b_capped != s_b:
-                            # หา limited stake แล้ว recalc ให้สมดุล
-                            if s_a_capped < s_a:
-                                # Leg A ถูก cap → จำกัด total stake แล้ว recalc
-                                limited = s_a_capped * USD_TO_THB
-                                ratio   = Decimal("1") / best[a].odds
-                                margin  = Decimal("1")/best[a].odds + Decimal("1")/best[b].odds
-                                new_total = (limited / USD_TO_THB) / ratio * margin
-                                profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, new_total)
+            if is_soccer:
+                # ══ Soccer 3-way branch: ตรวจเฉพาะ Home/Draw/Away ครบครัน ══
+                # เพิ่ม 2-way arb สำหรับ soccer ด้วย — ถ้า Draw ไม่ครบ
+                home_key = next((k for k in best if k.lower() not in ("draw",) and fuzzy_match(k, home, 0.4)), None)
+                away_key = next((k for k in best if k.lower() not in ("draw",) and fuzzy_match(k, away, 0.4)), None)
+                draw_key = "Draw" if "Draw" in best else None
+
+                if home_key and away_key and draw_key:
+                    # True 3-way arb: 1/H + 1/D + 1/A < 1
+                    bh, bd, ba = best[home_key], best[draw_key], best[away_key]
+                    # ต้องไม่ใช่ bookmaker เดียวกันทั้งสามฝั่ง
+                    bms = {bh.bookmaker, bd.bookmaker, ba.bookmaker}
+                    if len(bms) >= 2:  # อย่างน้อย 2 เว็บต่างกัน
+                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker):
+                            profit3, sh, sd, sa = calc_arb_3way(bh.odds, bd.odds, ba.odds)
+                            if profit3 >= MIN_PROFIT_PCT:
+                                opp = ArbOpportunity(
+                                    signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                    event=event_name, commence=commence,
+                                    leg1=bh, leg2=ba,
+                                    profit_pct=profit3, stake1=sh, stake2=sa,
+                                )
+                                found.append(opp)
+                                alert_cooldown[f"{event_name}|{bh.bookmaker}|{ba.bookmaker}"] = datetime.now(timezone.utc)
+                                log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%}")
+                # ยังสแกน 2-way สำหรับ soccer เผื่อรอบครอบ cross-book (H vs A, H vs Draw, etc.) ถ้า Draw ไม่ครบ
+                outcomes = list(best.keys())
+                for i in range(len(outcomes)):
+                    for j in range(i+1, len(outcomes)):
+                        a, b = outcomes[i], outcomes[j]
+                        if best[a].bookmaker == best[b].bookmaker: continue
+                        if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
+                        profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
+                        if profit >= MIN_PROFIT_PCT:
+                            opp = ArbOpportunity(
+                                signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                event=event_name, commence=commence,
+                                leg1=best[a], leg2=best[b],
+                                profit_pct=profit, stake1=s_a, stake2=s_b,
+                            )
+                            found.append(opp)
+                            alert_cooldown[f"{event_name}|{best[a].bookmaker}|{best[b].bookmaker}"] = datetime.now(timezone.utc)
+                            log.info(f"[ARB-2WAY] {event_name} ({a} vs {b}) profit={profit:.2%}")
+            else:
+                # ══ Non-soccer: 2-way arb เหมือนเดิม ══
+                outcomes = list(best.keys())
+                for i in range(len(outcomes)):
+                    for j in range(i+1, len(outcomes)):
+                        a, b = outcomes[i], outcomes[j]
+                        if best[a].bookmaker == best[b].bookmaker: continue
+                        # 3. Cooldown check
+                        if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
+                        profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
+                        if profit >= MIN_PROFIT_PCT:
+                            # Kelly — ปรับ total stake ตาม edge
+                            kelly_total = calc_kelly_stake(best[a].odds, best[b].odds, profit)
+                            if kelly_total != TOTAL_STAKE:
+                                profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, kelly_total)
+                            # 5. Apply max stake — recalc ใหม่ถ้าถูก cap
+                            s_a_capped = apply_max_stake(s_a, best[a].bookmaker)
+                            s_b_capped = apply_max_stake(s_b, best[b].bookmaker)
+                            if s_a_capped != s_a or s_b_capped != s_b:
+                                if s_a_capped < s_a:
+                                    limited = s_a_capped * USD_TO_THB
+                                    ratio   = Decimal("1") / best[a].odds
+                                    margin  = Decimal("1")/best[a].odds + Decimal("1")/best[b].odds
+                                    new_total = (limited / USD_TO_THB) / ratio * margin
+                                    profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, new_total)
+                                else:
+                                    limited = s_b_capped * USD_TO_THB
+                                    ratio   = Decimal("1") / best[b].odds
+                                    margin  = Decimal("1")/best[a].odds + Decimal("1")/best[b].odds
+                                    new_total = (limited / USD_TO_THB) / ratio * margin
+                                    profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, new_total)
+                                if profit < MIN_PROFIT_PCT:
+                                    log.debug(f"[ARB] {event_name} skipped after cap — profit={profit:.2%}")
+                                    continue
                             else:
-                                limited = s_b_capped * USD_TO_THB
-                                ratio   = Decimal("1") / best[b].odds
-                                margin  = Decimal("1")/best[a].odds + Decimal("1")/best[b].odds
-                                new_total = (limited / USD_TO_THB) / ratio * margin
-                                profit, s_a, s_b = calc_arb_fixed(best[a].odds, best[b].odds, new_total)
-                            # ตรวจสอบอีกครั้งว่ายังกำไรอยู่ไหม
-                            if profit < MIN_PROFIT_PCT:
-                                log.debug(f"[ARB] {event_name} skipped after cap — profit={profit:.2%}")
-                                continue
-                        else:
-                            s_a, s_b = s_a_capped, s_b_capped
-                        # B1: สร้าง opp นอก if/else cap block — ทั้ง cap และไม่ cap ถ้า profit ผ่าน
-                        opp = ArbOpportunity(
-                            signal_id=str(uuid.uuid4())[:8], sport=sport_key,
-                            event=event_name, commence=commence,
-                            leg1=best[a], leg2=best[b],
-                            profit_pct=profit, stake1=s_a, stake2=s_b,
-                        )
-                        found.append(opp)
-                        # บันทึก cooldown
-                        alert_cooldown[f"{event_name}|{best[a].bookmaker}|{best[b].bookmaker}"] = datetime.now(timezone.utc)
-                        log.info(f"[ARB] {event_name} | profit={profit:.2%}")
+                                s_a, s_b = s_a_capped, s_b_capped
+                            opp = ArbOpportunity(
+                                signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                event=event_name, commence=commence,
+                                leg1=best[a], leg2=best[b],
+                                profit_pct=profit, stake1=s_a, stake2=s_b,
+                            )
+                            found.append(opp)
+                            alert_cooldown[f"{event_name}|{best[a].bookmaker}|{best[b].bookmaker}"] = datetime.now(timezone.utc)
+                            log.info(f"[ARB] {event_name} | profit={profit:.2%}")
     # Scan summary per sport
     sport_counts: dict[str, int] = {}
     for opp in found:
@@ -2523,7 +2582,7 @@ async def do_scan() -> int:
 
         all_opps = scan_all(odds_by_sport, poly_markets)
         sent = 0
-        _SEEN_TTL = 4 * 3600  # 4 ชั่วโมง — resend ถ้า signal เดิมกลับมาหลัง 4h
+        _SEEN_TTL = SEEN_TTL_SEC  # อ่านจาก env SEEN_TTL_SEC (default 4h)
         _now_ts = time.time()
         for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
             key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
@@ -2858,9 +2917,23 @@ async def settle_completed_trades():
 
                 # #28 Handle special outcomes
                 if winner == "DRAW":
-                    log.info(f"[Settle] {trade.event} — DRAW, profit=0")
-                    # A1: DRAW ต้อง set actual_profit_thb=0 และ update in-memory
-                    trade.actual_profit_thb = 0
+                    # soccer 3-way: คำนวณ actual P&L เหมือน cmd_settle draw
+                    tt_draw = trade.stake1_thb + trade.stake2_thb
+                    draw_leg = None
+                    if trade.leg1_team and trade.leg1_team.lower() == "draw":
+                        draw_leg = (trade.leg1_odds, trade.stake1_thb)
+                    elif trade.leg2_team and trade.leg2_team.lower() == "draw":
+                        draw_leg = (trade.leg2_odds, trade.stake2_thb)
+                    if draw_leg:
+                        draw_odds, draw_stake = draw_leg
+                        actual_draw = int(draw_odds * draw_stake) - tt_draw
+                        draw_label = f"P&L: *\u0e3f{actual_draw:+,}*"
+                        log.info(f"[Settle] {trade.event} — DRAW (leg matched), profit={actual_draw:+,}")
+                    else:
+                        actual_draw = 0  # 2-way sport draw = refund
+                        draw_label = "P&L: *\u0e3f0* (refund)"
+                        log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
+                    trade.actual_profit_thb = actual_draw
                     trade.settled_at = datetime.now(timezone.utc).isoformat()
                     db_save_trade(trade)
                     with _data_lock:
@@ -2871,8 +2944,8 @@ async def settle_completed_trades():
                     for cid in ALL_CHAT_IDS:
                         try:
                             await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                text=f"🤝 *DRAW — P&L: ฿0*\n`{trade.event}`\n"
-                                     f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเปล่า")
+                                text=f"🤝 *DRAW — {draw_label}*\n`{trade.event}`\n"
+                                     f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเป่า")
                         except Exception: pass
                     settled_ids.append(signal_id)
                     continue
@@ -3296,7 +3369,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     actual = int(t.leg1_odds * t.stake1_thb) - tt
                 elif result == "leg2":
                     actual = int(t.leg2_odds * t.stake2_thb) - tt
-                else:
+                elif result == "draw":
+                    # soccer 3-way: คำนวณเหมือน cmd_settle
+                    draw_leg = None
+                    if t.leg1_team and t.leg1_team.lower() == "draw":
+                        draw_leg = (t.leg1_odds, t.stake1_thb)
+                    elif t.leg2_team and t.leg2_team.lower() == "draw":
+                        draw_leg = (t.leg2_odds, t.stake2_thb)
+                    if draw_leg:
+                        d_odds, d_stake = draw_leg
+                        actual = int(d_odds * d_stake) - tt
+                    else:
+                        actual = 0
+                else:  # void
                     actual = 0
                 t.actual_profit_thb = actual
                 t.settled_at = datetime.now(timezone.utc).isoformat()
