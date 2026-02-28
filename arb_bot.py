@@ -236,6 +236,11 @@ class TradeRecord:
     settled_at:  Optional[str] = None
     created_at:  str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     commence_time: str = ""   # v10-2: เวลาแข่งจริง เพื่อ restore settlement ถูกต้อง
+    # 3-way fields (Optional — None = 2-way trade)
+    leg3_bm:     Optional[str]   = None
+    leg3_team:   Optional[str]   = None
+    leg3_odds:   Optional[float] = None
+    stake3_thb:  Optional[int]   = None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -283,7 +288,9 @@ CREATE TABLE IF NOT EXISTS trade_records (
     stake1_thb INTEGER, stake2_thb INTEGER, profit_pct REAL, status TEXT,
     clv_leg1 REAL, clv_leg2 REAL, actual_profit_thb INTEGER,
     settled_at TEXT, created_at TEXT,
-    commence_time TEXT DEFAULT ''
+    commence_time TEXT DEFAULT '',
+    leg3_bm TEXT DEFAULT NULL, leg3_team TEXT DEFAULT NULL,
+    leg3_odds REAL DEFAULT NULL, stake3_thb INTEGER DEFAULT NULL
 );
 CREATE TABLE IF NOT EXISTS opportunity_log (
     id TEXT PRIMARY KEY, event TEXT, sport TEXT, profit_pct REAL,
@@ -522,13 +529,14 @@ def db_save_trade(t: "TradeRecord"):
 
 async def _async_save_trade(t: "TradeRecord"):
     await turso_exec(
-        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (t.signal_id,t.event,t.sport,t.leg1_bm,t.leg2_bm,
          t.leg1_team,t.leg2_team,
          t.leg1_odds,t.leg2_odds,t.stake1_thb,t.stake2_thb,
          t.profit_pct,t.status,t.clv_leg1,t.clv_leg2,
          t.actual_profit_thb,t.settled_at,t.created_at,
-         t.commence_time)  # v10-2
+         t.commence_time,
+         t.leg3_bm,t.leg3_team,t.leg3_odds,t.stake3_thb)
     )
 
 def db_save_opportunity(opp: dict):
@@ -578,9 +586,13 @@ def db_load_state(key: str, default: str = "") -> str:
 async def db_load_all() -> tuple[list, list, list]:
     """โหลดทุกอย่างจาก DB (async)"""
     try:
-        # v10-2: migrate DB schema — เพิ่มคอลัมน์ใหม่ถ้ายังไม่มี (ไม่พังถ้ามีอยู่แล้ว)
+        # migrate DB schema — เพิ่มคอลัมน์ใหม่ถ้ายังไม่มี (ไม่พังถ้ามีอยู่แล้ว)
         for _col, _sql in [
             ("commence_time", "ALTER TABLE trade_records ADD COLUMN commence_time TEXT DEFAULT ''"),
+            ("leg3_bm",   "ALTER TABLE trade_records ADD COLUMN leg3_bm TEXT DEFAULT NULL"),
+            ("leg3_team", "ALTER TABLE trade_records ADD COLUMN leg3_team TEXT DEFAULT NULL"),
+            ("leg3_odds", "ALTER TABLE trade_records ADD COLUMN leg3_odds REAL DEFAULT NULL"),
+            ("stake3_thb","ALTER TABLE trade_records ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
         ]:
             try: await turso_exec(_sql)
             except Exception: pass  # column exists already
@@ -595,6 +607,7 @@ async def db_load_all() -> tuple[list, list, list]:
             #            9=stake1_thb,10=stake2_thb,11=profit_pct,12=status,
             #            13=clv_leg1,14=clv_leg2,15=actual_profit_thb,
             #            16=settled_at,17=created_at,18=commence_time
+            #            19=leg3_bm,20=leg3_team,21=leg3_odds,22=stake3_thb
             if n >= 18:
                 trades.append(TradeRecord(
                     signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
@@ -606,7 +619,11 @@ async def db_load_all() -> tuple[list, list, list]:
                     clv_leg2=float(r[14]) if r[14] is not None else None,
                     actual_profit_thb=int(float(r[15])) if r[15] is not None else None,
                     settled_at=r[16],created_at=r[17],
-                    commence_time=r[18] if n >= 19 else ""))
+                    commence_time=r[18] if n >= 19 else "",
+                    leg3_bm=r[19] if n >= 20 else None,
+                    leg3_team=r[20] if n >= 21 else None,
+                    leg3_odds=float(r[21]) if n >= 22 and r[21] is not None else None,
+                    stake3_thb=int(float(r[22])) if n >= 23 and r[22] is not None else None))
             else:
                 # DB เก่า — ไม่มี leg1_team/leg2_team
                 ev = r[1] if n>1 else ""
@@ -1468,7 +1485,7 @@ def calc_arb_3way(odds_h: Decimal, odds_d: Decimal, odds_a: Decimal):
     profit = (Decimal("1") - margin) / margin
     s_h = (TOTAL_STAKE * inv_h / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     s_d = (TOTAL_STAKE * inv_d / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    s_a = (TOTAL_STAKE - s_h - s_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    s_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_h, s_d, s_a
 
 
@@ -1688,11 +1705,14 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     out_a = tokens[0].get("outcome","").lower()
     out_b = tokens[1].get("outcome","").lower()
     if out_a in ("yes","no") or out_b in ("yes","no"):
-        # Yes/No market — รับเฉพาะถ้า question ระบุทั้ง 2 ทีม เช่น "Will Arsenal beat Chelsea?"
+        # Yes/No market: soccer มี draw — Yes ≠ home win เสมอไป (No อาจ = draw or away)
+        # รับเฉพาะระบุทั้ง 2 ทีม และ sport ไม่ใช่ soccer (basketball/MMA/tennis)
         question = best.get("question","").lower()
+        sport_name = best.get("_sport", "").lower()
+        is_soccer_like = any(s in sport_name for s in ("soccer", "football"))
         both_teams = fuzzy_match(ta, question, 0.5) and fuzzy_match(tb, question, 0.5)
-        if not both_teams:
-            log.debug(f"[PolyYesNo] skip ambiguous Yes/No market: {best.get('question','')[:60]}")
+        if is_soccer_like or not both_teams:
+            log.debug(f"[PolyYesNo] skip Yes/No market (soccer={is_soccer_like} both_teams={both_teams}): {best.get('question','')[:60]}")
             return None
     pa       = Decimal(str(tokens[0].get("price",0)))
     pb       = Decimal(str(tokens[1].get("price",0)))
@@ -1981,9 +2001,12 @@ async def send_alert(opp: ArbOpportunity):
 
     s1 = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2 = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
+    s3_alert = (opp.stake3*USD_TO_THB).quantize(Decimal("1")) if opp.stake3 else None
     w1 = (opp.stake1*opp.leg1.odds*USD_TO_THB).quantize(Decimal("1"))
     w2 = (opp.stake2*opp.leg2.odds*USD_TO_THB).quantize(Decimal("1"))
-    tt = s1 + s2  # ใช้ stake จริง (ไม่ใช่ TOTAL_STAKE_THB) — สำคัญมากเมื่อใช้ Kelly
+    w3_alert = (opp.stake3*opp.leg3.odds*USD_TO_THB).quantize(Decimal("1")) if opp.stake3 and opp.leg3 else None
+    is_3way_alert = s3_alert is not None
+    tt = s1 + s2 + (s3_alert if is_3way_alert else Decimal("0"))
 
     # แปลงเวลาแข่งเป็น UTC+7 พร้อม countdown
     try:
@@ -2002,37 +2025,57 @@ async def send_alert(opp: ArbOpportunity):
         commence_line = f"📅 {opp.commence} UTC"
 
     urgent_prefix = f"{urgency_tag}\n" if urgency_tag else ""
+    arb_type = "3-WAY ARB" if is_3way_alert else "ARB FOUND"
+    if is_3way_alert:
+        table_rows = (
+            f"{'\ud83c\udfe0 '+opp.leg1.bookmaker[:10]:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'\u0e3f'+str(int(s1)):>8} {'\u0e3f'+str(int(w1)):>8}\n"
+            f"{'\u26aa '+opp.leg3.bookmaker[:10]:<12} {'Draw'[:15]:<15} {float(opp.leg3.odds):>5.3f} {'\u0e3f'+str(int(s3_alert)):>8} {'\u0e3f'+str(int(w3_alert)):>8}\n"
+            f"{'\ud83d\udfe0 '+opp.leg2.bookmaker[:10]:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'\u0e3f'+str(int(s2)):>8} {'\u0e3f'+str(int(w2)):>8}\n"
+        )
+        outcome_lines = (
+            f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,}\n"
+            f"   Draw → ฿{int(w3_alert):,}\n"
+            f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,}"
+        )
+    else:
+        table_rows = (
+            f"{'\ud83d\udd35 '+opp.leg1.bookmaker[:10]:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'\u0e3f'+str(int(s1)):>8} {'\u0e3f'+str(int(w1)):>8}\n"
+            f"{'\ud83d\udfe0 '+opp.leg2.bookmaker[:10]:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'\u0e3f'+str(int(s2)):>8} {'\u0e3f'+str(int(w2)):>8}\n"
+        )
+        outcome_lines = (
+            f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
+            f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*"
+        )
     msg = (
         f"{urgent_prefix}"
-        f"{emoji} *ARB FOUND — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
+        f"{emoji} *{arb_type} — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{commence_line}  {urgency_note}\n"
         f"🏆 {md_escape(opp.event)}\n"
-        f"💵 ทุน: *฿{int(tt):,}* {'_(Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
+        f"💵 ทุน: *฿{int(tt):,}* {'_(เป็น Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"```\n"
-        f"{'ช่องทาง':<12} {'ฝั่ง':<15} {'Odds':>5} {'วาง':>8} {'ได้':>8}\n"
-        f"{'─'*51}\n"
-        f"{'🔵 '+opp.leg1.bookmaker[:10]:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'฿'+str(int(s1)):>8} {'฿'+str(int(w1)):>8}\n"
-        f"{'🟠 '+opp.leg2.bookmaker[:10]:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'฿'+str(int(s2)):>8} {'฿'+str(int(w2)):>8}\n"
-        f"{'─'*51}\n"
-        f"{'รวม':<34} {'฿'+str(int(tt)):>8}\n"
+        f"{'\u0e0a\u0e48\u0e2d\u0e07\u0e17\u0e32\u0e07':<12} {'\u0e1d\u0e31\u0e48\u0e07':<15} {'Odds':>5} {'\u0e27\u0e32\u0e07':>8} {'\u0e44\u0e14\u0e49':>8}\n"
+        f"{'\u2500'*51}\n"
+        f"{table_rows}"
+        f"{'\u2500'*51}\n"
+        f"{'\u0e23\u0e27\u0e21':<34} {'\u0e3f'+str(int(tt)):>8}\n"
         f"```\n"
         f"📊 ไม่ว่าใครชนะ\n"
-        f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
-        f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*\n"
-        f"🔗 {' | '.join(u for u in [opp.leg1.market_url, opp.leg2.market_url] if u) or '—'}\n"
+        f"{outcome_lines}\n"
+        f"🔗 {' | '.join(u for u in [opp.leg1.market_url, opp.leg2.market_url] if u) or '\u2014'}\n"
         f"🆔 `{opp.signal_id}`"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{opp.signal_id}"),
         InlineKeyboardButton("❌ Reject",  callback_data=f"reject:{opp.signal_id}"),
     ]])
-    # 9. Multi-chat
+    # 9. Multi-chat (rate-limited)
     for cid in ALL_CHAT_IDS:
         try:
             await _app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown",
                                         reply_markup=keyboard if cid==CHAT_ID else None)
+            await asyncio.sleep(0.1)  # ป้องกัน Telegram Flood Control
         except Exception as e:
             log.error(f"[Alert] chat {cid}: {e}")
 
@@ -2111,29 +2154,29 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
 #  EXECUTE
 # ══════════════════════════════════════════════════════════════════
 async def execute_both(opp: ArbOpportunity) -> str:
-    # 🛡️ Slippage Guard — ตรวจราคาล่าสุดก่อน execute
-    live1, live2 = await refetch_live_odds(opp)
-    live_profit, _, _ = calc_arb(live1, live2)
+    is_3way = opp.leg3 is not None and opp.stake3 is not None
 
-    # #32 Abort ถ้า live profit ต่ำกว่า 0% หรือ ลดจาก original มากกว่า 50%
+    # 🛡️ Slippage Guard — 2-way only (ไม่ใช้ calc_arb 2-way ตัดสิน 3-way)
     orig_profit = opp.profit_pct
-    drop_too_much = (orig_profit > 0 and
-                    float(orig_profit - live_profit) / float(orig_profit) > 0.50)
-    if live_profit < Decimal("0") or drop_too_much:
-        log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%} (was {float(orig_profit):.2%})")
-        raise ValueError(
-            f"🚫 *ABORT: Odds Dropped*\n"
-            f"ราคาเปลี่ยนขณะรอยืนยัน\n"
-            f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit):.2%}*\n"
-            f"{'(profit ติดลบ)' if live_profit < 0 else '(profit ลด >50%)'}\n"
-            f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
-        )
-
-    # แจ้งถ้า profit ลดลงมากกว่า 30% จากที่คำนวณไว้
-    profit_drop = float(opp.profit_pct - live_profit) / float(opp.profit_pct) if opp.profit_pct > 0 else 0
+    live_profit = orig_profit  # default
     slippage_warn = ""
-    if profit_drop > 0.30:
-        slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit):.2%})"
+    if not is_3way:
+        live1, live2 = await refetch_live_odds(opp)
+        live_profit, _, _ = calc_arb(live1, live2)
+        drop_too_much = (orig_profit > 0 and
+                        float(orig_profit - live_profit) / float(orig_profit) > 0.50)
+        if live_profit < Decimal("0") or drop_too_much:
+            log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%} (was {float(orig_profit):.2%})")
+            raise ValueError(
+                f"🚫 *ABORT: Odds Dropped*\n"
+                f"ราคาเปลี่ยนขณะรอยืนยัน\n"
+                f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit):.2%}*\n"
+                f"{'(profit ติดลบ)' if live_profit < 0 else '(profit ลด >50%)'}\n"
+                f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
+            )
+        profit_drop = float(opp.profit_pct - live_profit) / float(opp.profit_pct) if opp.profit_pct > 0 else 0
+        if profit_drop > 0.30:
+            slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit):.2%})"
 
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
@@ -2184,11 +2227,12 @@ async def execute_both(opp: ArbOpportunity) -> str:
         leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
         stake1_thb=int(s1), stake2_thb=int(s2),
         profit_pct=float(opp.profit_pct), status="confirmed",
-        commence_time=opp.commence,  # v10-2
+        commence_time=opp.commence,
+        leg3_bm=opp.leg3.bookmaker if is_3way else None,
+        leg3_team=opp.leg3.outcome if is_3way else None,
+        leg3_odds=float(opp.leg3.odds_raw) if is_3way else None,
+        stake3_thb=int(s3) if is_3way else None,
     )
-    if is_3way:
-        tr.leg3_odds = float(opp.leg3.odds_raw)
-        tr.stake3_thb = int(s3)
     with _data_lock:
         trade_records.append(tr)
     db_save_trade(tr)            # save to DB
@@ -2248,7 +2292,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
         f"🔵 *{md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1)}\n\n"
         f"🟠 *{md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 ทุน ฿{int(tt):,}  _(ขุด ต้น profit: {float(live_profit):.2%})_\n"
+        f"💵 ทุน ฿{int(tt):,}  _(Live profit: {float(live_profit):.2%})_\n"
         f"   {md_escape(str(opp.leg1.outcome))} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
         f"   {md_escape(str(opp.leg2.outcome))} ชนะ → ฿{int(w2):,} (+฿{int(w2-tt):,})"
     )
@@ -2260,8 +2304,11 @@ async def execute_both(opp: ArbOpportunity) -> str:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # v10-6: เช็ค user_id โดยตรง (ไม่ใช่ chat_id เพราะ chat_id โชว์ให้ใครใน group กดได้)
-    _owner_id = os.getenv("OWNER_USER_ID", str(CHAT_ID))
+    # v10-6: เช็ค user_id โดยตรง (ไม่ใช่ chat_id — CHAT_ID ไม่ใช่ user_id)
+    _owner_id = os.getenv("OWNER_USER_ID", "")
+    if not _owner_id:
+        log.warning("[Auth] OWNER_USER_ID ไม่ได้ตั้ง — fallback CHAT_ID (ควรตั้ง OWNER_USER_ID ใน .env)")
+        _owner_id = str(CHAT_ID)
     if str(query.from_user.id) != str(_owner_id):
         await query.answer("⛔ Not authorized", show_alert=True)
         return
@@ -2633,7 +2680,9 @@ async def do_scan() -> int:
         _SEEN_TTL = SEEN_TTL_SEC  # อ่านจาก env SEEN_TTL_SEC (default 4h)
         _now_ts = time.time()
         for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
-            key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
+            _mtype = "3way" if (opp.leg3 is not None) else "2way"
+            _l3bm  = opp.leg3.bookmaker if opp.leg3 else "-"
+            key = f"{_mtype}|{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}|{_l3bm}"
             with _data_lock:
                 last_seen = seen_signals.get(key, 0)
                 is_new = (_now_ts - last_seen) > _SEEN_TTL
@@ -3095,6 +3144,11 @@ def periodic_cleanup():
             keys_to_remove = list(closing_odds.keys())[:-500]
             for k in keys_to_remove:
                 del closing_odds[k]
+        # trim _refetch_cache — ลบ entries ที่เกิน 30 วินาที
+        now_ts = time.time()
+        expired_rc = [k for k, (ts, _) in _refetch_cache.items() if now_ts - ts > 30]
+        for k in expired_rc:
+            del _refetch_cache[k]
 
 
 async def scanner_loop():
