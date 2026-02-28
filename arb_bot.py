@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  DEMINIA BOT V.1 —  Production Ready                                  ║
+║  DEMINIA BOT V.2 —  Production Ready                                  ║
 ║  1.  Odds Staleness + Slippage Guard   9.  Profitability Guard        ║
 ║  2.  Max/Min Odds Filter              10.  CLV Benchmark + Settlement ║
 ║  3.  Alert Cooldown + Multi-chat      11.  Manual Settle (/settle)    ║
@@ -8,7 +8,7 @@
 ║  5.  Turso persistent DB (sync+async) 13.  Thread-safe _data_lock     ║
 ║  6.  Scanner asyncio.Event wakeup     14.  Dashboard Force Settle UI  ║
 ║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
-║  8.  commence_time in TradeRecord     16.  keep_alive optional        ║
+║  8.  Soccer 3-way Arb (1X2 calc)     16.  Signal TTL + WAL DB        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -2371,7 +2371,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         rot_str = f"Sports      : {len(SPORTS)} (all)\n"
     await update.message.reply_text(
-        f"📊 *Deminia Bot V.1*\n"
+        f"📊 *Deminia Bot V.2*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
