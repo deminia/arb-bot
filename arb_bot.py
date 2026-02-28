@@ -769,6 +769,7 @@ async def detect_line_movements(odds_by_sport: dict):
     now = datetime.now(timezone.utc)
 
     for sport, events in odds_by_sport.items():
+        await asyncio.sleep(0)  # yield ให้ event loop ไปทำงานอื่น (Telegram, etc.) ได้ระหว่างสปอร์ต
         for event in events:
             home  = event.get("home_team","")
             away  = event.get("away_team","")
@@ -1682,14 +1683,10 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     # ⚠️ Yes/No guard: ถ้า outcome labels เป็น Yes/No แต่ question ไม่ระบุเพียงทีมเดียว → skip (หลีก map ผิด)
     out_a = tokens[0].get("outcome","").lower()
     out_b = tokens[1].get("outcome","").lower()
-    if out_a in ("yes","no") and out_b in ("yes","no"):
-        # Yes/No market — รับเฉพาะถ้า question พูดถึงทั้งสองทีม ("Will A beat B?")
-        # ถ้ามีแค่ทีมเดียวใน question → skip (ไม่รู้ว่า No = ทีมไหน)
-        question = best.get("question","").lower()
-        both_teams = fuzzy_match(ta, question, 0.5) and fuzzy_match(tb, question, 0.5)
-        if not both_teams:
-            log.debug(f"[PolyYesNo] skip single-team Yes/No market: {best.get('question','')[:50]}")
-            return None
+    if out_a in ("yes","no") or out_b in ("yes","no"):
+        # Yes/No market — skip ทั้งหมด: Yes ≠ home, No ≠ away เสมอไป (อาจเป็น draw/complement)
+        log.debug(f"[PolyYesNo] skip Yes/No market: {best.get('question','')[:60]}")
+        return None
     pa       = Decimal(str(tokens[0].get("price",0)))
     pb       = Decimal(str(tokens[1].get("price",0)))
     if pa <= 0 or pb <= 0: return None
@@ -1829,10 +1826,10 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                 if home_key and away_key and draw_key:
                     # True 3-way arb: 1/H + 1/D + 1/A < 1
                     bh, bd, ba = best[home_key], best[draw_key], best[away_key]
-                    # ต้องไม่ใช่ bookmaker เดียวกันทั้งสามฝั่ง
                     bms = {bh.bookmaker, bd.bookmaker, ba.bookmaker}
-                    if len(bms) >= 2:  # อย่างน้อย 2 เว็บต่างกัน
-                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker):
+                    if len(bms) >= 2:
+                        ck3 = f"3way|{event_name}|{bh.bookmaker}|{ba.bookmaker}"
+                        if not is_on_cooldown(event_name, f"3way|{bh.bookmaker}", ba.bookmaker):
                             profit3, sh, sd, sa = calc_arb_3way(bh.odds, bd.odds, ba.odds)
                             if profit3 >= MIN_PROFIT_PCT:
                                 opp = ArbOpportunity(
@@ -1842,26 +1839,30 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                     profit_pct=profit3, stake1=sh, stake2=sa,
                                 )
                                 found.append(opp)
-                                alert_cooldown[f"{event_name}|{bh.bookmaker}|{ba.bookmaker}"] = datetime.now(timezone.utc)
+                                alert_cooldown[ck3] = datetime.now(timezone.utc)
                                 log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%}")
-                # ยังสแกน 2-way สำหรับ soccer เผื่อรอบครอบ cross-book (H vs A, H vs Draw, etc.) ถ้า Draw ไม่ครบ
-                outcomes = list(best.keys())
-                for i in range(len(outcomes)):
-                    for j in range(i+1, len(outcomes)):
-                        a, b = outcomes[i], outcomes[j]
-                        if best[a].bookmaker == best[b].bookmaker: continue
-                        if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
-                        profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
-                        if profit >= MIN_PROFIT_PCT:
-                            opp = ArbOpportunity(
-                                signal_id=str(uuid.uuid4())[:8], sport=sport_key,
-                                event=event_name, commence=commence,
-                                leg1=best[a], leg2=best[b],
-                                profit_pct=profit, stake1=s_a, stake2=s_b,
-                            )
-                            found.append(opp)
-                            alert_cooldown[f"{event_name}|{best[a].bookmaker}|{best[b].bookmaker}"] = datetime.now(timezone.utc)
-                            log.info(f"[ARB-2WAY] {event_name} ({a} vs {b}) profit={profit:.2%}")
+                elif home_key and away_key and not draw_key:
+                    # ไม่มี Draw — cross-book H vs A เท่านั้น (ไม่ใช่ 1X2 ครบ 3 หน้า)
+                    bh, ba = best[home_key], best[away_key]
+                    if bh.bookmaker != ba.bookmaker:
+                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker):
+                            profit, s_h, s_a = calc_arb(bh.odds, ba.odds)
+                            if profit >= MIN_PROFIT_PCT:
+                                kelly_total = calc_kelly_stake(bh.odds, ba.odds, profit)
+                                if kelly_total != TOTAL_STAKE:
+                                    profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, kelly_total)
+                                s_h = apply_max_stake(s_h, bh.bookmaker)
+                                s_a = apply_max_stake(s_a, ba.bookmaker)
+                                if profit >= MIN_PROFIT_PCT:
+                                    opp = ArbOpportunity(
+                                        signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                        event=event_name, commence=commence,
+                                        leg1=bh, leg2=ba,
+                                        profit_pct=profit, stake1=s_h, stake2=s_a,
+                                    )
+                                    found.append(opp)
+                                    alert_cooldown[f"{event_name}|{bh.bookmaker}|{ba.bookmaker}"] = datetime.now(timezone.utc)
+                                    log.info(f"[ARB-2WAY-SOCCER] {event_name} H vs A profit={profit:.2%}")
             else:
                 # ══ Non-soccer: 2-way arb เหมือนเดิม ══
                 outcomes = list(best.keys())
@@ -3044,7 +3045,7 @@ async def scanner_loop():
     global _scan_wakeup
     _scan_wakeup = asyncio.Event()
     await asyncio.sleep(3)
-    log.info(f"[Scanner] v10.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
+    log.info(f"[Scanner] v2.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
     while True:
         if auto_scan:
             try: await do_scan()
@@ -3657,7 +3658,7 @@ async def post_init(app: Application):
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *Deminia Bot V.1 — Production Ready*\n"
+            "🤖 *Deminia Bot V.2 — Production Ready*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{restore_note}\n"
             f"Sports    : {' '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
@@ -3676,24 +3677,28 @@ async def post_init(app: Application):
 
 
 def handle_shutdown(signum, frame):
-    """Graceful shutdown — บันทึก state ลง SQLite sync โดยตรง ก่อนปิด"""
+    """สาย shutdown — บันทึก state ขึ้น Turso (sync) หรือ SQLite fallback"""
     log.info("[Shutdown] กำลังบันทึก state...")
+    stmts = []
+    for k, v in [
+        ("scan_count",     str(scan_count)),
+        ("auto_scan",      str(auto_scan)),
+        ("last_scan_time", last_scan_time),
+        ("api_remaining",  str(api_remaining)),
+    ]:
+        stmts.append({"sql": "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", "args": [k, v]})
     try:
-        # C2: เขียน SQLite sync ตรงๆ ไม่ผ่าน async task (ซึ่งอาจไม่ทันรัน)
-        with sqlite3.connect(DB_PATH, timeout=5) as con:
-            for k, v in [
-                ("scan_count",     str(scan_count)),
-                ("auto_scan",      str(auto_scan)),
-                ("last_scan_time", last_scan_time),
-                ("api_remaining",  str(api_remaining)),
-            ]:
-                con.execute(
-                    "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (k, v)
-                )
-            con.commit()
+        if _turso_ok and _turso_url:
+            _turso_http(stmts)  # sync via urllib — ใช้ได้ใน signal handler
+            log.info("[Shutdown] saved to Turso. Bye!")
+        else:
+            with sqlite3.connect(DB_PATH, timeout=5) as con:
+                for s in stmts:
+                    con.execute(s["sql"], s["args"])
+                con.commit()
+            log.info("[Shutdown] saved to SQLite. Bye!")
     except Exception as ex:
         log.error(f"[Shutdown] save failed: {ex}")
-    log.info("[Shutdown] saved. Bye!")
     os._exit(0)
 
 
