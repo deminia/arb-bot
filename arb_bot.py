@@ -12,7 +12,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import asyncio, json, logging, os, re, signal, sqlite3, threading, time, uuid
+import asyncio, json, logging, os, random, re, signal, sqlite3, threading, time, uuid
 import urllib.request, urllib.error
 # v10-6: ใช้ Turso HTTP REST API ตรงๆ — ไม่พึ่ง libsql_client
 _TURSO_API = "http"  # always http mode
@@ -97,8 +97,9 @@ LINE_MOVE_THRESHOLD = _d("LINE_MOVE_THRESHOLD", "0.05")  # 5%
 # 9. Multi-chat
 ALL_CHAT_IDS = [CHAT_ID] + EXTRA_CHAT_IDS
 # Polymarket liquidity filters
-POLY_MIN_LIQUIDITY    = float(os.getenv("POLY_MIN_LIQUIDITY",    "1000"))   # USD
-RLM_MIN_LIQUIDITY_USD = float(os.getenv("RLM_MIN_LIQUIDITY_USD", "10000"))  # USD — RLM signal
+POLY_MIN_LIQUIDITY      = float(os.getenv("POLY_MIN_LIQUIDITY",      "200"))   # USD
+POLY_MIN_DRAW_LIQUIDITY = float(os.getenv("POLY_MIN_DRAW_LIQUIDITY",  "100"))   # USD — Draw market มัก liquidity ต่ำกว่า
+RLM_MIN_LIQUIDITY_USD   = float(os.getenv("RLM_MIN_LIQUIDITY_USD",  "10000"))  # USD — RLM signal
 
 _SPORTS_DEFAULT = (
     "basketball_nba,basketball_euroleague,basketball_ncaab,"
@@ -139,6 +140,10 @@ H2H_FOCUS_SPORTS = {
 # กีฬา 3-way (Home/Draw/Away) — ต้องประมวลผลต่างกัน
 SOCCER_SPORTS = {s for s in ["soccer"] if True}  # prefix match
 THREE_WAY_SPORTS_PREFIX = "soccer"  # sport_key ที่ขึ้นต้นด้วยนี้คือ 3-way market
+
+KALSHI_API_KEY    = _s("KALSHI_API_KEY",    "")
+KALSHI_API_SECRET = _s("KALSHI_API_SECRET", "")
+USE_KALSHI        = bool(KALSHI_API_KEY)  # secret optional for read-only endpoints
 
 # 6. Commission แบบ dynamic (อ่านจาก env ได้)
 COMMISSION = {
@@ -243,7 +248,7 @@ _last_error: str = ""  # D2: last error message
 _db_write_halted: bool = False  # Fix 4: set True when Turso fails 3x
 
 pending:           dict[str, tuple]           = {}  # sid -> (ArbOpportunity, created_at_ts)
-seen_signals:      set[str]                  = set()
+seen_signals:      dict[str, float]          = {}  # key -> timestamp (TTL 4h)
 auto_scan:         bool                      = AUTO_SCAN_START
 scan_count:        int                       = 0
 last_scan_time:    str                       = "ยังไม่ได้สแกน"
@@ -793,7 +798,9 @@ async def detect_line_movements(odds_by_sport: dict):
                                         (b,t) for b,t in steam_tracker[steam_key]
                                         if (now-t).total_seconds() < 300
                                     ]
-                                    num_bm_moved = len(steam_tracker[steam_key])
+                                    # dedupe: นับเฉพาะ unique bookmakers
+                                    unique_bms = {b for b, _ in steam_tracker[steam_key]}
+                                    num_bm_moved = len(unique_bms)
                                     is_steam = num_bm_moved >= 2
 
                                     # 10. RLM: odds ขยับ反向กับ public bet
@@ -846,9 +853,10 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
         num_bm_moved  = ctx.get("num_bm_moved", 1)
         bm_key        = ctx.get("bm_key", "")
 
-        # จัดเกรดสัญญาณ
+        # จัดเกรดสัญญาณ — ส่ง liquidity จาก ctx ถ้ามี
+        liquidity_usd = ctx.get("liquidity_usd", 0)
         grade, grade_emoji, reasons = grade_signal(
-            lm, liquidity_usd=0,
+            lm, liquidity_usd=liquidity_usd,
             commence_time=commence_time,
             num_bm_moved=num_bm_moved,
         )
@@ -902,13 +910,22 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
 
         # คำแนะนำสำหรับ Grade A/B
         if grade in ("A", "B") and (lm.is_rlm or lm.is_steam):
-            action = "BET" if lm.pct_change < 0 else "FADE"
             target = lm.outcome
             if lm.pct_change < 0:
                 msg += (f"\n💡 *แนะนำ:* เดิมพัน *{md_escape(target)}* (odds ลง = เงินใหญ่เดิน)\n"
                         f"Soft books ยังไม่ตาม → โอกาส value bet!\n")
             else:
                 msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
+
+            # Payout calculator (เหมือน arb alert)
+            stake_thb = int(MIN_KELLY_STAKE)  # ใช้ MIN_KELLY_STAKE เป็น reference stake
+            odds_val  = float(lm.odds_after)
+            payout    = int(stake_thb * odds_val)
+            profit    = payout - stake_thb
+            msg += (
+                f"\n💵 *ตัวอย่าง ถ้าวาง ฿{stake_thb:,}:*\n"
+                f"   odds `{odds_val:.3f}` → ได้ *฿{payout:,}* (+฿{profit:,})\n"
+            )
 
             # Direct betting links
             msg += f"\n🔗 *วางเดิมพันได้ที่:*\n"
@@ -1056,41 +1073,46 @@ def grade_signal(lm: LineMovement, liquidity_usd: float = 0,
         return "C", "🅲", reasons
 
 
+def sport_to_path(sport_key: str) -> dict:
+    """แปลง sport_key เป็น path สำหรับแต่ละ bookmaker"""
+    s = sport_key.lower()
+    if "basketball" in s:
+        return {"pinnacle": "basketball", "1xbet": "basketball", "dafabet": "sports/basketball"}
+    if "soccer" in s:
+        return {"pinnacle": "soccer", "1xbet": "football", "dafabet": "sports/football"}
+    if "americanfootball" in s:
+        return {"pinnacle": "american-football", "1xbet": "american-football", "dafabet": "sports/american-football"}
+    if "baseball" in s:
+        return {"pinnacle": "baseball", "1xbet": "baseball", "dafabet": "sports/baseball"}
+    if "icehockey" in s:
+        return {"pinnacle": "ice-hockey", "1xbet": "ice-hockey", "dafabet": "sports/ice-hockey"}
+    if "cricket" in s:
+        return {"pinnacle": "cricket", "1xbet": "cricket", "dafabet": "sports/cricket"}
+    if "tennis" in s:
+        return {"pinnacle": "tennis", "1xbet": "tennis", "dafabet": "sports/tennis"}
+    if "mma" in s or "martial" in s:
+        return {"pinnacle": "mixed-martial-arts", "1xbet": "mixed-martial-arts", "dafabet": "sports/mma"}
+    return {"pinnacle": "sports", "1xbet": "sports", "dafabet": "sports"}
+
+
 def build_betting_links(event_name: str, outcome: str, sport: str,
                         odds: Decimal, bookmaker_key: str = "") -> str:
     """สร้างลิงค์ตรงไปหน้า betting สำหรับ RLM/Steam signal"""
     links = []
     parts = event_name.split(" vs ")
 
-    # Pinnacle
-    pin_sport = "basketball" if "basketball" in sport else \
-                "soccer" if "soccer" in sport else \
-                "american-football" if "americanfootball" in sport else \
-                "baseball" if "baseball" in sport else \
-                "tennis" if "tennis" in sport else \
-                "mixed-martial-arts" if "mma" in sport else "sports"
-    links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{pin_sport})")
-
-    # 1xBet
-    xbet_sport = "basketball" if "basketball" in sport else \
-                 "soccer" if "soccer" in sport else \
-                 "american-football" if "americanfootball" in sport else \
-                 "baseball" if "baseball" in sport else \
-                 "tennis" if "tennis" in sport else \
-                 "mixed-martial-arts" if "mma" in sport else "sports"
-    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{xbet_sport})")
-
-    # Dafabet
-    links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/sports)")
+    sp = sport_to_path(sport)
+    links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{sp['pinnacle']})")
+    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{sp['1xbet']})")
+    links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/{sp['dafabet']})")
 
     # Polymarket
     if parts:
         search_q = parts[0].replace(" ", "+")
         links.append(f"  🟣 [Polymarket](https://polymarket.com/search?query={search_q})")
 
-    # Kalshi (US regulated prediction market)
-    if KALSHI_API_KEY:
-        links.append(f"  🔵 [Kalshi](https://kalshi.com/sports)")
+    # Kalshi (US regulated prediction market — เปิดเสมอ ไม่ต้องมี API key)
+    links.append(f"  🔵 [Kalshi](https://kalshi.com/sports)")
 
     # Stake.com + Cloudbet (ถ้าตั้ง EXTRA_BOOKMAKERS)
     extra = _s("EXTRA_BOOKMAKERS", "")
@@ -1276,13 +1298,11 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════
 #  KALSHI FETCH
 # ══════════════════════════════════════════════════════════════════
-KALSHI_API_KEY = _s("KALSHI_API_KEY", "")  # ต้องตั้งใน .env
-
 async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
     """ดึง Kalshi sports markets — binary prediction markets (US regulated)
     Docs: https://trading-api.kalshi.com/trade-api/v2
     """
-    if not KALSHI_API_KEY:
+    if not USE_KALSHI:
         return []
     try:
         headers = {"Authorization": f"Bearer {KALSHI_API_KEY}"}
@@ -1558,7 +1578,7 @@ def find_draw_market(event_name: str, alt_markets: list) -> Optional[dict]:
         tokens = m.get("tokens", [])
         if len(tokens) < 2: continue
         liquidity = m.get("_liquidity", 0)
-        if liquidity < POLY_MIN_LIQUIDITY: continue
+        if liquidity < POLY_MIN_DRAW_LIQUIDITY: continue
 
         title = m.get("question", "").lower()
         # ต้องพูดถึงทีมทั้งสอง + คำว่า draw/x/tie
@@ -1637,6 +1657,17 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     if not best: return None
 
     tokens   = best.get("tokens",[])
+    # ⚠️ Yes/No guard: ถ้า outcome labels เป็น Yes/No แต่ question ไม่ระบุเพียงทีมเดียว → skip (หลีก map ผิด)
+    out_a = tokens[0].get("outcome","").lower()
+    out_b = tokens[1].get("outcome","").lower()
+    if out_a in ("yes","no") and out_b in ("yes","no"):
+        # ยอมรับเฉพาะ question รูปแบบ "Will [Team A] win?" ในกีฬา  2-way (NBA/NFL/etc.)
+        question = best.get("question","").lower()
+        is_soccer_mkt = best.get("_gamma") and any(kw in question for kw in ("draw"," tie","vs"))
+        team_in_question = fuzzy_match(ta, question, 0.5) and not fuzzy_match(tb, question, 0.5)
+        if not team_in_question:
+            log.debug(f"[PolyYesNo] skip ambiguous Yes/No market: {best.get('question','')[:50]}")
+            return None
     pa       = Decimal(str(tokens[0].get("price",0)))
     pb       = Decimal(str(tokens[1].get("price",0)))
     if pa <= 0 or pb <= 0: return None
@@ -1717,11 +1748,12 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     mkt_last_update = mkt.get("last_update", "")
                     for out in mkt.get("outcomes",[]):
                         name     = out.get("name","")
-                        is_draw  = name.lower() in ("draw","tie","no contest","nc")
-                        # กรอง Draw สำหรับกีฬา 2-way เท่านั้น — soccer เก็บไว้
+                        nl = name.lower()
+                        # กรอง "no contest"/"nc" เสมอ
+                        if nl in ("no contest", "nc"): continue
+                        is_draw = nl in ("draw", "tie")
+                        # กรอง Draw สำหรับกีฬา 2-way — soccer เก็บ Draw ไว้
                         if is_draw and not is_soccer: continue
-                        # กรอง "no contest"/"nc" เสมอ (ไม่ใช่ outcome ที่ bet ได้)
-                        if name.lower() in ("no contest","nc"): continue
                         odds_raw = Decimal(str(out.get("price",1)))
                         # 2. Odds filter
                         if not is_valid_odds(odds_raw): continue
@@ -1816,6 +1848,12 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                         # บันทึก cooldown
                         alert_cooldown[f"{event_name}|{best[a].bookmaker}|{best[b].bookmaker}"] = datetime.now(timezone.utc)
                         log.info(f"[ARB] {event_name} | profit={profit:.2%}")
+    # Scan summary per sport
+    sport_counts: dict[str, int] = {}
+    for opp in found:
+        sport_counts[opp.sport] = sport_counts.get(opp.sport, 0) + 1
+    for sk, cnt in sport_counts.items():
+        log.info(f"[ScanSummary] {sk} opps={cnt}")
     return found
 
 
@@ -2070,6 +2108,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
                 entry["status"] = "confirmed"
     db_update_opp_status(opp.signal_id, "confirmed")  # 💾
 
+    sp = sport_to_path(opp.sport)
     def steps(leg, stake):
         bm  = leg.bookmaker.lower()
         eid = leg.raw.get("event_id","")
@@ -2085,13 +2124,16 @@ async def execute_both(opp: ArbOpportunity) -> str:
             usdc_amt = round(stake / float(USD_TO_THB), 2)
             return f"  🔗 [เปิด Polymarket]({link})\n  2. เลือก *{leg.outcome}*\n  3. วาง *{usdc_amt} USDC* (≈฿{int(stake)}){cap_note}"
         elif "pinnacle" in bk:
-            link = f"https://www.pinnacle.com/en/mixed-martial-arts/matchup/{eid}" if eid else "https://www.pinnacle.com"
+            path = sp["pinnacle"]
+            link = f"https://www.pinnacle.com/en/{path}/matchup/{eid}" if eid else f"https://www.pinnacle.com/en/{path}"
             return f"  🔗 [เปิด Pinnacle]({link})\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
         elif "onexbet" in bk or "1xbet" in bm:
-            link = f"https://1xbet.com/en/line/mixed-martial-arts/{eid}" if eid else "https://1xbet.com/en/line/mixed-martial-arts"
+            path = sp["1xbet"]
+            link = f"https://1xbet.com/en/line/{path}/{eid}" if eid else f"https://1xbet.com/en/line/{path}"
             return f"  🔗 [เปิด 1xBet]({link})\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
         elif "dafabet" in bk:
-            return f"  🔗 [เปิด Dafabet](https://www.dafabet.com/en/sports/mma)\n  2. ค้นหา *{leg.outcome}*\n  3. วาง ฿{int(stake)}{cap_note}"
+            path = sp["dafabet"]
+            return f"  🔗 [เปิด Dafabet](https://www.dafabet.com/en/{path})\n  2. ค้นหา *{leg.outcome}*\n  3. วาง ฿{int(stake)}{cap_note}"
         return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
 
     return (
@@ -2183,8 +2225,8 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if args[0].lower()=="on":
         auto_scan=True; quota_warned=False
-        with _data_lock:  # Fix 3
-            seen_signals.clear()
+        with _data_lock:
+            seen_signals.clear()  # reset TTL timers เมื่อเปิด scan ใหม่
         await update.message.reply_text(f"🟢 *Auto scan เปิด* — ทุก {SCAN_INTERVAL}s", parse_mode="Markdown")
     elif args[0].lower()=="off":
         auto_scan=False
@@ -2357,7 +2399,7 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("ไม่มี trade ที่รอ settle")
             return
         lines = []
-        for sid, (t, dt) in ps_snap.items():
+        for sid, (t, dt) in list(ps_snap.items())[:40]:  # limit 40 เพื่อไม่เกิน Telegram 4096 chars
             dt_th = (dt + timedelta(hours=7)).strftime("%d/%m %H:%M") if dt else "?"
             lines.append(f"`{sid}` — {md_escape(t.event[:30])} ({dt_th})")
         await update.message.reply_text(
@@ -2390,7 +2432,18 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payout = int(t.leg2_odds * t.stake2_thb)
         actual = payout - tt
     elif result == "draw":
-        actual = 0
+        # soccer 3-way: ถ้ามี leg ที่ bet ฝั่ง Draw จริง → คำนวณ payout ให้ถูก
+        draw_leg = None
+        if t.leg1_team and t.leg1_team.lower() == "draw":
+            draw_leg = (1, t.leg1_odds, t.stake1_thb)
+        elif t.leg2_team and t.leg2_team.lower() == "draw":
+            draw_leg = (2, t.leg2_odds, t.stake2_thb)
+        if draw_leg:
+            _, draw_odds, draw_stake = draw_leg
+            payout = int(draw_odds * draw_stake)
+            actual = payout - tt
+        else:
+            actual = 0  # 2-way sport: refund ทั้งหมด (เกมเสมอในกีฬาที่ไม่ใช่ soccer)
     else:  # void
         actual = 0
 
@@ -2470,18 +2523,24 @@ async def do_scan() -> int:
 
         all_opps = scan_all(odds_by_sport, poly_markets)
         sent = 0
+        _SEEN_TTL = 4 * 3600  # 4 ชั่วโมง — resend ถ้า signal เดิมกลับมาหลัง 4h
+        _now_ts = time.time()
         for opp in sorted(all_opps, key=lambda x: x.profit_pct, reverse=True):
             key = f"{opp.event}|{opp.leg1.bookmaker}|{opp.leg2.bookmaker}"
             with _data_lock:
-                is_new = key not in seen_signals
+                last_seen = seen_signals.get(key, 0)
+                is_new = (_now_ts - last_seen) > _SEEN_TTL
                 if is_new:
-                    seen_signals.add(key)
+                    seen_signals[key] = _now_ts
             if is_new:
                 await send_alert(opp)
                 await asyncio.sleep(1)
                 sent += 1
         with _data_lock:
-            if len(seen_signals) > 500: seen_signals.clear()
+            # prune expired entries เพื่อไม่ให้ dict โต
+            expired = [k for k, ts in seen_signals.items() if (_now_ts - ts) > _SEEN_TTL]
+            for k in expired:
+                del seen_signals[k]
         scan_count    += 1
         last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
         save_snapshot()   # 💾 บันทึก state
@@ -3152,7 +3211,7 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
             return True, "scan triggered"
         elif key == "clear_seen":
             with _data_lock:
-                seen_signals.clear()
+                seen_signals.clear()  # clear dict — reset all TTL timers
             return True, "seen_signals cleared"
         else:
             return False, f"unknown key: {key}"
