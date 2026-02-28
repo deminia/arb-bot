@@ -981,10 +981,11 @@ def update_clv(event: str, outcome: str, bookmaker: str, final_odds: Decimal):
     closing_odds[key][bookmaker.lower()] = final_odds
 
 
-def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float]]:
+def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
     CLV = (odds_got / closing_odds - 1) × 100%
     บวก = เอาชนะตลาด | ลบ = แพ้ตลาด
+    Returns: (clv_leg1, clv_leg2, clv_leg3)  — clv_leg3 = None for 2-way trades
     """
     def _clv(event, outcome, bm, odds_got):
         key = f"{event}|{outcome}"
@@ -993,10 +994,12 @@ def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float]]:
             return round((float(odds_got) / float(co) - 1) * 100, 2)
         return None
 
-    # ใช้ leg1_team/leg2_team เป็น outcome key (ชื่อทีม ไม่ใช่ bookmaker)
     clv1 = _clv(trade.event, trade.leg1_team or trade.leg1_bm, trade.leg1_bm, trade.leg1_odds)
     clv2 = _clv(trade.event, trade.leg2_team or trade.leg2_bm, trade.leg2_bm, trade.leg2_odds)
-    return clv1, clv2
+    clv3 = None
+    if trade.leg3_team and trade.leg3_bm and trade.leg3_odds:
+        clv3 = _clv(trade.event, trade.leg3_team, trade.leg3_bm, trade.leg3_odds)
+    return clv1, clv2, clv3
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1285,6 +1288,18 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
 
                 fee_rate = float(m.get("makerBaseFee", 0) or 0) + float(m.get("takerBaseFee", 200) or 200)
 
+                # Infer sport from event tags or slug for Yes/No guard
+                ev_tags = [t.get("slug", "") for t in ev.get("tags", [])]
+                ev_sport = next((tg for tg in ev_tags if tg in (
+                    "soccer", "football", "basketball", "mma", "tennis",
+                    "baseball", "hockey", "rugby",
+                )), "")
+                if not ev_sport:
+                    _slug = m.get("slug", ev.get("slug", "")).lower()
+                    for _sp in ("soccer", "football", "basketball", "mma", "tennis"):
+                        if _sp in _slug:
+                            ev_sport = _sp
+                            break
                 enriched.append({
                     "question":        m.get("question", ev.get("title", ev.get("question", ""))),
                     "slug":            m.get("slug", ev.get("slug", "")),
@@ -1293,6 +1308,7 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
                     "_volume_24h":     volume_24h,
                     "_liquidity":      max(volume_24h, total_vol / 30),
                     "_gamma":          True,
+                    "_sport":          ev_sport,
                 })
 
         # Step 3: enrich top 20 ด้วย real orderbook liquidity
@@ -1858,15 +1874,39 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                         if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker, "3way"):
                             profit3, sh, sd, sa = calc_arb_3way(bh.odds, bd.odds, ba.odds)
                             if profit3 >= MIN_PROFIT_PCT:
-                                opp = ArbOpportunity(
-                                    signal_id=str(uuid.uuid4())[:8], sport=sport_key,
-                                    event=event_name, commence=commence,
-                                    leg1=bh, leg2=ba, leg3=bd,
-                                    profit_pct=profit3, stake1=sh, stake2=sa, stake3=sd,
-                                )
-                                found.append(opp)
-                                alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker, "3way")] = datetime.now(timezone.utc)
-                                log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%}")
+                                # Kelly — scale total stake by edge
+                                kelly_total = calc_kelly_stake(bh.odds, ba.odds, profit3)  # approx 2-leg Kelly
+                                if kelly_total != TOTAL_STAKE:
+                                    ratio = kelly_total / TOTAL_STAKE
+                                    sh = (sh * ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                                    sd = (sd * ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                                    sa = (sa * ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                                    profit3, _, _, _ = calc_arb_3way(bh.odds, bd.odds, ba.odds)  # recompute profit
+                                # apply_max_stake per leg — cap ถ้าเกิน
+                                sh_cap = apply_max_stake(sh, bh.bookmaker)
+                                sd_cap = apply_max_stake(sd, bd.bookmaker)
+                                sa_cap = apply_max_stake(sa, ba.bookmaker)
+                                if sh_cap < sh or sd_cap < sd or sa_cap < sa:
+                                    # ใช้ stake ต่ำสุดเป็น limit และ rescale ทั้ง 3 legs
+                                    min_ratio = min(
+                                        sh_cap / sh if sh > 0 else Decimal("1"),
+                                        sd_cap / sd if sd > 0 else Decimal("1"),
+                                        sa_cap / sa if sa > 0 else Decimal("1"),
+                                    )
+                                    sh = (sh * min_ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                                    sd = (sd * min_ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                                    sa = (sa * min_ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                                    profit3, _, _, _ = calc_arb_3way(bh.odds, bd.odds, ba.odds)
+                                if profit3 >= MIN_PROFIT_PCT:
+                                    opp = ArbOpportunity(
+                                        signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                        event=event_name, commence=commence,
+                                        leg1=bh, leg2=ba, leg3=bd,
+                                        profit_pct=profit3, stake1=sh, stake2=sa, stake3=sd,
+                                    )
+                                    found.append(opp)
+                                    alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker, "3way")] = datetime.now(timezone.utc)
+                                    log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%} stake=({float(sh):.2f},{float(sd):.2f},{float(sa):.2f})")
                 elif home_key and away_key and not draw_key:
                     # ไม่มี Draw — cross-book H vs A เท่านั้น (ไม่ใช่ 1X2 ครบ 3 หน้า)
                     bh, ba = best[home_key], best[away_key]
@@ -1969,6 +2009,8 @@ async def send_alert(opp: ArbOpportunity):
     except Exception:
         mins_to_start = 999
 
+    _s3_thb = int(opp.stake3 * USD_TO_THB) if opp.stake3 else None
+    _tt_thb = int(opp.stake1*USD_TO_THB) + int(opp.stake2*USD_TO_THB) + (_s3_thb or 0)
     entry = {
         "id": opp.signal_id, "event": opp.event, "sport": opp.sport,
         "profit_pct": float(opp.profit_pct),
@@ -1976,6 +2018,9 @@ async def send_alert(opp: ArbOpportunity):
         "leg2_bm": opp.leg2.bookmaker, "leg2_odds": float(opp.leg2.odds),
         "stake1_thb": int(opp.stake1*USD_TO_THB),
         "stake2_thb": int(opp.stake2*USD_TO_THB),
+        "leg3_bm": opp.leg3.bookmaker if opp.leg3 else None,
+        "stake3_thb": _s3_thb,
+        "total_stake_thb": _tt_thb,
         "created_at": opp.created_at, "status": "pending",
         "mins_to_start": round(mins_to_start) if mins_to_start < 9999 else 9999,
     }
@@ -2160,7 +2205,27 @@ async def execute_both(opp: ArbOpportunity) -> str:
     orig_profit = opp.profit_pct
     live_profit = orig_profit  # default
     slippage_warn = ""
-    if not is_3way:
+    if is_3way:
+        # 3-way slippage guard: refetch all 3 legs และ calc_arb_3way ยืนยัน
+        live1, live2 = await refetch_live_odds(opp)
+        live3 = opp.leg3.odds  # default to cached
+        # ดึง draw odds จาก cache ถ้า refetch ไม่ได้ (Polymarket ไม่มี refetch สด)
+        live_profit3, _, _, _ = calc_arb_3way(live1, live3, live2)  # H, D, A
+        drop_too_much_3 = (orig_profit > 0 and
+            float(orig_profit - live_profit3) / float(orig_profit) > 0.50)
+        if live_profit3 < Decimal("0") or drop_too_much_3:
+            log.warning(f"[SlippageGuard-3way] ABORT {opp.event} — live={live_profit3:.2%} (was {float(orig_profit):.2%})")
+            raise ValueError(
+                f"🚫 *ABORT: Odds Dropped (3-way)*\n"
+                f"ราคาเปลี่ยนขณะรอยืนยัน\n"
+                f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit3):.2%}*\n"
+                f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
+            )
+        live_profit = live_profit3
+        profit_drop_3 = float(opp.profit_pct - live_profit3) / float(opp.profit_pct) if opp.profit_pct > 0 else 0
+        if profit_drop_3 > 0.30:
+            slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop_3:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit3):.2%})"
+    else:
         live1, live2 = await refetch_live_odds(opp)
         live_profit, _, _ = calc_arb(live1, live2)
         drop_too_much = (orig_profit > 0 and
@@ -2392,14 +2457,15 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with _data_lock:  # v10-12
         confirmed = [t for t in trade_records if t.status=="confirmed"]
         rejected  = [t for t in trade_records if t.status=="rejected"]
-    total_profit = sum(t.profit_pct * (t.stake1_thb+t.stake2_thb) for t in confirmed)
+    total_profit = sum(t.profit_pct * (t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
 
     # CLV summary
     clv_values = []
     for t in confirmed:
-        c1, c2 = calc_clv(t)
+        c1, c2, c3 = calc_clv(t)
         if c1 is not None: clv_values.append(c1)
         if c2 is not None: clv_values.append(c2)
+        if c3 is not None: clv_values.append(c3)
     avg_clv = sum(clv_values)/len(clv_values) if clv_values else None
 
     clv_str = f"{avg_clv:+.2f}%" if avg_clv is not None else "ยังไม่มีข้อมูล"
@@ -3295,9 +3361,10 @@ def calc_stats() -> dict:
     # ── CLV Summary ───────────────────────────────────────────────
     clv_values = []
     for t in confirmed:
-        c1, c2 = calc_clv(t)
+        c1, c2, c3 = calc_clv(t)
         if c1 is not None: clv_values.append(c1)
         if c2 is not None: clv_values.append(c2)
+        if c3 is not None: clv_values.append(c3)
     avg_clv = sum(clv_values)/len(clv_values) if clv_values else None
     clv_positive = len([c for c in clv_values if c > 0])
     clv_negative = len([c for c in clv_values if c < 0])
@@ -3310,14 +3377,16 @@ def calc_stats() -> dict:
     # ── Trade records สำหรับ table ────────────────────────────────
     trade_list = []
     for t in tr_snap:  # C6: ใช้ tr_snap (snapshot ใน lock) ไม่ใช่ trade_records โดยตรง
-        c1, c2 = calc_clv(t)
+        c1, c2, c3 = calc_clv(t)
         trade_list.append({
             "signal_id": t.signal_id, "event": t.event, "sport": t.sport,
             "leg1_bm": t.leg1_bm, "leg2_bm": t.leg2_bm,
             "leg1_odds": t.leg1_odds, "leg2_odds": t.leg2_odds,
             "stake1_thb": t.stake1_thb, "stake2_thb": t.stake2_thb,
             "profit_pct": t.profit_pct, "status": t.status,
-            "clv_leg1": c1, "clv_leg2": c2,
+            "clv_leg1": c1, "clv_leg2": c2, "clv_leg3": c3,
+            "leg3_bm": t.leg3_bm, "leg3_team": t.leg3_team,
+            "leg3_odds": t.leg3_odds, "stake3_thb": t.stake3_thb,
             "created_at": t.created_at,
         })
 
@@ -3475,21 +3544,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
                 else:
                     t, _ = entry
-                tt = t.stake1_thb + t.stake2_thb
+                tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
                 if result == "leg1":
                     actual = int(t.leg1_odds * t.stake1_thb) - tt
                 elif result == "leg2":
                     actual = int(t.leg2_odds * t.stake2_thb) - tt
                 elif result == "draw":
-                    # soccer 3-way: คำนวณเหมือน cmd_settle
-                    draw_leg = None
-                    if t.leg1_team and t.leg1_team.lower() == "draw":
-                        draw_leg = (t.leg1_odds, t.stake1_thb)
+                    # 3-way: leg3 = Draw; fallback leg1/leg2
+                    if t.leg3_team and t.leg3_team.lower() == "draw" and t.leg3_odds and t.stake3_thb:
+                        actual = int(t.leg3_odds * t.stake3_thb) - tt
+                    elif t.leg1_team and t.leg1_team.lower() == "draw":
+                        actual = int(t.leg1_odds * t.stake1_thb) - tt
                     elif t.leg2_team and t.leg2_team.lower() == "draw":
-                        draw_leg = (t.leg2_odds, t.stake2_thb)
-                    if draw_leg:
-                        d_odds, d_stake = draw_leg
-                        actual = int(d_odds * d_stake) - tt
+                        actual = int(t.leg2_odds * t.stake2_thb) - tt
                     else:
                         actual = 0
                 else:  # void
@@ -3576,12 +3643,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 tr_snap    = list(trade_records[-30:])
                 ps_snap    = list(_pending_settlement.values())  # Fix 4: full unsettled list
                 pending_ct = len(pending)
-            est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
+            est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
             clv_values = []
             for t in confirmed:
-                c1,c2 = calc_clv(t)
+                c1, c2, c3 = calc_clv(t)
                 if c1 is not None: clv_values.append(c1)
                 if c2 is not None: clv_values.append(c2)
+                if c3 is not None: clv_values.append(c3)
             avg_clv = sum(clv_values)/len(clv_values) if clv_values else None
 
             lm_list = [{"event":m.event,"bookmaker":m.bookmaker,"outcome":m.outcome,
@@ -3610,6 +3678,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "settled_at": t.settled_at,
                 "created_at": t.created_at,
                 "commence_time": t.commence_time,
+                # 3-way fields
+                "leg3_bm":    t.leg3_bm,
+                "leg3_team":  t.leg3_team,
+                "leg3_odds":  t.leg3_odds,
+                "stake3_thb": t.stake3_thb,
             } for t in tr_snap]
 
             data = {
@@ -3630,17 +3703,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "opportunities":   opp_snap,
                 "line_movements":  lm_list,
                 "trade_records":   tr_list,
-                "unsettled_trades": [  # Fix 4: from _pending_settlement (not tr_snap) — full list
+                "unsettled_trades": [
                     {
-                        "signal_id": t.signal_id,
-                        "event":     t.event,
-                        "leg1_bm":   t.leg1_bm,
-                        "leg2_bm":   t.leg2_bm,
+                        "signal_id":  t.signal_id,
+                        "event":      t.event,
+                        "leg1_bm":    t.leg1_bm,
+                        "leg2_bm":    t.leg2_bm,
                         "profit_pct": t.profit_pct,
                         "stake1_thb": t.stake1_thb,
                         "stake2_thb": t.stake2_thb,
                         "created_at": t.created_at,
                         "commence_time": t.commence_time,
+                        # 3-way fields
+                        "leg3_bm":    t.leg3_bm,
+                        "leg3_team":  t.leg3_team,
+                        "leg3_odds":  t.leg3_odds,
+                        "stake3_thb": t.stake3_thb,
                     }
                     for t, _dt in ps_snap
                 ],
