@@ -2577,7 +2577,7 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     t, _ = entry
-    tt = t.stake1_thb + t.stake2_thb
+    tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
 
     if result == "leg1":
         payout = int(t.leg1_odds * t.stake1_thb)
@@ -2586,18 +2586,19 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payout = int(t.leg2_odds * t.stake2_thb)
         actual = payout - tt
     elif result == "draw":
-        # soccer 3-way: ถ้ามี leg ที่ bet ฝั่ง Draw จริง → คำนวณ payout ให้ถูก
-        draw_leg = None
-        if t.leg1_team and t.leg1_team.lower() == "draw":
-            draw_leg = (1, t.leg1_odds, t.stake1_thb)
+        # 3-way: leg3 = Draw leg (bookmaker=draw bm, outcome="Draw")
+        # fallback: leg1 or leg2 ถ้าชื่อ == "draw"
+        if t.leg3_team and t.leg3_team.lower() == "draw" and t.leg3_odds and t.stake3_thb:
+            payout = int(t.leg3_odds * t.stake3_thb)
+            actual = payout - tt
+        elif t.leg1_team and t.leg1_team.lower() == "draw":
+            payout = int(t.leg1_odds * t.stake1_thb)
+            actual = payout - tt
         elif t.leg2_team and t.leg2_team.lower() == "draw":
-            draw_leg = (2, t.leg2_odds, t.stake2_thb)
-        if draw_leg:
-            _, draw_odds, draw_stake = draw_leg
-            payout = int(draw_odds * draw_stake)
+            payout = int(t.leg2_odds * t.stake2_thb)
             actual = payout - tt
         else:
-            actual = 0  # 2-way sport: refund ทั้งหมด (เกมเสมอในกีฬาที่ไม่ใช่ soccer)
+            actual = 0  # 2-way sport: refund
     else:  # void
         actual = 0
 
@@ -2905,35 +2906,31 @@ def parse_winner(event: dict, sport: str = "") -> Optional[str]:
 
 def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     """
-    คำนวณกำไร/ขาดทุนจริง โดยใช้ชื่อทีมที่บันทึกไว้ใน trade
-
-    arb ที่ดี → กำไรไม่ว่าใครชนะ
-    แต่ถ้า stake ถูก cap หรือ odds เปลี่ยนก่อนวาง → อาจมีผิดพลาดได้
+    คำนวณกำไร/ขาดทุนจริง รองรับ 2-way และ 3-way (leg3 = Draw)
     """
-    total_staked = trade.stake1_thb + trade.stake2_thb
+    total_staked = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
 
-    # match winner กับ leg1_team หรือ leg2_team (fuzzy)
-    match_leg1 = fuzzy_match(winner, trade.leg1_team, threshold=0.5)
-    match_leg2 = fuzzy_match(winner, trade.leg2_team, threshold=0.5)
+    # บันทึกทุก leg (รวม leg3 ถ้ามี)
+    legs = [
+        {"team": trade.leg1_team or "", "odds": trade.leg1_odds, "stake": trade.stake1_thb},
+        {"team": trade.leg2_team or "", "odds": trade.leg2_odds, "stake": trade.stake2_thb},
+    ]
+    if trade.leg3_team and trade.leg3_odds and trade.stake3_thb:
+        legs.append({"team": trade.leg3_team, "odds": trade.leg3_odds, "stake": trade.stake3_thb})
 
-    if match_leg1 and not match_leg2:
-        # leg1 ชนะ → ได้ payout จาก stake1
-        payout = trade.stake1_thb * trade.leg1_odds
-        log.info(f"[Settle] {trade.event} → leg1 won ({trade.leg1_team})")
-    elif match_leg2 and not match_leg1:
-        # leg2 ชนะ → ได้ payout จาก stake2
-        payout = trade.stake2_thb * trade.leg2_odds
-        log.info(f"[Settle] {trade.event} → leg2 won ({trade.leg2_team})")
+    # หา leg ที่ match winner
+    matched = [leg for leg in legs if fuzzy_match(winner, leg["team"], threshold=0.5)]
+    unmatched = [leg for leg in legs if not fuzzy_match(winner, leg["team"], threshold=0.5)]
+
+    if len(matched) == 1:
+        payout = matched[0]["stake"] * matched[0]["odds"]
+        log.info(f"[Settle] {trade.event} → '{matched[0]['team']}' won")
     else:
-        # match ทั้งคู่หรือไม่ match เลย — ใช้ leg ที่ให้ payout สูงกว่า (conservative)
-        payout1 = trade.stake1_thb * trade.leg1_odds
-        payout2 = trade.stake2_thb * trade.leg2_odds
-        payout  = min(payout1, payout2)  # worst case
-        log.warning(f"[Settle] {trade.event} — winner '{winner}' ambiguous "
-                    f"(leg1={trade.leg1_team}, leg2={trade.leg2_team}) using worst-case")
+        # ambiguous — worst-case payout
+        payout = min(leg["stake"] * leg["odds"] for leg in legs)
+        log.warning(f"[Settle] {trade.event} — winner '{winner}' ambiguous — using worst-case")
 
-    profit = int(payout - total_staked)
-    return profit
+    return int(payout - total_staked)
 
 
 async def settle_completed_trades():
@@ -3023,21 +3020,23 @@ async def settle_completed_trades():
 
                 # #28 Handle special outcomes
                 if winner == "DRAW":
-                    # soccer 3-way: คำนวณ actual P&L เหมือน cmd_settle draw
-                    tt_draw = trade.stake1_thb + trade.stake2_thb
-                    draw_leg = None
-                    if trade.leg1_team and trade.leg1_team.lower() == "draw":
-                        draw_leg = (trade.leg1_odds, trade.stake1_thb)
+                    # 3-way: leg3 = Draw; 2-way: refund
+                    tt_draw = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
+                    if trade.leg3_team and trade.leg3_team.lower() == "draw" and trade.leg3_odds and trade.stake3_thb:
+                        actual_draw = int(trade.leg3_odds * trade.stake3_thb) - tt_draw
+                        draw_label = f"P&L: *฿{actual_draw:+,}*"
+                        log.info(f"[Settle] {trade.event} — DRAW (leg3), profit={actual_draw:+,}")
+                    elif trade.leg1_team and trade.leg1_team.lower() == "draw":
+                        actual_draw = int(trade.leg1_odds * trade.stake1_thb) - tt_draw
+                        draw_label = f"P&L: *฿{actual_draw:+,}*"
+                        log.info(f"[Settle] {trade.event} — DRAW (leg1), profit={actual_draw:+,}")
                     elif trade.leg2_team and trade.leg2_team.lower() == "draw":
-                        draw_leg = (trade.leg2_odds, trade.stake2_thb)
-                    if draw_leg:
-                        draw_odds, draw_stake = draw_leg
-                        actual_draw = int(draw_odds * draw_stake) - tt_draw
-                        draw_label = f"P&L: *\u0e3f{actual_draw:+,}*"
-                        log.info(f"[Settle] {trade.event} — DRAW (leg matched), profit={actual_draw:+,}")
+                        actual_draw = int(trade.leg2_odds * trade.stake2_thb) - tt_draw
+                        draw_label = f"P&L: *฿{actual_draw:+,}*"
+                        log.info(f"[Settle] {trade.event} — DRAW (leg2), profit={actual_draw:+,}")
                     else:
-                        actual_draw = 0  # 2-way sport draw = refund
-                        draw_label = "P&L: *\u0e3f0* (refund)"
+                        actual_draw = 0
+                        draw_label = "P&L: *฿0* (refund)"
                         log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
                     trade.actual_profit_thb = actual_draw
                     trade.settled_at = datetime.now(timezone.utc).isoformat()
@@ -3069,7 +3068,7 @@ async def settle_completed_trades():
 
                 # คำนวณ P&L จริง
                 actual_profit = calc_actual_pnl(trade, winner)
-                total_staked  = trade.stake1_thb + trade.stake2_thb
+                total_staked  = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
                 emoji_result  = "✅" if actual_profit >= 0 else "❌"
                 sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
 
@@ -3263,8 +3262,8 @@ def calc_stats() -> dict:
 
     rlm_wr,   rlm_cnt   = signal_win_rate(rlm_moves)
     steam_wr, steam_cnt = signal_win_rate(steam_moves)
-    arb_total = len(confirmed) + len(rejected)
-    arb_wr    = (len(confirmed) / arb_total * 100) if arb_total > 0 else None
+    arb_total    = len(confirmed) + len(rejected)
+    confirm_rate = (len(confirmed) / arb_total * 100) if arb_total > 0 else None
 
     # ── Sharp vs Public ───────────────────────────────────────────
     sharp_count  = len(rlm_moves) + len(steam_moves)
@@ -3287,9 +3286,9 @@ def calc_stats() -> dict:
     sport_profit = defaultdict(float)
     sport_stake  = defaultdict(float)
     for t in confirmed:
-        est = t.profit_pct * (t.stake1_thb + t.stake2_thb)
+        est = t.profit_pct * (t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0))
         sport_profit[t.sport] += est
-        sport_stake[t.sport]  += (t.stake1_thb + t.stake2_thb)
+        sport_stake[t.sport]  += (t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0))
     roi_by_sport = {s: sport_profit[s]/sport_stake[s]
                     for s in sport_stake if sport_stake[s] > 0}
 
@@ -3305,7 +3304,7 @@ def calc_stats() -> dict:
     best_clv     = max(clv_values) if clv_values else None
 
     # ── P&L ───────────────────────────────────────────────────────
-    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb) for t in confirmed)
+    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
     avg_profit = (sum(t.profit_pct for t in confirmed)/len(confirmed)*100) if confirmed else None
 
     # ── Trade records สำหรับ table ────────────────────────────────
@@ -3327,7 +3326,8 @@ def calc_stats() -> dict:
         "rlm_count":       rlm_cnt,
         "steam_win_rate":  steam_wr,
         "steam_count":     steam_cnt,
-        "arb_win_rate":    arb_wr,
+        "arb_win_rate":    confirm_rate,
+        "confirm_rate":    confirm_rate,
         "confirmed_trades":len(confirmed),
         "sharp_count":     sharp_count,
         "public_count":    public_count,
