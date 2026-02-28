@@ -195,6 +195,8 @@ class ArbOpportunity:
     profit_pct: Decimal
     stake1:     Decimal
     stake2:     Decimal
+    leg3:       Optional["OddsLine"] = None   # 3-way: Draw leg
+    stake3:     Optional[Decimal]   = None   # 3-way: Draw stake
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     status:     str = "pending"
 
@@ -310,7 +312,7 @@ def _turso_http(statements: list) -> list:
     body = json.dumps({"requests": [
         {"type": "execute", "stmt": {
             "sql": s["sql"],
-            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
+            "args": [{"type": _turso_val_type(v), "value": _turso_val_json(v)} for v in s.get("args", [])]
         }} for s in statements
     ] + [{"type": "close"}]}).encode()
     req = urllib.request.Request(
@@ -1312,14 +1314,12 @@ async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
     if not USE_KALSHI:
         return []
     try:
-        headers = {"Authorization": f"Bearer {KALSHI_API_KEY}"}
         sport_categories = ["sports", "basketball", "football", "soccer", "baseball", "mma"]
         all_markets: list[dict] = []
         for cat in sport_categories:
             async with session.get(
                 "https://trading-api.kalshi.com/trade-api/v2/markets",
                 params={"status": "open", "category": cat, "limit": 100},
-                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
                 if r.status != 200: continue
@@ -1577,10 +1577,14 @@ def is_valid_odds(odds: Decimal) -> bool:
     """2. กรอง odds ที่ผิดปกติ"""
     return MIN_ODDS_ALLOWED <= odds <= MAX_ODDS_ALLOWED
 
-def is_on_cooldown(event: str, bm1: str, bm2: str) -> bool:
+def make_cooldown_key(event: str, bm1: str, bm2: str, market_type: str = "2way") -> str:
+    """สร้าง cooldown key ที่ consistent สำหรับทั้ง read/write"""
+    return f"{market_type}|{event}|{bm1}|{bm2}"
+
+def is_on_cooldown(event: str, bm1: str, bm2: str, market_type: str = "2way") -> bool:
     """3. เช็ค alert cooldown"""
-    key      = f"{event}|{bm1}|{bm2}"
-    last     = alert_cooldown.get(key)
+    key  = make_cooldown_key(event, bm1, bm2, market_type)
+    last = alert_cooldown.get(key)
     if last and (datetime.now(timezone.utc) - last).total_seconds() < ALERT_COOLDOWN_MIN * 60:
         return True
     return False
@@ -1684,9 +1688,12 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     out_a = tokens[0].get("outcome","").lower()
     out_b = tokens[1].get("outcome","").lower()
     if out_a in ("yes","no") or out_b in ("yes","no"):
-        # Yes/No market — skip ทั้งหมด: Yes ≠ home, No ≠ away เสมอไป (อาจเป็น draw/complement)
-        log.debug(f"[PolyYesNo] skip Yes/No market: {best.get('question','')[:60]}")
-        return None
+        # Yes/No market — รับเฉพาะถ้า question ระบุทั้ง 2 ทีม เช่น "Will Arsenal beat Chelsea?"
+        question = best.get("question","").lower()
+        both_teams = fuzzy_match(ta, question, 0.5) and fuzzy_match(tb, question, 0.5)
+        if not both_teams:
+            log.debug(f"[PolyYesNo] skip ambiguous Yes/No market: {best.get('question','')[:60]}")
+            return None
     pa       = Decimal(str(tokens[0].get("price",0)))
     pb       = Decimal(str(tokens[1].get("price",0)))
     if pa <= 0 or pb <= 0: return None
@@ -1828,18 +1835,17 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     bh, bd, ba = best[home_key], best[draw_key], best[away_key]
                     bms = {bh.bookmaker, bd.bookmaker, ba.bookmaker}
                     if len(bms) >= 2:
-                        ck3 = f"3way|{event_name}|{bh.bookmaker}|{ba.bookmaker}"
-                        if not is_on_cooldown(event_name, f"3way|{bh.bookmaker}", ba.bookmaker):
+                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker, "3way"):
                             profit3, sh, sd, sa = calc_arb_3way(bh.odds, bd.odds, ba.odds)
                             if profit3 >= MIN_PROFIT_PCT:
                                 opp = ArbOpportunity(
                                     signal_id=str(uuid.uuid4())[:8], sport=sport_key,
                                     event=event_name, commence=commence,
-                                    leg1=bh, leg2=ba,
-                                    profit_pct=profit3, stake1=sh, stake2=sa,
+                                    leg1=bh, leg2=ba, leg3=bd,
+                                    profit_pct=profit3, stake1=sh, stake2=sa, stake3=sd,
                                 )
                                 found.append(opp)
-                                alert_cooldown[ck3] = datetime.now(timezone.utc)
+                                alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker, "3way")] = datetime.now(timezone.utc)
                                 log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%}")
                 elif home_key and away_key and not draw_key:
                     # ไม่มี Draw — cross-book H vs A เท่านั้น (ไม่ใช่ 1X2 ครบ 3 หน้า)
@@ -1851,8 +1857,20 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                 kelly_total = calc_kelly_stake(bh.odds, ba.odds, profit)
                                 if kelly_total != TOTAL_STAKE:
                                     profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, kelly_total)
-                                s_h = apply_max_stake(s_h, bh.bookmaker)
-                                s_a = apply_max_stake(s_a, ba.bookmaker)
+                                # rebalance หลัง cap (เหมือน non-soccer branch)
+                                s_h_cap = apply_max_stake(s_h, bh.bookmaker)
+                                s_a_cap = apply_max_stake(s_a, ba.bookmaker)
+                                if s_h_cap != s_h or s_a_cap != s_a:
+                                    if s_h_cap < s_h:
+                                        ratio = Decimal("1") / bh.odds
+                                        margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
+                                        new_total = (s_h_cap * USD_TO_THB / USD_TO_THB) / ratio * margin
+                                        profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
+                                    else:
+                                        ratio = Decimal("1") / ba.odds
+                                        margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
+                                        new_total = (s_a_cap * USD_TO_THB / USD_TO_THB) / ratio * margin
+                                        profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
                                 if profit >= MIN_PROFIT_PCT:
                                     opp = ArbOpportunity(
                                         signal_id=str(uuid.uuid4())[:8], sport=sport_key,
@@ -1861,7 +1879,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                         profit_pct=profit, stake1=s_h, stake2=s_a,
                                     )
                                     found.append(opp)
-                                    alert_cooldown[f"{event_name}|{bh.bookmaker}|{ba.bookmaker}"] = datetime.now(timezone.utc)
+                                    alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker)] = datetime.now(timezone.utc)
                                     log.info(f"[ARB-2WAY-SOCCER] {event_name} H vs A profit={profit:.2%}")
             else:
                 # ══ Non-soccer: 2-way arb เหมือนเดิม ══
@@ -1871,7 +1889,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                         a, b = outcomes[i], outcomes[j]
                         if best[a].bookmaker == best[b].bookmaker: continue
                         # 3. Cooldown check
-                        if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue
+                        if is_on_cooldown(event_name, best[a].bookmaker, best[b].bookmaker): continue  # 2way default
                         profit, s_a, s_b = calc_arb(best[a].odds, best[b].odds)
                         if profit >= MIN_PROFIT_PCT:
                             # Kelly — ปรับ total stake ตาม edge
@@ -1906,7 +1924,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                 profit_pct=profit, stake1=s_a, stake2=s_b,
                             )
                             found.append(opp)
-                            alert_cooldown[f"{event_name}|{best[a].bookmaker}|{best[b].bookmaker}"] = datetime.now(timezone.utc)
+                            alert_cooldown[make_cooldown_key(event_name, best[a].bookmaker, best[b].bookmaker)] = datetime.now(timezone.utc)
                             log.info(f"[ARB] {event_name} | profit={profit:.2%}")
     # Scan summary per sport
     sport_counts: dict[str, int] = {}
@@ -2119,31 +2137,43 @@ async def execute_both(opp: ArbOpportunity) -> str:
 
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
+    s3_raw = (opp.stake3*USD_TO_THB).quantize(Decimal("1")) if opp.stake3 else None
     # Natural rounding
     s1 = natural_round(s1_raw)
     s2 = natural_round(s2_raw)
+    s3 = natural_round(s3_raw) if s3_raw is not None else None
 
-    # v10-3: Profitability Guard — rebalance s2 ถ้า rounding ทำให้ arb หาย
-    w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
-    w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
-    tt = s1 + s2
-    rounded_profit = (min(w1, w2) - tt) / tt if tt > 0 else Decimal("0")
-    if rounded_profit < Decimal("0"):
-        # rebalance: หา s2 ที่ทำให้ w2 >= w1 (worst-case break-even)
-        s2_rebalanced = (w1 / opp.leg2.odds_raw).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
-        rebalanced_profit = (min(w1, (s2_rebalanced * opp.leg2.odds_raw).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
-        if rebalanced_profit >= Decimal("0"):
-            s2 = s2_rebalanced
-            log.info(f"[ProfitGuard] rebalanced s2: {int(s2_raw)} -> {int(s2)} | profit: {float(rounded_profit):.3%} -> {float(rebalanced_profit):.3%}")
-        else:
-            log.warning(f"[ProfitGuard] ABORT {opp.event} — arb lost after rounding (profit={float(rounded_profit):.3%})")
-            raise ValueError(
-                f"Abort: arb profit ติดลบหลัง natural rounding ({float(rounded_profit):.2%})\n"
-                f"ทุนน้อยเกินไปสำหรับ edge นี้ — รอ signal ใหม่ที่ profit สูงกว่า"
-            )
-    w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
-    w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
-    tt = s1 + s2
+    is_3way = opp.leg3 is not None and s3 is not None
+
+    if is_3way:
+        # 3-way: ตรวจ profit เป็น positive เท่านั้น (live_profit คำนวณจาก 2-way ระหว่าง H/A ไม่ถูกต้อง เก็บไว้เป็น estimate)
+        w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
+        w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
+        w3 = (s3 * opp.leg3.odds_raw).quantize(Decimal("1"))
+        tt = s1 + s2 + s3
+    else:
+        # v10-3: Profitability Guard — rebalance s2 ถ้า rounding ทำให้ arb หาย
+        w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
+        w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
+        tt = s1 + s2
+        rounded_profit = (min(w1, w2) - tt) / tt if tt > 0 else Decimal("0")
+        if rounded_profit < Decimal("0"):
+            # rebalance: หา s2 ที่ทำให้ w2 >= w1 (worst-case break-even)
+            s2_rebalanced = (w1 / opp.leg2.odds_raw).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
+            rebalanced_profit = (min(w1, (s2_rebalanced * opp.leg2.odds_raw).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
+            if rebalanced_profit >= Decimal("0"):
+                s2 = s2_rebalanced
+                log.info(f"[ProfitGuard] rebalanced s2: {int(s2_raw)} -> {int(s2)} | profit: {float(rounded_profit):.3%} -> {float(rebalanced_profit):.3%}")
+            else:
+                log.warning(f"[ProfitGuard] ABORT {opp.event} — arb lost after rounding (profit={float(rounded_profit):.3%})")
+                raise ValueError(
+                    f"Abort: arb profit ติดลบหลัง natural rounding ({float(rounded_profit):.2%})\n"
+                    f"ทุนน้อยเกินไปสำหรับ edge นี้ — รอ signal ใหม่ที่ profit สูงกว่า"
+                )
+        w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
+        w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
+        tt = s1 + s2
+        w3 = None
 
     # บันทึก trade
     tr = TradeRecord(
@@ -2156,17 +2186,20 @@ async def execute_both(opp: ArbOpportunity) -> str:
         profit_pct=float(opp.profit_pct), status="confirmed",
         commence_time=opp.commence,  # v10-2
     )
+    if is_3way:
+        tr.leg3_odds = float(opp.leg3.odds_raw)
+        tr.stake3_thb = int(s3)
     with _data_lock:
         trade_records.append(tr)
-    db_save_trade(tr)            # 💾 save to DB
-    register_for_settlement(tr, opp.commence)  # 🏆 auto settle
+    db_save_trade(tr)            # save to DB
+    register_for_settlement(tr, opp.commence)  # auto settle
     register_closing_watch(opp)               # #39 CLV watch ตอนเจอ opp ใหม่
     # Fix 3: lock opportunity_log update
     with _data_lock:
         for entry in opportunity_log:
             if entry["id"] == opp.signal_id:
                 entry["status"] = "confirmed"
-    db_update_opp_status(opp.signal_id, "confirmed")  # 💾
+    db_update_opp_status(opp.signal_id, "confirmed")  # save
 
     sp = sport_to_path(opp.sport)
     def steps(leg, stake):
@@ -2196,13 +2229,26 @@ async def execute_both(opp: ArbOpportunity) -> str:
             return f"  🔗 [เปิด Dafabet](https://www.dafabet.com/en/{path})\n  2. ค้นหา *{leg.outcome}*\n  3. วาง ฿{int(stake)}{cap_note}"
         return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
 
+    if is_3way:
+        return (
+            f"📋 *วางเงิน 3-WAY — {md_escape(opp.event)}*{slippage_warn}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏠 *Home — {md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1)}\n\n"
+            f"⚪ Draw — *{md_escape(opp.leg3.bookmaker)}*\n{steps(opp.leg3, s3)}\n\n"
+            f"🟠 *Away — {md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2)}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 ทุน ฿{int(tt):,}  _(คาด profit: {float(opp.profit_pct):.2%})_\n"
+            f"   {md_escape(opp.leg1.outcome)} ชนะ → ฿{int(w1):,}\n"
+            f"   Draw → ฿{int(w3):,}\n"
+            f"   {md_escape(opp.leg2.outcome)} ชนะ → ฿{int(w2):,}"
+        )
     return (
         f"📋 *วางเงิน — {md_escape(opp.event)}*{slippage_warn}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 *{md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1)}\n\n"
         f"🟠 *{md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 ทุน ฿{int(tt):,}  _(Live profit: {float(live_profit):.2%})_\n"
+        f"💵 ทุน ฿{int(tt):,}  _(ขุด ต้น profit: {float(live_profit):.2%})_\n"
         f"   {md_escape(str(opp.leg1.outcome))} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
         f"   {md_escape(str(opp.leg2.outcome))} ชนะ → ฿{int(w2):,} (+฿{int(w2-tt):,})"
     )
@@ -2214,8 +2260,9 @@ async def execute_both(opp: ArbOpportunity) -> str:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # v10-6: เฉพาะ CHAT_ID เจ้าของบอทเท่านั้นที่ confirm/reject ได้
-    if str(query.message.chat_id) != str(CHAT_ID):
+    # v10-6: เช็ค user_id โดยตรง (ไม่ใช่ chat_id เพราะ chat_id โชว์ให้ใครใน group กดได้)
+    _owner_id = os.getenv("OWNER_USER_ID", str(CHAT_ID))
+    if str(query.from_user.id) != str(_owner_id):
         await query.answer("⛔ Not authorized", show_alert=True)
         return
     try: action, sid = query.data.split(":",1)
@@ -2638,6 +2685,10 @@ async def watch_closing_lines():
                             _closing_line_watch[key]["done"] = True
                     log.info(f"[CLV] auto-expired stale watch: {info['event']}")
 
+            if api_remaining <= 5:
+                log.warning("[Quota] Credits ต่ำเกินไป — ระงับ CLV fetch ชั่วคราว")
+                await asyncio.sleep(300)
+                continue
             if to_fetch:
                 async with aiohttp.ClientSession() as session:
                     for key, info in to_fetch:
@@ -2863,6 +2914,11 @@ async def settle_completed_trades():
                 earliest = min(cdt for _, cdt in ps_snapshot.values())
                 wait_min = max(0, int((earliest + timedelta(hours=2) - now).total_seconds() / 60))
                 log.debug(f"[Settle] {len(ps_snapshot)} trade(s) waiting — earliest ready in {wait_min}m")
+                await asyncio.sleep(300)
+                continue
+
+            if api_remaining <= 5:
+                log.warning("[Quota] Credits ต่ำเกินไป — ระงับ settle fetch ชั่วคราว")
                 await asyncio.sleep(300)
                 continue
 
