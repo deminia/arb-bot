@@ -284,7 +284,7 @@ def _turso_http(statements: list) -> list:
     body = json.dumps({"requests": [
         {"type": "execute", "stmt": {
             "sql": s["sql"],
-            "args": [{"type": _turso_val_type(v), "value": _turso_val_json(v)} for v in s.get("args", [])]
+            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
         }} for s in statements
     ] + [{"type": "close"}]}).encode()
     req = urllib.request.Request(
@@ -327,11 +327,12 @@ def _turso_val_type(v) -> str:
     return "text"
 
 def _turso_val(v):
-    """Turso /v2/pipeline: value must always be a string (or null for NULL)"""
+    """Turso /v2/pipeline: integer/text/blob → string; float/Decimal → native JSON number (f64)."""
     if v is None:              return None
-    if isinstance(v, bool):    return str(int(v))   # True->'1', False->'0'
-    if isinstance(v, int):     return str(v)
-    if isinstance(v, (float, Decimal)): return str(float(v))  # Decimal → float string
+    if isinstance(v, bool):    return str(int(v))   # True->'1', False->'0'  (integer type)
+    if isinstance(v, int):     return str(v)         # integer type → string
+    if isinstance(v, Decimal): return float(v)       # float type → native number (not string)
+    if isinstance(v, float):   return v              # float type → native number (not string)
     if isinstance(v, bytes):   return v.hex()
     return str(v)
 
