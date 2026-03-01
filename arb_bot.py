@@ -648,7 +648,7 @@ async def db_load_all() -> tuple[list, list, list]:
             except Exception: pass  # column exists already
 
         trades_rows = await turso_query(
-            "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500")
+            "SELECT * FROM trade_records ORDER BY created_at ASC LIMIT 500")  # S2: ASC = oldest-first, matches runtime list semantics
         trades = []
         for r in trades_rows:
             n = len(r)
@@ -691,7 +691,7 @@ async def db_load_all() -> tuple[list, list, list]:
                     settled_at=r[14],created_at=r[15]))
 
         opps_rows = await turso_query(
-            "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100")
+            "SELECT * FROM opportunity_log ORDER BY created_at ASC LIMIT 100")  # S2: ASC
         opps = []
         for r in opps_rows:
             n = len(r)
@@ -710,7 +710,7 @@ async def db_load_all() -> tuple[list, list, list]:
             })
 
         lm_rows = await turso_query(
-            "SELECT * FROM line_movements ORDER BY ts DESC LIMIT 200")
+            "SELECT * FROM line_movements ORDER BY ts ASC LIMIT 200")  # S2: ASC
         lms = [LineMovement(
             event=r[1],sport=r[2],bookmaker=r[3],outcome=r[4],
             odds_before=Decimal(str(r[5])),odds_after=Decimal(str(r[6])),
@@ -1101,9 +1101,11 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
 def update_clv(event: str, outcome: str, bookmaker: str, final_odds: Decimal):
     """บันทึก closing odds เพื่อคำนวณ CLV"""
     key = f"{event}|{outcome}"
-    if key not in closing_odds:
-        closing_odds[key] = {}
-    closing_odds[key][norm_bm_key(bookmaker)] = final_odds
+    # S3: closing_odds อ่าน/เขียนข้าม thread (asyncio loop + dashboard thread) — ต้องใช้ lock
+    with _data_lock:
+        if key not in closing_odds:
+            closing_odds[key] = {}
+        closing_odds[key][norm_bm_key(bookmaker)] = final_odds
 
 
 def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -1115,7 +1117,9 @@ def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Opti
     """
     def _clv(event, outcome, odds_got):
         key = f"{event}|{outcome}"
-        bm_data = closing_odds.get(key, {})
+        # S3: snapshot under lock to avoid race with update_clv (dashboard thread vs asyncio)
+        with _data_lock:
+            bm_data = dict(closing_odds.get(key, {}))
         # M4: strict Pinnacle benchmark — ถ้าไม่มี Pinnacle closing line → None
         co = bm_data.get("pinnacle")
         if co and co > 0:
@@ -3685,7 +3689,8 @@ async def watch_closing_lines():
                                     break
                             if not _merged:
                                 events.append(_ex_ev)
-                        fetch_ok = False
+                        matched_any = False       # S4: aggregate flags แทน per-event
+                        pinnacle_found_any = False  # S4: ถ้ามี Pinnacle ใน event ใดก็ตาม → True
                         for event in events:
                             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
                             # E6: fuzzy match — ตรวจ token overlap แทน string ตรง ทน alias/punctuation
@@ -3695,7 +3700,7 @@ async def watch_closing_lines():
                             _src_tokens = set(re.split(r'[\s\-_/]+', _src))
                             _overlap = len(_tgt_tokens & _src_tokens) / max(len(_tgt_tokens), 1)
                             if _overlap < 0.6 and ename != info["event"]: continue
-                            pinnacle_found = False
+                            _ev_pinnacle = False
                             for bm in event.get("bookmakers", []):
                                 bk = bm.get("key","")
                                 for mkt in bm.get("markets",[]):
@@ -3707,18 +3712,19 @@ async def watch_closing_lines():
                                         _norm_name = "Draw" if str(_out_name).strip().lower() in ("draw", "tie", "x") else _out_name
                                         update_clv(info["event"], _norm_name, bk, price)
                                         if bk == "pinnacle":
-                                            pinnacle_found = True
-                            fetch_ok = True
-                            if not pinnacle_found:
+                                            _ev_pinnacle = True
+                            matched_any = True
+                            if _ev_pinnacle:
+                                pinnacle_found_any = True
+                            if not _ev_pinnacle:
                                 log.warning(f"[CLV] ⚠️ Pinnacle closing line missing for {ename} — CLV benchmark unreliable")
-                            log.info(f"[CLV] closing line saved: {ename} (pinnacle={'✅' if pinnacle_found else '❌'})")
-                        # R3: mark done ONLY after successful fetch WITH Pinnacle closing line
-                        # ถ้า match event ได้แต่ไม่มี Pinnacle → ยังไม่ mark done (retry ต่อ)
-                        if fetch_ok and pinnacle_found:
+                            log.info(f"[CLV] closing line saved: {ename} (pinnacle={'✅' if _ev_pinnacle else '❌'})")
+                        # S4/R3: mark done ต่อเมื่อ match >=1 event AND มี Pinnacle ใน event ใดก็ตาม
+                        if matched_any and pinnacle_found_any:
                             with _data_lock:
                                 if key in _closing_line_watch:
                                     _closing_line_watch[key]["done"] = True
-                        elif fetch_ok and not pinnacle_found:
+                        elif matched_any and not pinnacle_found_any:
                             log.warning(f"[CLV] Pinnacle line missing for {info['event']} — will retry next window")
                         else:
                             log.warning(f"[CLV] fetch returned no match for {info['event']} — will retry")
@@ -4130,10 +4136,15 @@ def periodic_cleanup():
         done_clw = [k for k, v in _closing_line_watch.items() if v.get("done")]
         for k in done_clw:
             del _closing_line_watch[k]
-        if len(closing_odds) > 500:
+        if len(closing_odds) > 500:  # S3: already inside _data_lock block
             keys_to_remove = list(closing_odds.keys())[:-500]
             for k in keys_to_remove:
                 del closing_odds[k]
+        # S6/Issue32: prune seen_signals ใน periodic_cleanup ด้วย (ป้องกัน leak เมื่อ scan lock ค้าง)
+        _now_ts_pc = time.time()
+        _seen_exp = [k for k, ts in seen_signals.items() if (_now_ts_pc - ts) > SEEN_TTL_SEC]
+        for k in _seen_exp:
+            del seen_signals[k]
         # trim _refetch_cache — ลบ entries ที่เกิน 30 วินาที
         now_ts = time.time()
         expired_rc = [k for k, (ts, _) in _refetch_cache.items() if now_ts - ts > 30]
@@ -4175,9 +4186,10 @@ async def scanner_loop():
                 expired.append(_sid)
                 continue
             try:
-                _cdt = parse_commence(_opp.commence)
-                if _now_dt > _cdt + timedelta(minutes=5):  # เลยเวลาแข่ง +5m
-                    expired.append(_sid)
+                if _opp.commence:  # S5/Issue31: guard empty string ก่อน parse
+                    _cdt = parse_commence(_opp.commence)
+                    if _now_dt > _cdt + timedelta(minutes=5):  # เลยเวลาแข่ง +5m
+                        expired.append(_sid)
             except Exception:
                 pass
         if expired:
@@ -4190,16 +4202,18 @@ async def scanner_loop():
                             opp_rec["status"] = "expired"
                             break
             log.info(f"[Pending] expired {len(expired)} signal(s)")
-            # R1/R4: persist expired status — Turso เท่านั้นถ้า Turso mode, SQLite ถ้าไม่มี Turso
-            if _turso_ok:
+            # S1: split-brain guard — ถ้า writes halted ห้าม fallback SQLite
+            if _db_write_halted:
+                pass  # skip persist entirely — Turso halted, SQLite would cause split-brain
+            elif _turso_ok:
                 async def _expire_turso(_sids=list(expired)):
                     for _sid in _sids:
                         try:
-                            # R1: PK ของ opportunity_log คือ id ไม่ใช่ signal_id
                             await turso_exec("UPDATE opportunity_log SET status='expired' WHERE id=?", (_sid,))
                         except Exception: pass
                 asyncio.get_running_loop().create_task(_expire_turso())
             else:
+                # SQLite-only mode (Turso never configured)
                 try:
                     with sqlite3.connect(DB_PATH, timeout=2) as _con:
                         for _sid in expired:
