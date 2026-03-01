@@ -4170,9 +4170,13 @@ async def scanner_loop():
     await asyncio.sleep(3)
     log.info(f"[Scanner] v2.0 | interval={SCAN_INTERVAL}s | sports={len(SPORTS)}")
     while True:
+        # S7: log auto_scan state every loop to trace silent stops
+        log.info(f"[Scanner] tick | auto_scan={auto_scan} | db_halted={_db_write_halted} | api={api_remaining}")
         if auto_scan:
             try: await do_scan()
             except Exception as e: log.error(f"[Scanner] {e}")
+        else:
+            log.warning("[Scanner] auto_scan=False — skipping scan this tick")
         periodic_cleanup()
         # D1: pending TTL cleanup — ลบ signal เก่าเกิน TTL หรือเลยเวลาแข่งแล้ว
         _ttl = SIGNAL_TTL_SEC  # F7
