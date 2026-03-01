@@ -3304,7 +3304,26 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with _data_lock:  # v10-12
         confirmed = [t for t in trade_records if t.status=="confirmed"]
         rejected  = [t for t in trade_records if t.status=="rejected"]
-    total_profit = sum(t.profit_pct * (t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
+
+    # I1/I3: separate arb vs VB; est_profit = unsettled arb only (VB edge != guaranteed profit)
+    def _is_vb(t): return t.stake2_thb == 0 and t.leg2_team == "-"
+    arb_confirmed = [t for t in confirmed if not _is_vb(t)]
+    vb_confirmed  = [t for t in confirmed if _is_vb(t)]
+    settled       = [t for t in confirmed if t.actual_profit_thb is not None]
+    unsettled_arb = [t for t in arb_confirmed if t.actual_profit_thb is None]
+    actual_profit = sum(t.actual_profit_thb for t in settled)
+    # I3: est_profit = unsettled arb only
+    est_profit    = sum(t.profit_pct * (t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0))
+                        for t in unsettled_arb)
+    # VB expected value (edge * stake) — shown separately
+    vb_ev         = sum(t.profit_pct * t.stake1_thb for t in vb_confirmed
+                        if t.actual_profit_thb is None)
+
+    win_trades = [t for t in settled if t.actual_profit_thb >= 0]
+    lose_trades= [t for t in settled if t.actual_profit_thb < 0]
+    win_rate   = len(win_trades)/len(settled)*100 if settled else 0
+    confirm_rate = len(confirmed)/(len(confirmed)+len(rejected))*100 if (confirmed or rejected) else None
+    confirm_str  = f"{confirm_rate:.0f}%" if confirm_rate is not None else "N/A"
 
     # CLV summary
     clv_values = []
@@ -3314,29 +3333,21 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if c2 is not None: clv_values.append(c2)
         if c3 is not None: clv_values.append(c3)
     avg_clv = sum(clv_values)/len(clv_values) if clv_values else None
-
     clv_str = f"{avg_clv:+.2f}%" if avg_clv is not None else "ยังไม่มีข้อมูล"
-    # actual P&L จาก settled trades
-    settled   = [t for t in confirmed if t.actual_profit_thb is not None]
-    unsettled = [t for t in confirmed if t.actual_profit_thb is None]
-    actual_profit = sum(t.actual_profit_thb for t in settled)
-    win_trades    = [t for t in settled if t.actual_profit_thb >= 0]
-    lose_trades   = [t for t in settled if t.actual_profit_thb < 0]
-    win_rate      = len(win_trades)/len(settled)*100 if settled else 0
-    # B3: แยก confirm_rate vs settled_win_rate ให้ชัดเจน
-    confirm_rate  = len(confirmed) / (len(confirmed) + len(rejected)) * 100 if (confirmed or rejected) else None
-    confirm_str   = f"{confirm_rate:.0f}%" if confirm_rate is not None else "N/A"
 
+    vb_line = (f"\n🎯 VB EV         : ฿{int(vb_ev):+,} _({len(vb_confirmed)} VB, edge-based)_"
+               if vb_confirmed else "")
     await update.message.reply_text(
         f"💰 *P&L Summary*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Confirmed   : {len(confirmed)} trades\n"
+        f"Confirmed   : {len(confirmed)} ({len(arb_confirmed)} arb + {len(vb_confirmed)} VB)\n"
         f"  └ Confirm rate : {confirm_str} ({len(confirmed)} / {len(confirmed)+len(rejected)})\n"
-        f"  └ Settled : {len(settled)} | Unsettled: {len(unsettled)}\n"
+        f"  └ Settled : {len(settled)} | Unsettled arb: {len(unsettled_arb)}\n"
         f"  └ *Settled Win Rate*: {win_rate:.0f}% ({len(win_trades)}W/{len(lose_trades)}L)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 Actual P&L  : *฿{actual_profit:+,}*\n"
-        f"📊 Est. Profit : ฿{int(total_profit):,} _(ยังไม่ settle)_\n"
+        f"📊 Arb Est.    : ฿{int(est_profit):,} _(unsettled arb only)_"
+        f"{vb_line}\n"
         f"📈 CLV avg     : {clv_str}\n"
         f"_(CLV บวก = เอาชนะตลาด)_",
         parse_mode="Markdown",
@@ -3798,6 +3809,19 @@ _settle_alerted: set[str] = set()            # B6: signal_ids ที่แจ้
 _manual_review_alerted: set[str] = set()     # D5: signal_ids ที่แจ้ง MANUAL_REVIEW ไปแล้ว
 
 
+def _settle_hint(trade: TradeRecord) -> str:
+    """I4: return smart /settle hint based on trade type"""
+    sid = trade.signal_id
+    is_vb   = trade.stake2_thb == 0 and trade.leg2_team == "-"
+    is_3way = bool(trade.leg3_team)
+    if is_vb:
+        return f"`/settle {sid} leg1` หรือ `/settle {sid} void`"
+    elif is_3way:
+        return f"`/settle {sid} leg1|leg2|draw|void`"
+    else:
+        return f"`/settle {sid} leg1` หรือ `/settle {sid} leg2` หรือ `/settle {sid} void`"
+
+
 def register_for_settlement(trade: TradeRecord, commence: str):
     """เพิ่ม trade เข้า queue รอ settle — จะยิง API ก็ต่อเมื่อเลยเวลาเตะ +2h"""
     try:
@@ -4030,7 +4054,7 @@ async def settle_completed_trades():
                                         text=(
                                             f"⚠️ *Zombie Trade* `{md_escape(trade.event)}`\n"
                                             f"ไม่พบ event ใน API หลัง 72h — settle ด้วยตนเอง:\n"
-                                            f"`/settle {trade.signal_id} draw`"
+                                            + _settle_hint(trade)
                                         ),
                                         parse_mode="Markdown"
                                     )
@@ -4055,7 +4079,8 @@ async def settle_completed_trades():
                                         text=(
                                             f"⏰ *Postponed?* `{md_escape(trade.event)}`\n"
                                             f"เลยเวลาแข่งกว่า 6h แต่ยังไม่ completed\n"
-                                            f"แนะนำ settle ด้วยตนเอง: `/settle {trade.signal_id} draw`"
+                                            f"แนะนำ settle ด้วยตนเอง: "
+                                            + _settle_hint(trade)
                                         ),
                                         parse_mode="Markdown"
                                     )
@@ -4407,6 +4432,9 @@ def calc_stats() -> dict:
     arb_total    = len(confirmed) + len(rejected)
     confirm_rate = (len(confirmed) / arb_total * 100) if arb_total > 0 else None
 
+    # I2/I3: define once — used in ROI, P&L, and est_profit
+    arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
+
     # ── Sharp vs Public ───────────────────────────────────────────
     sharp_count  = len(rlm_moves) + len(steam_moves)
     public_count = max(0, len(lm_snap) - sharp_count)
@@ -4426,9 +4454,10 @@ def calc_stats() -> dict:
                           for bm in bm_total if bm_total[bm] >= 3}
 
     # ── ROI per Sport ─────────────────────────────────────────────
+    # I2: ROI = arb only (profit_pct * stake is meaningful for arb, not VB edge)
     sport_profit = defaultdict(float)
     sport_stake  = defaultdict(float)
-    for t in confirmed:
+    for t in arb_confirmed:
         est = t.profit_pct * (t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0))
         sport_profit[t.sport] += est
         sport_stake[t.sport]  += (t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0))
@@ -4448,9 +4477,9 @@ def calc_stats() -> dict:
     best_clv     = max(clv_values) if clv_values else None
 
     # ── P&L ───────────────────────────────────────────────────────
-    # H1: exclude VB trades from est_profit — VB profit_pct = edge (expected), not guaranteed arb return
-    arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
-    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in arb_confirmed)
+    # I3: est_profit = unsettled arb only (arb_confirmed defined above)
+    unsettled_arb_snap = [t for t in arb_confirmed if t.actual_profit_thb is None]
+    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in unsettled_arb_snap)
     avg_profit = (sum(t.profit_pct for t in arb_confirmed)/len(arb_confirmed)*100) if arb_confirmed else None
 
     # ── Trade records สำหรับ table ────────────────────────────────
@@ -4560,7 +4589,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         J7: รองรับทั้ง Bearer header และ ?token= query param
         """
         if not DASHBOARD_TOKEN:
-            return True  # ไม่ได้ตั้ง token = ไม่บังคับ auth
+            # I5: allow only if ALLOW_INSECURE_DASHBOARD=true is explicitly set
+            _ALLOW_INSECURE = os.getenv("ALLOW_INSECURE_DASHBOARD", "").lower() == "true"
+            if _ALLOW_INSECURE:
+                return True
+            # block and return 401 — production-safe by default
+            self.send_response(401)
+            body = b'{"error":"DASHBOARD_TOKEN not set. Set ALLOW_INSECURE_DASHBOARD=true to allow unauthenticated access."}'
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return False
         # C6: Bearer header
         auth = self.headers.get("Authorization", "")
         if auth == f"Bearer {DASHBOARD_TOKEN}":
