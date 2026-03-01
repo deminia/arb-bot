@@ -337,7 +337,7 @@ def _turso_http(statements: list) -> list:
     body = json.dumps({"requests": [
         {"type": "execute", "stmt": {
             "sql": s["sql"],
-            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
+            "args": [{"type": _turso_val_type(v), "value": _turso_val_json(v)} for v in s.get("args", [])]
         }} for s in statements
     ] + [{"type": "close"}]}).encode()
     req = urllib.request.Request(
@@ -388,6 +388,20 @@ def _turso_val(v):
     if isinstance(v, float):   return v              # float type → native number (not string)
     if isinstance(v, bytes):   return v.hex()
     return str(v)
+
+def norm_bm_key(name: str) -> str:
+    """Normalize bookmaker display name → API key for CLV lookup."""
+    s = (name or "").lower().strip()
+    if s in ("1xbet", "onexbet", "1x bet"):
+        return "onexbet"
+    if s in ("dafabet",):
+        return "dafabet"
+    if s in ("stake", "stake.com"):
+        return "stake"
+    if s in ("cloudbet",):
+        return "cloudbet"
+    return s
+
 
 def _turso_val_json(v):
     """Turso /v2/pipeline: return native JSON type for integer/float, string for text/blob, None for null.
@@ -672,11 +686,22 @@ async def db_load_all() -> tuple[list, list, list]:
 
         opps_rows = await turso_query(
             "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 100")
-        opps = [{"id":r[0],"event":r[1],"sport":r[2],"profit_pct":float(r[3] or 0),
-                 "leg1_bm":r[4],"leg1_odds":float(r[5] or 0),"leg2_bm":r[6],"leg2_odds":float(r[7] or 0),
-                 "stake1_thb":int(float(r[8] or 0)),"stake2_thb":int(float(r[9] or 0)),
-                 "created_at":r[10],"status":r[11]}
-                for r in opps_rows]
+        opps = []
+        for r in opps_rows:
+            n = len(r)
+            opps.append({
+                "id":         r[0], "event":     r[1],  "sport":     r[2],
+                "profit_pct": float(r[3] or 0),
+                "leg1_bm":    r[4],  "leg1_odds": float(r[5] or 0),
+                "leg2_bm":    r[6],  "leg2_odds": float(r[7] or 0),
+                "stake1_thb": int(float(r[8] or 0)),
+                "stake2_thb": int(float(r[9] or 0)),
+                "created_at": r[10], "status":    r[11],
+                # R8: 3-way fields (columns 12-14 added by migration)
+                "leg3_bm":         r[12] if n > 12 else None,
+                "stake3_thb":      int(float(r[13])) if n > 13 and r[13] is not None else None,
+                "total_stake_thb": int(float(r[14])) if n > 14 and r[14] is not None else None,
+            })
 
         lm_rows = await turso_query(
             "SELECT * FROM line_movements ORDER BY ts DESC LIMIT 200")
@@ -873,15 +898,14 @@ async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None =
                                         if poly_match:
                                             liq_usd = float(poly_match.get("_liquidity", 0) or 0)
 
-                                    # C4: สร้าง all_odds dict — odds ของ outcome นี้จากทุก bm
-                                    # (ใช้ history ที่เก็บไว้แล้ว + ค่าปัจจุบัน)
+                                                            # C4: สร้าง all_odds dict — odds ของ outcome นี้จากทุก bm
                                     _hist_for_outcome = odds_history.get(hist_key, {})
                                     all_odds_for_ctx: dict[str, float] = {
-                                        _bk: float(_o)
+                                        norm_bm_key(_bk): float(_o)
                                         for _bk, _o in _hist_for_outcome.items()
                                         if isinstance(_o, (int, float, Decimal))
                                     }
-                                    all_odds_for_ctx[bk] = float(new_odds)  # อัพเดทค่าล่าสุด
+                                    all_odds_for_ctx[norm_bm_key(bk)] = float(new_odds)  # อัพเดทค่าล่าสุด
 
                                     # C4: หา sharp_odds (Pinnacle) vs soft_odds (bm นี้)
                                     sharp_odds_val = float(all_odds_for_ctx.get("pinnacle", 0))
@@ -997,11 +1021,17 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
                 msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
 
             # Dynamic Kelly Payout Calculator
-            # C4: ใช้ sharp_odds จาก ctx ถ้ามี (Pinnacle current price)
-            # ถ้าไม่มี fallback ไป odds_before (ราคาก่อนขยับ = Sharp reference ประมาณ)
+            # R2: เฉพาะ soft books เท่านั้น — ไม่แนะนำให้วางที่ Pinnacle
+            _soft_books = {"onexbet", "1xbet", "dafabet", "stake", "cloudbet", "betway", "unibet", "bwin"}
+            _bm_key_norm = norm_bm_key(ctx.get("bm_key", lm.bookmaker))
+            if _bm_key_norm == "pinnacle" or _bm_key_norm not in _soft_books:
+                continue  # R2: skip — ไม่ใช่ soft book
             sharp_ctx = ctx.get("sharp_odds", 0.0)
             true_odds = sharp_ctx if sharp_ctx > 1.0 else float(lm.odds_before)
             soft_odds = float(lm.odds_after)     # ราคา Soft book ที่จะวาง
+            # R2: guard — ไม่มี soft stale price ที่ดีกว่า sharp จริง
+            if sharp_ctx <= 1.0 or sharp_ctx >= soft_odds:
+                continue  # ไม่มี edge จริง — soft ยังไม่ค้างไว้
             rec_stake_thb, edge_pct = calc_valuebet_kelly(true_odds, soft_odds, grade)
             rec_stake_int = int(rec_stake_thb)
 
@@ -1061,7 +1091,7 @@ def update_clv(event: str, outcome: str, bookmaker: str, final_odds: Decimal):
     key = f"{event}|{outcome}"
     if key not in closing_odds:
         closing_odds[key] = {}
-    closing_odds[key][bookmaker.lower()] = final_odds
+    closing_odds[key][norm_bm_key(bookmaker)] = final_odds
 
 
 def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -1072,7 +1102,7 @@ def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Opti
     """
     def _clv(event, outcome, bm, odds_got):
         key = f"{event}|{outcome}"
-        co  = closing_odds.get(key, {}).get(bm.lower())
+        co  = closing_odds.get(key, {}).get(norm_bm_key(bm))
         if co and co > 0:
             return round((float(odds_got) / float(co) - 1) * 100, 2)
         return None
@@ -1224,12 +1254,12 @@ def build_betting_links(event_name: str, outcome: str, sport: str,
         return f" `{float(o):.3f}`" if o else ""
 
     links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{sp['pinnacle']}){_odds_tag('pinnacle')}")
-    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{sp['1xbet']}){_odds_tag('1xbet')}")
+    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{sp['1xbet']}){_odds_tag('onexbet')}")
     links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/{sp['dafabet']}){_odds_tag('dafabet')}")
 
     # เว็บอื่นที่มีใน all_odds แต่ไม่ได้ hardcode ไว้
     if all_odds:
-        known = {"pinnacle", "1xbet", "dafabet", "polymarket", "kalshi"}
+        known = {"pinnacle", "onexbet", "1xbet", "dafabet", "polymarket", "kalshi"}
         for bm, o in sorted(all_odds.items()):
             if bm not in known:
                 links.append(f"  📌 {bm.title()} — `{float(o):.3f}`")
@@ -1308,29 +1338,57 @@ async def fetch_poly_market_detail(session: aiohttp.ClientSession, condition_id:
         return {}
 
 
+async def _http_get_with_retry(session: aiohttp.ClientSession, url: str,
+                               params: dict | None = None, max_tries: int = 3,
+                               label: str = "") -> tuple[int, any]:
+    """INFO1: Retry with exponential backoff for 429/502/503.
+    Returns (status, json_data). Returns (status, None) after all retries."""
+    for attempt in range(max_tries):
+        try:
+            async with session.get(url, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
+                status = r.status
+                if status == 200:
+                    data = await r.json(content_type=None)
+                    return status, data
+                if status in (429, 502, 503) and attempt < max_tries - 1:
+                    wait = 1.5 ** attempt + random.uniform(0, 0.5)
+                    log.warning(f"[Fetch] {label} HTTP {status} — retry {attempt+1}/{max_tries-1} in {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                return status, None
+        except Exception as e:
+            if attempt < max_tries - 1:
+                wait = 1.5 ** attempt
+                log.debug(f"[Fetch] {label} error: {e} — retry in {wait:.1f}s")
+                await asyncio.sleep(wait)
+            else:
+                log.warning(f"[Fetch] {label} failed after {max_tries} tries: {e}")
+    return 0, None
+
+
 async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
     """ดึง Polymarket sports events ผ่าน Gamma API (แม่นยำกว่า CLOB /markets)"""
     try:
         # Step 1: ดึง sports series list จาก Gamma API
         gamma_markets: list[dict] = []
-        async with session.get(
-            "https://gamma-api.polymarket.com/events",
+        _st, _data = await _http_get_with_retry(
+            session, "https://gamma-api.polymarket.com/events",
             params={"active": "true", "closed": "false", "limit": 100,
                     "tag_slug": "sports", "order": "volume24hr", "ascending": "false"},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status == 200:
-                gamma_markets = await r.json(content_type=None)
+            label="Polymarket/Gamma",
+        )
+        if _st == 200 and isinstance(_data, list):
+            gamma_markets = _data
 
         if not gamma_markets:
-            # fallback ถ้า Gamma ไม่ตอบ — ลอง CLOB เดิม
-            async with session.get(
-                "https://clob.polymarket.com/markets",
+            # fallback ถ้า Gamma ไม่ตอบ — ลอง CLOB เดิม (with retry)
+            _st2, _data2 = await _http_get_with_retry(
+                session, "https://clob.polymarket.com/markets",
                 params={"active": True, "closed": False, "tag_slug": "sports"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                data = await r.json(content_type=None)
-                raw = data.get("data", [])
+                label="Polymarket/CLOB",
+            )
+            raw = _data2.get("data", []) if isinstance(_data2, dict) else []
             enriched = []
             for m in raw[:80]:
                 tokens = m.get("tokens", [])
@@ -1345,6 +1403,14 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
                 m["_fee_pct"]    = fee_rate / 10000
                 m["_volume_24h"] = volume_24h
                 m["_liquidity"]  = min(volume_24h, total_vol / 30)
+                    # R5: infer _sport เหมือน Gamma path
+                _slug_fb = m.get("slug", "").lower()
+                _sport_fb = ""
+                for _sp_fb in ("soccer", "football", "basketball", "mma", "tennis", "baseball", "hockey"):
+                    if _sp_fb in _slug_fb:
+                        _sport_fb = _sp_fb
+                        break
+                m["_sport"] = _sport_fb
                 enriched.append(m)
             log.info(f"[Polymarket] CLOB fallback: {len(enriched)} markets")
             return enriched
@@ -1449,14 +1515,13 @@ async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
         sport_categories = ["sports", "basketball", "football", "soccer", "baseball", "mma"]
         all_markets: list[dict] = []
         for cat in sport_categories:
-            async with session.get(
-                "https://trading-api.kalshi.com/trade-api/v2/markets",
+            _st, _data = await _http_get_with_retry(
+                session, "https://trading-api.kalshi.com/trade-api/v2/markets",
                 params={"status": "open", "category": cat, "limit": 100},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status != 200: continue
-                data = await r.json(content_type=None)
-                all_markets.extend(data.get("markets", []))
+                label=f"Kalshi/{cat}",
+            )
+            if _st == 200 and isinstance(_data, dict):
+                all_markets.extend(_data.get("markets", []))
 
         enriched = []
         seen_ids = set()
@@ -1624,7 +1689,11 @@ def natural_round(amount: Decimal) -> Decimal:
     # ปัดลงก่อน แล้วสุ่ม +0 หรือ +1 step (50/50)
     base = (amount // step) * step
     jitter = step if random.random() < 0.5 else Decimal("0")
-    return base + jitter
+    result = base + jitter
+    # R7: clamp อีกรอบหลัง round — natural_round อาจดัน stake เกิน MAX_KELLY_STAKE
+    result = min(result, MAX_KELLY_STAKE)
+    result = max(result, MIN_KELLY_STAKE)
+    return result
 
 
 def get_current_bankroll() -> Decimal:
@@ -2023,7 +2092,10 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                     sh = (sh * ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                                     sd = (sd * ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                                     sa = (sa * ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                                    profit3, _, _, _ = calc_arb_3way(bh.odds, bd.odds, ba.odds)  # recompute profit
+                                    # BugA: คำนวณ profit จาก scaled stakes โดยตรง ไม่ใช้ TOTAL_STAKE
+                                    _tt3 = sh + sd + sa
+                                    _w3_min = min(sh*bh.odds, sd*bd.odds, sa*ba.odds)
+                                    profit3 = (_w3_min - _tt3) / _tt3 if _tt3 > 0 else Decimal("0")
                                 # apply_max_stake per leg — cap ถ้าเกิน
                                 sh_cap = apply_max_stake(sh, bh.bookmaker)
                                 sd_cap = apply_max_stake(sd, bd.bookmaker)
@@ -2038,7 +2110,10 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                     sh = (sh * min_ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                                     sd = (sd * min_ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                                     sa = (sa * min_ratio).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                                    profit3, _, _, _ = calc_arb_3way(bh.odds, bd.odds, ba.odds)
+                                    # BugA: recompute profit จาก scaled stakes
+                                    _tt3 = sh + sd + sa
+                                    _w3_min = min(sh*bh.odds, sd*bd.odds, sa*ba.odds)
+                                    profit3 = (_w3_min - _tt3) / _tt3 if _tt3 > 0 else Decimal("0")
                                 if profit3 >= MIN_PROFIT_PCT:
                                     opp = ArbOpportunity(
                                         signal_id=str(uuid.uuid4())[:8], sport=sport_key,
@@ -2254,7 +2329,7 @@ async def send_alert(opp: ArbOpportunity):
         f"```\n"
         f"📊 ไม่ว่าใครชนะ\n"
         f"{outcome_lines}\n"
-        f"🔗 {' | '.join(u for u in [opp.leg1.market_url, opp.leg2.market_url] if u) or '\u2014'}\n"
+        f"🔗 {' | '.join(u for u in [opp.leg1.market_url, opp.leg2.market_url, (opp.leg3.market_url if opp.leg3 else None)] if u) or '\u2014'}\n"
         f"🆔 `{opp.signal_id}`"
     )
     keyboard = InlineKeyboardMarkup([[
@@ -2352,10 +2427,22 @@ async def execute_both(opp: ArbOpportunity) -> str:
     live_profit = orig_profit  # default
     slippage_warn = ""
     if is_3way:
-        # 3-way slippage guard: refetch all 3 legs และ calc_arb_3way ยืนยัน
+        # BugC/R4: refetch all 3 legs including Draw
         live1, live2 = await refetch_live_odds(opp)
-        live3 = opp.leg3.odds  # default to cached
-        # ดึง draw odds จาก cache ถ้า refetch ไม่ได้ (Polymarket ไม่มี refetch สด)
+        live3 = opp.leg3.odds  # default = cached
+        # ถ้า leg3 มาจาก Polymarket/Kalshi ให้ยิง CLOB orderbook ดึง mid-price ใหม่
+        leg3_token = opp.leg3.raw.get("token_id", "") if opp.leg3.raw else ""
+        if leg3_token:
+            try:
+                async with aiohttp.ClientSession() as _sess:
+                    _book = await fetch_poly_market_detail(_sess, leg3_token)
+                if _book and _book.get("mid_price", 0) > 0:
+                    _mid = Decimal(str(_book["mid_price"]))
+                    _fee = Decimal(str(opp.leg3.raw.get("fee_pct", 0.02))) if opp.leg3.raw else Decimal("0.02")
+                    live3 = apply_slippage(Decimal("1") / _mid, opp.leg3.bookmaker.lower())
+                    log.info(f"[SlippageGuard-3way] live Draw refetched: {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
+            except Exception as _e:
+                log.debug(f"[SlippageGuard-3way] draw refetch failed: {_e} — using cached")
         live_profit3, _, _, _ = calc_arb_3way(live1, live3, live2)  # H, D, A
         drop_too_much_3 = (orig_profit > 0 and
             float(orig_profit - live_profit3) / float(orig_profit) > 0.50)
@@ -2396,8 +2483,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
     s1 = natural_round(s1_raw)
     s2 = natural_round(s2_raw)
     s3 = natural_round(s3_raw) if s3_raw is not None else None
-
-    is_3way = opp.leg3 is not None and s3 is not None
+    # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
 
     if is_3way:
         # 3-way: ตรวจ profit เป็น positive เท่านั้น (live_profit คำนวณจาก 2-way ระหว่าง H/A ไม่ถูกต้อง เก็บไว้เป็น estimate)
@@ -2667,6 +2753,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         auto_scan=True; quota_warned=False
         with _data_lock:
             seen_signals.clear()  # reset TTL timers เมื่อเปิด scan ใหม่
+            _pending_vb.clear()   # BugD: clear stale value bet signals
         await update.message.reply_text(f"🟢 *Auto scan เปิด* — ทุก {SCAN_INTERVAL}s", parse_mode="Markdown")
     elif args[0].lower()=="off":
         auto_scan=False
