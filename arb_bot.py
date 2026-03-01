@@ -254,7 +254,25 @@ _bot_start_ts: float = time.time()  # D2: uptime
 _last_error: str = ""  # D2: last error message
 _db_write_halted: bool = False  # Fix 4: set True when Turso fails 3x
 
+@dataclass
+class ValueBetSignal:
+    """Value Bet signal จาก Line Movement — รอ Confirm ก่อนวาง"""
+    signal_id:   str
+    event:       str
+    sport:       str
+    bookmaker:   str       # Soft book ที่จะวาง
+    outcome:     str       # ฝั่งที่แทง
+    true_odds:   float     # Pinnacle/Sharp (ก่อนขยับ)
+    soft_odds:   float     # Soft book (หลังขยับ)
+    grade:       str       # A / B / C
+    rec_stake_thb: int     # Kelly stake ที่แนะนำ
+    edge_pct:    float     # edge (%)
+    commence_time: str = ""
+    created_at:  str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 pending:           dict[str, tuple]           = {}  # sid -> (ArbOpportunity, created_at_ts)
+_pending_vb:       dict[str, tuple]           = {}  # sid -> (ValueBetSignal, created_at_ts)
 seen_signals:      dict[str, float]          = {}  # key -> timestamp (TTL 4h)
 auto_scan:         bool                      = AUTO_SCAN_START
 scan_count:        int                       = 0
@@ -935,6 +953,8 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             msg += f"  {reason}\n"
 
         # คำแนะนำสำหรับ Grade A/B
+        vb_sid = None
+        keyboard = None
         if grade in ("A", "B") and (lm.is_rlm or lm.is_steam):
             target = lm.outcome
             if lm.pct_change < 0:
@@ -943,19 +963,43 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             else:
                 msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
 
-            # Payout calculator (เหมือน arb alert)
-            stake_thb = int(MIN_KELLY_STAKE)  # ใช้ MIN_KELLY_STAKE เป็น reference stake
-            odds_val  = float(lm.odds_after)
-            payout    = int(stake_thb * odds_val)
-            profit    = payout - stake_thb
-            msg += (
-                f"\n💵 *ตัวอย่าง ถ้าวาง ฿{stake_thb:,}:*\n"
-                f"   odds `{odds_val:.3f}` → ได้ *฿{payout:,}* (+฿{profit:,})\n"
-            )
+            # Dynamic Kelly Payout Calculator
+            true_odds = float(lm.odds_before)   # Sharp reference (ก่อนไหล)
+            soft_odds = float(lm.odds_after)     # ราคาปัจจุบัน (Soft book ยังไม่ตาม)
+            rec_stake_thb, edge_pct = calc_valuebet_kelly(true_odds, soft_odds, grade)
+            rec_stake_int = int(rec_stake_thb)
 
-            # Direct betting links
+            if rec_stake_int > 0 and edge_pct > 0:
+                payout = int(rec_stake_int * soft_odds)
+                profit = payout - rec_stake_int
+                fraction_map = {"A": "30%", "B": "15%", "C": "5%"}
+                msg += (
+                    f"\n💰 *Dynamic Kelly Stake — เกรด {grade} ({fraction_map.get(grade,'?')} Kelly):*\n"
+                    f"  Edge: *+{edge_pct:.2f}%* | วาง *฿{rec_stake_int:,}* ที่ `{soft_odds:.3f}`\n"
+                    f"  ได้คืน *฿{payout:,}* (กำไร +฿{profit:,})\n"
+                )
+                # สร้าง ValueBetSignal รอ Confirm
+                vb_sid = str(uuid.uuid4())[:8]
+                vb = ValueBetSignal(
+                    signal_id=vb_sid, event=lm.event, sport=lm.sport,
+                    bookmaker=lm.bookmaker, outcome=lm.outcome,
+                    true_odds=true_odds, soft_odds=soft_odds,
+                    grade=grade, rec_stake_thb=rec_stake_int,
+                    edge_pct=edge_pct, commence_time=commence_time,
+                )
+                with _data_lock:
+                    _pending_vb[vb_sid] = (vb, time.time())
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"✅ Confirm Value Bet ฿{rec_stake_int:,}", callback_data=f"vb_confirm:{vb_sid}"),
+                    InlineKeyboardButton("❌ Skip", callback_data=f"vb_reject:{vb_sid}"),
+                ]])
+            else:
+                msg += f"\n⚠️ *ระบบคำนวณแล้ว: No Value / Edge ต่ำ* (edge={edge_pct:.2f}%) — ควรรอดูท่าที\n"
+
+            # Direct betting links + odds ทุกเว็บ
+            all_odds_ctx: dict | None = ctx.get("all_odds")
             msg += f"\n🔗 *วางเดิมพันได้ที่:*\n"
-            msg += build_betting_links(lm.event, lm.outcome, lm.sport, lm.odds_after, bm_key)
+            msg += build_betting_links(lm.event, lm.outcome, lm.sport, lm.odds_after, bm_key, all_odds_ctx)
             msg += "\n"
 
         # H2H Focus note
@@ -964,7 +1008,10 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
 
         for cid in ALL_CHAT_IDS:
             try:
-                await _app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+                await _app.bot.send_message(
+                    chat_id=cid, text=msg, parse_mode="Markdown",
+                    reply_markup=keyboard if keyboard else None,
+                )
                 await asyncio.sleep(0.3)
             except Exception as e:
                 log.error(f"[LineMove] alert error: {e}")
@@ -1125,30 +1172,46 @@ def sport_to_path(sport_key: str) -> dict:
 
 
 def build_betting_links(event_name: str, outcome: str, sport: str,
-                        odds: Decimal, bookmaker_key: str = "") -> str:
-    """สร้างลิงค์ตรงไปหน้า betting สำหรับ RLM/Steam signal"""
+                        odds: Decimal, bookmaker_key: str = "",
+                        all_odds: dict | None = None) -> str:
+    """สร้างลิงค์ตรงไปหน้า betting พร้อมแสดง odds ของแต่ละเว็บ
+
+    all_odds: dict {bookmaker_lower -> odds_float} สำหรับแสดง odds ต่อท้ายลิงก์
+    """
     links = []
     parts = event_name.split(" vs ")
-
     sp = sport_to_path(sport)
-    links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{sp['pinnacle']})")
-    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{sp['1xbet']})")
-    links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/{sp['dafabet']})")
+
+    def _odds_tag(bm_key: str) -> str:
+        if not all_odds: return ""
+        o = all_odds.get(bm_key)
+        return f" `{float(o):.3f}`" if o else ""
+
+    links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{sp['pinnacle']}){_odds_tag('pinnacle')}")
+    links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{sp['1xbet']}){_odds_tag('1xbet')}")
+    links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/{sp['dafabet']}){_odds_tag('dafabet')}")
+
+    # เว็บอื่นที่มีใน all_odds แต่ไม่ได้ hardcode ไว้
+    if all_odds:
+        known = {"pinnacle", "1xbet", "dafabet", "polymarket", "kalshi"}
+        for bm, o in sorted(all_odds.items()):
+            if bm not in known:
+                links.append(f"  📌 {bm.title()} — `{float(o):.3f}`")
 
     # Polymarket
     if parts:
         search_q = parts[0].replace(" ", "+")
-        links.append(f"  🟣 [Polymarket](https://polymarket.com/search?query={search_q})")
+        links.append(f"  🟣 [Polymarket](https://polymarket.com/search?query={search_q}){_odds_tag('polymarket')}")
 
-    # Kalshi (US regulated prediction market — เปิดเสมอ ไม่ต้องมี API key)
-    links.append(f"  🔵 [Kalshi](https://kalshi.com/sports)")
+    # Kalshi
+    links.append(f"  🔵 [Kalshi](https://kalshi.com/sports){_odds_tag('kalshi')}")
 
     # Stake.com + Cloudbet (ถ้าตั้ง EXTRA_BOOKMAKERS)
     extra = _s("EXTRA_BOOKMAKERS", "")
     if "stake" in extra:
-        links.append(f"  ⚫ [Stake.com](https://stake.com/sports)")
+        links.append(f"  ⚫ [Stake.com](https://stake.com/sports){_odds_tag('stake')}")
     if "cloudbet" in extra:
-        links.append(f"  ☁️ [Cloudbet](https://www.cloudbet.com/en/sports)")
+        links.append(f"  ☁️ [Cloudbet](https://www.cloudbet.com/en/sports){_odds_tag('cloudbet')}")
 
     return "\n".join(links)
 
@@ -1568,6 +1631,49 @@ def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> D
 
     log.info(f"[Kelly] edge={edge:.2%} full={full_kelly:.3f} frac={frac_kelly:.3f} bankroll=฿{int(current_bankroll):,} stake=฿{int(kelly_thb):,} (${float(kelly_usd):.0f})")
     return kelly_usd
+
+
+def calc_valuebet_kelly(true_odds: float, soft_odds: float, grade: str) -> tuple[Decimal, float]:
+    """
+    Kelly Criterion สำหรับ Value Betting (แทงหน้าเดียว) พร้อม Dynamic Fraction ตามเกรด
+
+    Args:
+        true_odds : ราคา Sharp/Pinnacle ก่อนขยับ (estimate true probability)
+        soft_odds : ราคา Soft book ที่จะวาง (หลังขยับ)
+        grade     : "A" / "B" / "C" จาก grade_signal()
+
+    Returns:
+        (rec_stake_thb, edge_pct) — stake แนะนำเป็นบาท, edge เป็น %
+        stake = 0 ถ้าไม่มี value
+    """
+    # Dynamic fraction ตามความคมสัญญาณ
+    fraction_map = {"A": 0.30, "B": 0.15, "C": 0.05}
+    fraction = fraction_map.get(grade, 0.05)
+
+    if true_odds <= 1.0 or soft_odds <= 1.0:
+        return Decimal("0"), 0.0
+
+    true_prob = 1.0 / true_odds
+    edge = (true_prob * soft_odds) - 1.0
+
+    if edge <= 0:
+        return Decimal("0"), round(edge * 100, 2)
+
+    # Full Kelly สำหรับ directional bet: f* = edge / (b) where b = soft_odds - 1
+    full_kelly = edge / (soft_odds - 1.0)
+    frac_kelly = full_kelly * fraction
+
+    if not USE_KELLY:
+        stake_thb = MIN_KELLY_STAKE
+    else:
+        current_bankroll = get_current_bankroll()
+        stake_thb = Decimal(str(frac_kelly)) * current_bankroll
+        stake_thb = max(MIN_KELLY_STAKE, min(MAX_KELLY_STAKE, stake_thb))
+        stake_thb = natural_round(stake_thb)
+        stake_thb = max(MIN_KELLY_STAKE, stake_thb)
+
+    log.info(f"[DynamicKelly] Grade {grade} | edge={edge:.2%} | full={full_kelly:.3f} frac={frac_kelly:.3f} | stake=฿{int(stake_thb):,}")
+    return stake_thb, round(edge * 100, 2)
 
 
 def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
@@ -2379,19 +2485,78 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try: action, sid = query.data.split(":",1)
     except Exception: return
-    # A2: Signal TTL — ไม่ให้ confirm signal ที่เก่าเกิน 15 นาที
+
     SIGNAL_TTL = int(os.getenv("SIGNAL_TTL_SEC", "900"))  # default 15m
+    orig = query.message.text
+
+    # ── Value Bet confirm/reject ──────────────────────────────────
+    if action in ("vb_confirm", "vb_reject"):
+        with _data_lock:
+            vb_entry = _pending_vb.get(sid)
+        if not vb_entry:
+            try: await query.edit_message_text(orig+"\n\n⚠️ Value Bet signal หมดอายุแล้ว")
+            except Exception: pass
+            return
+        vb, vb_ts = vb_entry
+        if time.time() - vb_ts > SIGNAL_TTL:
+            with _data_lock:
+                _pending_vb.pop(sid, None)
+            try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-vb_ts)//60)}m ago)", parse_mode="Markdown")
+            except Exception: pass
+            return
+        with _data_lock:
+            _pending_vb.pop(sid, None)
+        if action == "vb_reject":
+            try: await query.edit_message_text(orig+"\n\n❌ *Value Bet Skipped*", parse_mode="Markdown")
+            except Exception: pass
+            return
+        # vb_confirm — แจ้ง Telegram พร้อม step-by-step
+        sp = sport_to_path(vb.sport)
+        bm_lower = vb.bookmaker.lower()
+        if "pinnacle" in bm_lower:
+            link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
+        elif "1xbet" in bm_lower or "onexbet" in bm_lower:
+            link = f"https://1xbet.com/en/line/{sp['1xbet']}"
+        elif "dafabet" in bm_lower:
+            link = f"https://www.dafabet.com/en/{sp['dafabet']}"
+        else:
+            link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
+        confirm_msg = (
+            f"✅ *Value Bet CONFIRMED — เกรด {vb.grade}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏆 {md_escape(vb.event)}\n"
+            f"📡 {md_escape(vb.bookmaker)} — *{md_escape(vb.outcome)}*\n"
+            f"💰 Edge: *+{vb.edge_pct:.2f}%* | Stake: *฿{vb.rec_stake_thb:,}* @ `{vb.soft_odds:.3f}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 *วิธีวาง:*\n"
+            f"  1. [เปิด {md_escape(vb.bookmaker)}]({link})\n"
+            f"  2. ค้นหา *{md_escape(vb.event)}*\n"
+            f"  3. เลือก *{md_escape(vb.outcome)}* @ `{vb.soft_odds:.3f}`\n"
+            f"  4. วาง *฿{vb.rec_stake_thb:,}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"_(ยืนยันแล้ว — วางด้วยมือ)_"
+        )
+        try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{vb.rec_stake_thb:,}", parse_mode="Markdown")
+        except Exception: pass
+        for cid in ALL_CHAT_IDS:
+            try:
+                await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
+            except Exception as e:
+                log.error(f"[VB] confirm msg error: {e}")
+        return
+
+    # ── Arb confirm/reject ────────────────────────────────────────
     with _data_lock:
         entry = pending.get(sid)
     if not entry:
-        try: await query.edit_message_text(query.message.text+"\n\n⚠️ หมดอายุ")
+        try: await query.edit_message_text(orig+"\n\n⚠️ หมดอายุ")
         except Exception: pass
         return
     opp, sig_ts = entry
     if time.time() - sig_ts > SIGNAL_TTL:
         with _data_lock:
             pending.pop(sid, None)
-        try: await query.edit_message_text(query.message.text+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
+        try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
     # Fix 1: map action string to canonical status
@@ -2401,7 +2566,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if entry["id"] == sid:
                 entry["status"] = new_status
                 break
-    orig = query.message.text
     if action == "reject":
         with _data_lock:
             pending.pop(sid, None)  # B2: pop ตอน reject จริง
@@ -3214,6 +3378,11 @@ def periodic_cleanup():
         expired_rc = [k for k, (ts, _) in _refetch_cache.items() if now_ts - ts > 30]
         for k in expired_rc:
             del _refetch_cache[k]
+        # trim _pending_vb — ลบ Value Bet signals ที่หมดอายุ (> SIGNAL_TTL)
+        _vb_ttl = int(os.getenv("SIGNAL_TTL_SEC", "900"))
+        expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
+        for k in expired_vb:
+            del _pending_vb[k]
 
 
 async def scanner_loop():
