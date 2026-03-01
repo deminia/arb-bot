@@ -1824,6 +1824,10 @@ def calc_kelly_stake(odds_a: Decimal, odds_b: Decimal, profit_pct: Decimal) -> D
 
     Full Kelly = (edge) / (1 - 1/max_odds)
     Fractional = Full Kelly × KELLY_FRACTION
+
+    H4: NOTE — สำหรับ 3-way arb ฟังก์ชันนี้รับเฉพาะ odds_a, odds_b (2 legs)
+    และใช้ min_prob = min(1/odds_a, 1/odds_b) ซึ่งเป็น conservative approximation
+    ไม่ได้คำนวณ true 3-way Kelly — stake ที่ได้จะต่ำกว่า optimal เล็กน้อย (safe side)
     """
     if not USE_KELLY:
         return TOTAL_STAKE  # USD
@@ -2094,9 +2098,12 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
         if any(x in q_lower for x in _non_h2h_terms):
             log.debug(f"[PolyYesNo] skip non-H2H proposition: {best.get('question','')[:60]}")
             return None
-        # H5: parse ว่า Yes = ทีมไหน — รับเฉพาะ beat/defeat/'win against' (allowlist)
+        # H5: parse ว่า Yes = ทีมไหน — รับ beat/defeat/'win against' + fallback 'will X win'
         # Q6: re imported at top-level
         _pat = re.search(r'will\s+(.*?)\s+(?:beat|defeat|win against)', q_lower)
+        if not _pat:
+            # G4: fallback — 'Will X win?' format (single team, treated as Yes=X)
+            _pat = re.search(r'will\s+(.*?)\s+win\b', q_lower)
         if not _pat:
             log.debug(f"[PolyYesNo] skip — can't parse Yes team from: {best.get('question','')[:60]}")
             return None
@@ -4009,6 +4016,28 @@ async def settle_completed_trades():
                         break
 
                 if not matched_event:
+                    # H2: zombie deadman — if trade has no API match after 72h past commence, alert once and remove
+                    try:
+                        _ct_zombie = parse_commence(trade.commence_time or "")
+                        _zombie_elapsed = (datetime.now(timezone.utc) - _ct_zombie).total_seconds()
+                        if _zombie_elapsed > 72 * 3600 and signal_id not in _manual_review_alerted:
+                            _manual_review_alerted.add(signal_id)
+                            log.warning(f"[Settle] {trade.event} — no API match after 72h, marking MANUAL_REVIEW")
+                            if _app:
+                                asyncio.get_running_loop().create_task(
+                                    _app.bot.send_message(
+                                        chat_id=CHAT_ID,
+                                        text=(
+                                            f"⚠️ *Zombie Trade* `{md_escape(trade.event)}`\n"
+                                            f"ไม่พบ event ใน API หลัง 72h — settle ด้วยตนเอง:\n"
+                                            f"`/settle {trade.signal_id} draw`"
+                                        ),
+                                        parse_mode="Markdown"
+                                    )
+                                )
+                            settled_ids.append(signal_id)  # remove from pending loop
+                    except Exception:
+                        pass
                     continue
                 if not matched_event.get("completed", False):
                     # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
@@ -4419,8 +4448,10 @@ def calc_stats() -> dict:
     best_clv     = max(clv_values) if clv_values else None
 
     # ── P&L ───────────────────────────────────────────────────────
-    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
-    avg_profit = (sum(t.profit_pct for t in confirmed)/len(confirmed)*100) if confirmed else None
+    # H1: exclude VB trades from est_profit — VB profit_pct = edge (expected), not guaranteed arb return
+    arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
+    est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in arb_confirmed)
+    avg_profit = (sum(t.profit_pct for t in arb_confirmed)/len(arb_confirmed)*100) if arb_confirmed else None
 
     # ── Trade records สำหรับ table ────────────────────────────────
     trade_list = []
@@ -4692,7 +4723,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 tr_snap    = list(trade_records[-30:])
                 ps_snap    = list(_pending_settlement.values())
                 pending_ct = len(pending)
-            est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
+            # H1: exclude VB trades from est_profit — profit_pct for VB = edge, not guaranteed return
+            _arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
+            est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in _arb_confirmed)
             clv_values = []
             for t in confirmed:
                 c1, c2, c3 = calc_clv(t)
@@ -4993,6 +5026,9 @@ def handle_shutdown(signum, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT,  handle_shutdown)
+    # H3: warn if dashboard is unauthenticated (DASHBOARD_TOKEN not set)
+    if not DASHBOARD_TOKEN:
+        log.warning("[Security] DASHBOARD_TOKEN not set — dashboard and /api/* are publicly accessible! Set DASHBOARD_TOKEN env var to protect.")
 
     app = (
         Application.builder()
