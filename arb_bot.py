@@ -9,6 +9,10 @@
 ║  6.  Scanner asyncio.Event wakeup     14.  Dashboard Force Settle UI  ║
 ║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
 ║  8.  Soccer 3-way Arb (1X2 calc)     16.  Signal TTL + WAL DB        ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  Patch B/C: asyncio.Lock scan, VB slippage guard, auth require_owner ║
+║  confirm_rate/win_rate split, 3-way live payout, Semaphore Odds API  ║
+║  postponed no-spam, draw label-token, migration at startup, C3-C14   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -315,7 +319,9 @@ CREATE TABLE IF NOT EXISTS opportunity_log (
     id TEXT PRIMARY KEY, event TEXT, sport TEXT, profit_pct REAL,
     leg1_bm TEXT, leg1_odds REAL, leg2_bm TEXT, leg2_odds REAL,
     stake1_thb INTEGER, stake2_thb INTEGER, created_at TEXT,
-    status TEXT DEFAULT 'pending'
+    status TEXT DEFAULT 'pending',
+    leg3_bm TEXT DEFAULT NULL, stake3_thb INTEGER DEFAULT NULL,
+    total_stake_thb INTEGER DEFAULT NULL
 );
 CREATE TABLE IF NOT EXISTS line_movements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1665,10 +1671,12 @@ def calc_arb(odds_a: Decimal, odds_b: Decimal):
     s_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_a, (TOTAL_STAKE - s_a).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-def calc_arb_3way(odds_h: Decimal, odds_d: Decimal, odds_a: Decimal):
+def calc_arb_3way(odds_h: Decimal, odds_d: Decimal, odds_a: Decimal, total: Optional[Decimal] = None):
     """คำนวณ 3-way arb (soccer 1X2): Home / Draw / Away
-    Returns: (profit_pct, stake_h, stake_d, stake_a) ทั้งหมดใน USD (TOTAL_STAKE)
+    C12: รับ total param — ถ้าไม่ส่งมาใช้ TOTAL_STAKE (backward compat)
+    Returns: (profit_pct, stake_h, stake_d, stake_a) ทั้งหมดใน USD
     """
+    _total = total if total is not None else TOTAL_STAKE
     inv_h = Decimal("1") / odds_h
     inv_d = Decimal("1") / odds_d
     inv_a = Decimal("1") / odds_a
@@ -1676,9 +1684,9 @@ def calc_arb_3way(odds_h: Decimal, odds_d: Decimal, odds_a: Decimal):
     if margin >= 1:
         return Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0")
     profit = (Decimal("1") - margin) / margin
-    s_h = (TOTAL_STAKE * inv_h / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    s_d = (TOTAL_STAKE * inv_d / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    s_a = (TOTAL_STAKE * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    s_h = (_total * inv_h / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    s_d = (_total * inv_d / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    s_a = (_total * inv_a / margin).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     return profit, s_h, s_d, s_a
 
 
@@ -2361,7 +2369,7 @@ async def send_alert(opp: ArbOpportunity):
         try:
             await _app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown",
                                         reply_markup=keyboard if cid==CHAT_ID else None)
-            await asyncio.sleep(0.1)  # ป้องกัน Telegram Flood Control
+            await asyncio.sleep(1.5)  # C10: ป้องกัน Telegram Flood (20 msg/min limit per chat)
         except Exception as e:
             log.error(f"[Alert] chat {cid}: {e}")
 
@@ -2547,14 +2555,17 @@ async def execute_both(opp: ArbOpportunity) -> str:
         w3 = (s3 * _leg3_disp).quantize(Decimal("1"))
         tt = s1 + s2 + s3
     else:
+        # C5/C13: ใช้ live odds (after slippage) แทน odds_raw สำหรับ guard + payout display
+        _od1 = live1 if 'live1' in locals() else opp.leg1.odds
+        _od2 = live2 if 'live2' in locals() else opp.leg2.odds
         # v10-3: Profitability Guard — rebalance s2 ถ้า rounding ทำให้ arb หาย
-        w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
-        w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
+        w1 = (s1 * _od1).quantize(Decimal("1"))
+        w2 = (s2 * _od2).quantize(Decimal("1"))
         tt = s1 + s2
         rounded_profit = (min(w1, w2) - tt) / tt if tt > 0 else Decimal("0")
         if rounded_profit < Decimal("0"):
             # rebalance: หา s2 ที่ทำให้ w2 >= w1 (worst-case break-even)
-            s2_rebalanced = (w1 / opp.leg2.odds_raw).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
+            s2_rebalanced = (w1 / _od2).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
             rebalanced_profit = (min(w1, (s2_rebalanced * opp.leg2.odds_raw).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
             if rebalanced_profit >= Decimal("0"):
                 s2 = s2_rebalanced
@@ -2653,6 +2664,22 @@ async def execute_both(opp: ArbOpportunity) -> str:
 # ══════════════════════════════════════════════════════════════════
 #  TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
+def is_owner(update: Update) -> bool:
+    """C3: ตรวจว่า user เป็น owner (ตาม OWNER_USER_ID)"""
+    owner = os.getenv("OWNER_USER_ID", "").strip()
+    if not owner:
+        return True  # ไม่ได้ตั้ง = ไม่บังคับ
+    user = update.effective_user
+    return bool(user and str(user.id) == owner)
+
+async def require_owner(update: Update) -> bool:
+    """C3: Guard — คืน False และแจ้ง ⛔ ถ้าไม่ใช่ owner"""
+    if not is_owner(update):
+        if update.message:
+            await update.message.reply_text("⛔ Not authorized")
+        return False
+    return True
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2811,10 +2838,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError as abort_msg:
         # B2: ไม่ pop pending ถ้า execute abort — user ยังกดอีกครั้งได้
         try: await query.edit_message_text(orig+"\n\n"+str(abort_msg)+"\n\n_กด Confirm ใหม่ได้_", parse_mode="Markdown")
-        except Exception: pass  # C8
+        except Exception: pass
+    except Exception as e:  # C4: generic catch — network/parse/decimal errors
+        log.error(f"[Confirm] execute_both failed: {e}", exc_info=True)
+        try:
+            await query.edit_message_text(
+                orig + "\n\n❌ *Execution failed*\nระบบขัดข้องระหว่างยืนยัน กรุณาลองใหม่",
+                parse_mode="Markdown"
+            )
+        except Exception: pass
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update): return  # C3
     global auto_scan, quota_warned
     args = context.args
     if not args:
@@ -2839,6 +2875,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """4. /pnl — ดู P&L summary"""
+    if not await require_owner(update): return  # C3
     with _data_lock:  # v10-12
         confirmed = [t for t in trade_records if t.status=="confirmed"]
         rejected  = [t for t in trade_records if t.status=="rejected"]
@@ -2883,6 +2920,7 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """7. /lines — ดู line movements ล่าสุด"""
+    if not await require_owner(update): return  # C3
     with _data_lock:  # v10-12
         recent = list(line_movements[-10:])[::-1]
     if not recent:
@@ -2903,6 +2941,7 @@ async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update): return  # C3
     s = "🟢 เปิด" if auto_scan else "🔴 ปิด"
     qpct = min(100, int(api_remaining/5))
     qbar = "█"*int(qpct/5)+"░"*(20-int(qpct/5))
@@ -2945,9 +2984,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update): return  # C3
     global _now_last_ts
-    # Fix 4: check scan-in-progress BEFORE burning cooldown
-    if _scan_in_progress:
+    # C1: ใช้ _scan_lock.locked() แทน dead _scan_in_progress flag
+    if _scan_lock and _scan_lock.locked():
         await update.message.reply_text("⏳ *กำลัง scan อยู่แล้ว* — รอสักครู่", parse_mode="Markdown")
         return
     # A5: Rate limit /now — ไม่ให้กดซ้ำภายใน NOW_COOLDOWN_SEC
@@ -2968,6 +3008,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """v10-11: /trades — แสดง trade list รายละเอียด 10 รายการล่าสุด"""
+    if not await require_owner(update): return  # C3
     with _data_lock:
         recent = [t for t in trade_records if t.status == "confirmed"][-10:][::-1]
     if not recent:
@@ -3007,6 +3048,7 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Manual settle สำหรับ MANUAL_REVIEW หรือ DRAW
     ตัวอย่าง: /settle abc12345 leg1
     """
+    if not await require_owner(update): return  # C3
     args = context.args
     if len(args) < 2:
         # Fix 5: snapshot _pending_settlement before reading
@@ -3040,6 +3082,13 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     t, _ = entry
+    # C8: double-settle guard
+    if t.actual_profit_thb is not None or t.settled_at is not None:
+        await update.message.reply_text(
+            f"⚠️ Trade นี้ settle ไปแล้ว (P&L: ฿{t.actual_profit_thb:+,})",
+            parse_mode="Markdown"
+        )
+        return
     tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
 
     if result == "leg1":
@@ -3101,15 +3150,35 @@ async def do_scan() -> int:
         return 0
     async with _scan_lock:
      try:
+        # C9: Bankroll guard — หยุด scan ถ้าทุนหมด
+        _cur_bankroll = get_current_bankroll()
+        if _cur_bankroll < MIN_KELLY_STAKE and auto_scan:
+            auto_scan = False
+            log.warning(f"[Bankroll] ทุนเหลือ \u0e3f{int(_cur_bankroll):,} < MIN \u0e3f{int(MIN_KELLY_STAKE):,} — หยุด scan")
+            if _app:
+                asyncio.get_running_loop().create_task(
+                    _app.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"🚨 *Bankroll Alert*\n"
+                            f"ทุนเหลือ *\u0e3f{int(_cur_bankroll):,}* น้อยกว่า MIN \u0e3f{int(MIN_KELLY_STAKE):,}\n"
+                            f"❌ Auto scan หยุดอัตโนมัติ — เติมทุนหรือทบทวนระบบ"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                )
+            return 0
+
         # A4: Daily Loss Limit
         if MAX_DAILY_LOSS_THB > 0:
-            today = datetime.now(timezone.utc).date()
+            # C7: ใช้ UTC+7 แทน UTC เพื่อ reset ตรงกับวันใช้งานจริง
+            today = (datetime.now(timezone.utc) + timedelta(hours=7)).date()
             with _data_lock:
                 daily_loss = sum(
                     t.actual_profit_thb for t in trade_records
                     if t.actual_profit_thb is not None
                     and t.settled_at
-                    and datetime.fromisoformat(t.settled_at).date() == today
+                    and (datetime.fromisoformat(t.settled_at) + timedelta(hours=7)).date() == today
                 )
             if daily_loss <= -int(MAX_DAILY_LOSS_THB):
                 if auto_scan:
@@ -3729,23 +3798,43 @@ def calc_stats() -> dict:
     # ── Win Rate ──────────────────────────────────────────────────
 
     # เชื่อม RLM กับ trade ที่เกิดขึ้นหลังสัญญาณ (ภายใน 30 นาที)
-    def signal_win_rate(moves):
-        if not moves or not confirmed: return None, len(moves)
-        wins = 0
-        total = 0
+    # C2: แยก signal_conversion_rate (signal → confirmed) vs settled_win_rate (actual outcome)
+    def signal_conversion_rate(moves):
+        """วัด % ของ line-move signals ที่ถูก confirm เป็น trade ภายใน 30 นาที"""
+        if not moves: return None, len(moves)
+        converted = 0
+        total_m = 0
         for m in moves:
             m_ts = datetime.fromisoformat(m.ts.replace("Z","+00:00")) if "Z" in m.ts else datetime.fromisoformat(m.ts)
+            total_m += 1
             for t in confirmed:
                 t_ts = datetime.fromisoformat(t.created_at)
-                if abs((t_ts - m_ts).total_seconds()) < 1800:  # 30 นาที
-                    if m.event in t.event or t.event in m.event:
-                        total += 1
-                        wins  += 1  # confirmed = win (arb)
-                        break
-        return (wins/total*100 if total > 0 else None), len(moves)
+                if abs((t_ts - m_ts).total_seconds()) < 1800 and (m.event in t.event or t.event in m.event):
+                    converted += 1
+                    break
+        return (converted / total_m * 100 if total_m > 0 else None), total_m
 
-    rlm_wr,   rlm_cnt   = signal_win_rate(rlm_moves)
-    steam_wr, steam_cnt = signal_win_rate(steam_moves)
+    def signal_win_rate(moves):
+        """C2: วัด % ที่ trade ที่ match สัญญาณนั้น settled ด้วยกำไร (actual_profit_thb >= 0)"""
+        if not moves: return None, len(moves)
+        wins = 0
+        total = 0
+        settled_confirmed = [t for t in confirmed if t.actual_profit_thb is not None]
+        for m in moves:
+            m_ts = datetime.fromisoformat(m.ts.replace("Z","+00:00")) if "Z" in m.ts else datetime.fromisoformat(m.ts)
+            for t in settled_confirmed:
+                t_ts = datetime.fromisoformat(t.created_at)
+                if abs((t_ts - m_ts).total_seconds()) < 1800 and (m.event in t.event or t.event in m.event):
+                    total += 1
+                    if t.actual_profit_thb >= 0:
+                        wins += 1
+                    break
+        return (wins / total * 100 if total > 0 else None), len(moves)
+
+    rlm_conv,   rlm_cnt   = signal_conversion_rate(rlm_moves)
+    steam_conv, steam_cnt = signal_conversion_rate(steam_moves)
+    rlm_wr,   _   = signal_win_rate(rlm_moves)
+    steam_wr, _   = signal_win_rate(steam_moves)
     arb_total    = len(confirmed) + len(rejected)
     confirm_rate = (len(confirmed) / arb_total * 100) if arb_total > 0 else None
 
@@ -3809,10 +3898,12 @@ def calc_stats() -> dict:
         })
 
     return {
-        "rlm_win_rate":    rlm_wr,
-        "rlm_count":       rlm_cnt,
-        "steam_win_rate":  steam_wr,
-        "steam_count":     steam_cnt,
+        "rlm_conversion_rate":  rlm_conv,
+        "rlm_win_rate":          rlm_wr,
+        "rlm_count":             rlm_cnt,
+        "steam_conversion_rate": steam_conv,
+        "steam_win_rate":        steam_wr,
+        "steam_count":           steam_cnt,
         "arb_win_rate":    confirm_rate,
         "confirm_rate":    confirm_rate,
         "confirmed_trades":len(confirmed),
@@ -3897,10 +3988,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not DASHBOARD_TOKEN:
             return True  # ไม่ได้ตั้ง token = ไม่บังคับ auth
         auth = self.headers.get("Authorization", "")
-        # รองรับทั้ง header และ query param ?token=xxx
-        from urllib.parse import urlparse, parse_qs
-        qs_token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
-        if auth == f"Bearer {DASHBOARD_TOKEN}" or qs_token == DASHBOARD_TOKEN:
+        # C6: Bearer header เท่านั้น — ไม่รองรับ query param (ป้องกัน token หลุดใน URL/log)
+        if auth == f"Bearer {DASHBOARD_TOKEN}":
             return True
         self.send_response(401)
         body = b'{"error":"unauthorized"}'
@@ -4028,7 +4117,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "turso_ok":          _turso_ok,
                 "db_write_halted":   _db_write_halted,
                 "last_scan":         last_scan_time,
-                "scan_in_progress":  _scan_in_progress,
+                "scan_in_progress":  bool(_scan_lock and _scan_lock.locked()),  # C1
                 "scan_count":        scan_count,
                 "pending":           pending_snap,
                 "api_remaining":     api_remaining,
