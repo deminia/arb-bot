@@ -95,7 +95,7 @@ MAX_STAKE_DAFABET  = _d("MAX_STAKE_DAFABET",  "0")
 # 7. Line movement threshold
 LINE_MOVE_THRESHOLD = _d("LINE_MOVE_THRESHOLD", "0.05")  # 5%
 # 9. Multi-chat
-ALL_CHAT_IDS = [CHAT_ID] + EXTRA_CHAT_IDS
+ALL_CHAT_IDS = list(dict.fromkeys([CHAT_ID] + EXTRA_CHAT_IDS))  # B7: dedupe
 # Polymarket liquidity filters
 POLY_MIN_LIQUIDITY      = float(os.getenv("POLY_MIN_LIQUIDITY",      "200"))   # USD
 POLY_MIN_DRAW_LIQUIDITY = float(os.getenv("POLY_MIN_DRAW_LIQUIDITY",  "100"))   # USD — Draw market มัก liquidity ต่ำกว่า
@@ -248,7 +248,8 @@ class TradeRecord:
 # ══════════════════════════════════════════════════════════════════
 _main_loop: Optional[asyncio.AbstractEventLoop] = None  # ref to main loop for cross-thread calls
 _scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
-_scan_in_progress: bool = False  # B6: ป้องกัน scan overlap
+_scan_in_progress: bool = False  # B6: ป้องกัน scan overlap (legacy — replaced by _scan_lock)
+_scan_lock: Optional[asyncio.Lock] = None  # B1: asyncio-safe scan mutex
 _now_last_ts: float = 0  # A5: timestamp ที่กด /now ล่าสุด
 _bot_start_ts: float = time.time()  # D2: uptime
 _last_error: str = ""  # D2: last error message
@@ -575,14 +576,7 @@ def db_save_opportunity(opp: dict):
     _schedule_coro(_async_save_opp(opp))
 
 async def _async_save_opp(opp: dict):
-    # C9: migrate opportunity_log table ให้มี 3-way columns
-    for _col, _sql in [
-        ("leg3_bm",        "ALTER TABLE opportunity_log ADD COLUMN leg3_bm TEXT DEFAULT NULL"),
-        ("stake3_thb",     "ALTER TABLE opportunity_log ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
-        ("total_stake_thb","ALTER TABLE opportunity_log ADD COLUMN total_stake_thb INTEGER DEFAULT NULL"),
-    ]:
-        try: await turso_exec(_sql)
-        except Exception: pass  # column exists
+    # B5: migration ย้ายไป db_load_all startup แล้ว — ไม่ต้อง ALTER TABLE ทุก insert
     await turso_exec(
         """INSERT OR REPLACE INTO opportunity_log
            (id,event,sport,profit_pct,leg1_bm,leg1_odds,leg2_bm,leg2_odds,
@@ -637,6 +631,10 @@ async def db_load_all() -> tuple[list, list, list]:
             ("leg3_team", "ALTER TABLE trade_records ADD COLUMN leg3_team TEXT DEFAULT NULL"),
             ("leg3_odds", "ALTER TABLE trade_records ADD COLUMN leg3_odds REAL DEFAULT NULL"),
             ("stake3_thb","ALTER TABLE trade_records ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
+            # B5: opportunity_log 3-way migration ย้ายมาไว้ที่นี่ — ยิงแค่ครั้งเดียวตอน startup
+            ("opp_leg3_bm",        "ALTER TABLE opportunity_log ADD COLUMN leg3_bm TEXT DEFAULT NULL"),
+            ("opp_stake3_thb",     "ALTER TABLE opportunity_log ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
+            ("opp_total_stake_thb","ALTER TABLE opportunity_log ADD COLUMN total_stake_thb INTEGER DEFAULT NULL"),
         ]:
             try: await turso_exec(_sql)
             except Exception: pass  # column exists already
@@ -1021,21 +1019,23 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
                 msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
 
             # Dynamic Kelly Payout Calculator
-            # R2: เฉพาะ soft books เท่านั้น — ไม่แนะนำให้วางที่ Pinnacle
+            # R2/B9: เฉพาะ soft books เท่านั้น — Pinnacle ไม่แสดง Kelly section แต่ยัง send alert
             _soft_books = {"onexbet", "1xbet", "dafabet", "stake", "cloudbet", "betway", "unibet", "bwin"}
             _bm_key_norm = norm_bm_key(ctx.get("bm_key", lm.bookmaker))
-            if _bm_key_norm == "pinnacle" or _bm_key_norm not in _soft_books:
-                continue  # R2: skip — ไม่ใช่ soft book
             sharp_ctx = ctx.get("sharp_odds", 0.0)
             true_odds = sharp_ctx if sharp_ctx > 1.0 else float(lm.odds_before)
             soft_odds = float(lm.odds_after)     # ราคา Soft book ที่จะวาง
-            # R2: guard — ไม่มี soft stale price ที่ดีกว่า sharp จริง
-            if sharp_ctx <= 1.0 or sharp_ctx >= soft_odds:
-                continue  # ไม่มี edge จริง — soft ยังไม่ค้างไว้
-            rec_stake_thb, edge_pct = calc_valuebet_kelly(true_odds, soft_odds, grade)
+            _is_soft_with_edge = (
+                _bm_key_norm != "pinnacle"
+                and _bm_key_norm in _soft_books
+                and sharp_ctx > 1.0
+                and sharp_ctx < soft_odds  # soft ยังค้างราคาดีกว่า sharp
+            )
+            rec_stake_thb, edge_pct = (Decimal("0"), 0.0)
+            if _is_soft_with_edge:
+                rec_stake_thb, edge_pct = calc_valuebet_kelly(true_odds, soft_odds, grade)
             rec_stake_int = int(rec_stake_thb)
-
-            if rec_stake_int > 0 and edge_pct > 0:
+            if _is_soft_with_edge and rec_stake_int > 0 and edge_pct > 0:
                 payout = int(rec_stake_int * soft_odds)
                 profit = payout - rec_stake_int
                 fraction_map = {"A": "30%", "B": "15%", "C": "5%"}
@@ -1602,11 +1602,24 @@ async def async_fetch_extra_books(session: aiohttp.ClientSession, sport_key: str
         log.debug(f"[ExtraBooks] {sport_key}: {e}")
         return []
 
+_ODDS_API_SEM: Optional[asyncio.Semaphore] = None  # B8: จำกัด concurrent Odds API requests
+
+async def _fetch_odds_sem(session: aiohttp.ClientSession, sport: str) -> list[dict]:
+    """B8: wrap async_fetch_odds ด้วย Semaphore เพื่อไม่ให้ burst เกิน 5 concurrent"""
+    sem = _ODDS_API_SEM
+    if sem is None:
+        return await async_fetch_odds(session, sport)
+    async with sem:
+        return await async_fetch_odds(session, sport)
+
 async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
+    global _ODDS_API_SEM
+    if _ODDS_API_SEM is None:
+        _ODDS_API_SEM = asyncio.Semaphore(5)  # B8: max 5 concurrent Odds API requests
     async with aiohttp.ClientSession() as session:
         n = len(sports)
         results = await asyncio.gather(
-            *[async_fetch_odds(session, s) for s in sports],
+            *[_fetch_odds_sem(session, s) for s in sports],
             async_fetch_polymarket(session),
             async_fetch_kalshi(session),
             *([async_fetch_extra_books(session, s) for s in sports] if _s("EXTRA_BOOKMAKERS","") else []),
@@ -1865,9 +1878,16 @@ def find_draw_market(event_name: str, alt_markets: list) -> Optional[dict]:
     if not best: return None
 
     tokens  = best.get("tokens", [])
-    # หา token ที่เป็น "Yes" (Draw จะเกิด) — token[0] มักเป็น Yes
-    # ราคาของ Yes = probability draw → odds = 1/price
-    pa = Decimal(str(tokens[0].get("price", 0) or 0))
+    # B4: เลือก token ตาม label (Yes/Draw/Tie) แทน index 0 ที่ไม่รับประกัน order
+    _draw_labels = ("yes", "draw", "tie")
+    yes_token = next(
+        (t for t in tokens if str(t.get("outcome", "")).strip().lower() in _draw_labels),
+        None,
+    )
+    if yes_token is None:
+        return None  # ไม่มี Draw/Yes token ที่ชัดเจน
+
+    pa = Decimal(str(yes_token.get("price", 0) or 0))
     if pa <= 0.01: return None
 
     fee_pct = Decimal(str(best.get("_fee_pct", 0.02)))
@@ -1897,7 +1917,7 @@ def find_draw_market(event_name: str, alt_markets: list) -> Optional[dict]:
         "outcome":    "Draw",
         "odds_raw":   odds_raw,
         "odds":       odds_eff,
-        "token_id":   tokens[0].get("token_id", ""),
+        "token_id":   yes_token.get("token_id", ""),
     }
 
 
@@ -2416,6 +2436,38 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
     return opp.leg1.odds, opp.leg2.odds
 
 
+async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
+    """B2: ดึง live odds ของ soft book ก่อน VB confirm
+    Returns: live soft_odds (float) — คืน vb.soft_odds เดิมถ้าหาไม่เจอ
+    """
+    try:
+        cached_ts, cached_events = _refetch_cache.get(vb.sport, (0, []))
+        if time.time() - cached_ts < 15 and cached_events:
+            events = cached_events
+        else:
+            async with aiohttp.ClientSession() as session:
+                events = await async_fetch_odds(session, vb.sport)
+            _refetch_cache[vb.sport] = (time.time(), events)
+        bm_key_norm = norm_bm_key(vb.bookmaker)
+        for event in events:
+            ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
+            if not fuzzy_match(ename, vb.event, 0.7):
+                continue
+            for bm in event.get("bookmakers", []):
+                bk = bm.get("key", "")
+                if norm_bm_key(bk) != bm_key_norm:
+                    continue
+                for mkt in bm.get("markets", []):
+                    if mkt.get("key") != "h2h":
+                        continue
+                    for out in mkt.get("outcomes", []):
+                        if fuzzy_match(out.get("name", ""), vb.outcome, 0.8):
+                            return float(out.get("price", vb.soft_odds))
+    except Exception as e:
+        log.warning(f"[VBGuard] refetch failed: {e}")
+    return vb.soft_odds
+
+
 # ══════════════════════════════════════════════════════════════════
 #  EXECUTE
 # ══════════════════════════════════════════════════════════════════
@@ -2486,10 +2538,13 @@ async def execute_both(opp: ArbOpportunity) -> str:
     # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
 
     if is_3way:
-        # 3-way: ตรวจ profit เป็น positive เท่านั้น (live_profit คำนวณจาก 2-way ระหว่าง H/A ไม่ถูกต้อง เก็บไว้เป็น estimate)
-        w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
-        w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
-        w3 = (s3 * opp.leg3.odds_raw).quantize(Decimal("1"))
+        # B10: ใช้ live odds (after slippage) สำหรับ payout display — ไม่ใช้ odds_raw ที่ยังไม่หัก commission
+        _leg1_disp = live1 if 'live1' in dir() else opp.leg1.odds
+        _leg2_disp = live2 if 'live2' in dir() else opp.leg2.odds
+        _leg3_disp = live3 if 'live3' in dir() else opp.leg3.odds
+        w1 = (s1 * _leg1_disp).quantize(Decimal("1"))
+        w2 = (s2 * _leg2_disp).quantize(Decimal("1"))
+        w3 = (s3 * _leg3_disp).quantize(Decimal("1"))
         tt = s1 + s2 + s3
     else:
         # v10-3: Profitability Guard — rebalance s2 ถ้า rounding ทำให้ arb หาย
@@ -2633,6 +2688,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await query.edit_message_text(orig+"\n\n❌ *Value Bet Skipped*", parse_mode="Markdown")
             except Exception: pass
             return
+        # B2: VB slippage guard — refetch live odds ก่อน confirm
+        try: await query.edit_message_text(orig+"\n\n⏳ *ตรวจราคาล่าสุด...*", parse_mode="Markdown")
+        except Exception: pass
+        live_soft_odds = await refetch_valuebet_odds(vb)
+        _, live_edge = calc_valuebet_kelly(vb.true_odds, live_soft_odds, vb.grade)
+        if live_soft_odds < vb.soft_odds * 0.98 or live_edge <= 0:  # tolerance 2%
+            try:
+                await query.edit_message_text(
+                    orig + (
+                        f"\n\n🚫 *ABORT: Value เปลี่ยนแล้ว*\n"
+                        f"คาด `{vb.soft_odds:.3f}` → จริง `{live_soft_odds:.3f}`\n"
+                        f"edge ใหม่ = {live_edge:.2f}%"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception: pass
+            return
         # vb_confirm — แจ้ง Telegram พร้อม step-by-step
         sp = sport_to_path(vb.sport)
         bm_lower = vb.bookmaker.lower()
@@ -2753,7 +2825,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         auto_scan=True; quota_warned=False
         with _data_lock:
             seen_signals.clear()  # reset TTL timers เมื่อเปิด scan ใหม่
-            _pending_vb.clear()   # BugD: clear stale value bet signals
+            # B11: clear เฉพาะ expired VB signals — ไม่ลบที่ยังไม่หมดอายุ
+            _vb_ttl_now = int(os.getenv("SIGNAL_TTL_SEC", "900"))
+            _now_vb = time.time()
+            _expired_vb = [k for k, (_, ts) in _pending_vb.items() if _now_vb - ts > _vb_ttl_now]
+            for k in _expired_vb:
+                del _pending_vb[k]
         await update.message.reply_text(f"🟢 *Auto scan เปิด* — ทุก {SCAN_INTERVAL}s", parse_mode="Markdown")
     elif args[0].lower()=="off":
         auto_scan=False
@@ -2784,15 +2861,19 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_trades    = [t for t in settled if t.actual_profit_thb >= 0]
     lose_trades   = [t for t in settled if t.actual_profit_thb < 0]
     win_rate      = len(win_trades)/len(settled)*100 if settled else 0
+    # B3: แยก confirm_rate vs settled_win_rate ให้ชัดเจน
+    confirm_rate  = len(confirmed) / (len(confirmed) + len(rejected)) * 100 if (confirmed or rejected) else None
+    confirm_str   = f"{confirm_rate:.0f}%" if confirm_rate is not None else "N/A"
 
     await update.message.reply_text(
         f"💰 *P&L Summary*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Confirmed   : {len(confirmed)} trades\n"
+        f"  └ Confirm rate : {confirm_str} ({len(confirmed)} / {len(confirmed)+len(rejected)})\n"
         f"  └ Settled : {len(settled)} | Unsettled: {len(unsettled)}\n"
-        f"  └ Win/Lose: {len(win_trades)}W / {len(lose_trades)}L ({win_rate:.0f}%)\n"
+        f"  └ *Settled Win Rate*: {win_rate:.0f}% ({len(win_trades)}W/{len(lose_trades)}L)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Actual P&L  : *฿{actual_profit:+,}*\n"
+        f"💰 Actual P&L  : *฿{actual_profit:+,}*\n"
         f"📊 Est. Profit : ฿{int(total_profit):,} _(ยังไม่ settle)_\n"
         f"📈 CLV avg     : {clv_str}\n"
         f"_(CLV บวก = เอาชนะตลาด)_",
@@ -3011,12 +3092,15 @@ _sport_rotation_idx = 0  # v10-14: pointer สำหรับ rotation
 
 async def do_scan() -> int:
     global scan_count, last_scan_time, _sport_rotation_idx, _scan_in_progress, auto_scan, _last_error
-    # B6: ป้องกัน scan ซ้อน — ถ้า scan กำลังสแกนอยู่ ให้รอ
-    if _scan_in_progress:
-        log.debug("[Scan] อยู่ระหว่าง scan ทิ้ง request นี้")
+    # B1: asyncio.Lock — กัน race จาก /now + dashboard + scanner_loop พร้อมกัน
+    if _scan_lock is None:
+        log.warning("[Scan] lock not initialized")
         return 0
-    _scan_in_progress = True
-    try:
+    if _scan_lock.locked():
+        log.debug("[Scan] already running — skip")
+        return 0
+    async with _scan_lock:
+     try:
         # A4: Daily Loss Limit
         if MAX_DAILY_LOSS_THB > 0:
             today = datetime.now(timezone.utc).date()
@@ -3084,12 +3168,10 @@ async def do_scan() -> int:
         last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
         save_snapshot()   # 💾 บันทึก state
         return sent
-    except Exception as e:
+     except Exception as e:
         _last_error = f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {e!r}"
         log.error(f"[Scan] error: {e}", exc_info=True)
         return 0
-    finally:
-        _scan_in_progress = False
 
 
 # track events ที่รอดึง closing line
@@ -3181,6 +3263,7 @@ def register_closing_watch(opp: "ArbOpportunity"):
 # ══════════════════════════════════════════════════════════════════
 # track trades ที่รอ settle: signal_id → (trade, commence_dt)
 _pending_settlement: dict[str, tuple] = {}   # signal_id → (TradeRecord, datetime)
+_settle_alerted: set[str] = set()            # B6: signal_ids ที่แจ้ง postponed ไปแล้ว
 
 
 def register_for_settlement(trade: TradeRecord, commence: str):
@@ -3391,11 +3474,17 @@ async def settle_completed_trades():
                         ct = parse_commence(matched_event.get("commence_time",""))
                         if (datetime.now(timezone.utc) - ct).total_seconds() > 6 * 3600:
                             log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
-                            if _app:
+                            # B6: แจ้งครั้งเดียว — ไม่ spam ทุกรอบ
+                            if _app and signal_id not in _settle_alerted:
+                                _settle_alerted.add(signal_id)
                                 asyncio.get_running_loop().create_task(
                                     _app.bot.send_message(
                                         chat_id=CHAT_ID,
-                                        text=f"⏰ *Postponed?* `{md_escape(trade.event)}`\nเลยเวลาแข่งกว่า 6h แต่ยังไม่ completed\nแนะนำ settle ด้วยตนเอง: `/settle {trade.signal_id} draw`",
+                                        text=(
+                                            f"⏰ *Postponed?* `{md_escape(trade.event)}`\n"
+                                            f"เลยเวลาแข่งกว่า 6h แต่ยังไม่ completed\n"
+                                            f"แนะนำ settle ด้วยตนเอง: `/settle {trade.signal_id} draw`"
+                                        ),
                                         parse_mode="Markdown"
                                     )
                                 )
@@ -4118,7 +4207,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining, _main_loop
+    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining, _main_loop, _scan_lock
+    # B1: สร้าง asyncio.Lock ใน event loop ที่ถูกต้อง
+    _scan_lock = asyncio.Lock()
     # #33 บันทึก main event loop สำหรับ cross-thread db saves
     _main_loop = asyncio.get_running_loop()
 
