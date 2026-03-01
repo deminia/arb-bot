@@ -2052,7 +2052,8 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     if out_a in ("yes","no") or out_b in ("yes","no"):
         question = best.get("question","").lower()
         sport_name = best.get("_sport", "").lower()
-        is_soccer_like = any(s in sport_name for s in ("soccer", "football"))
+        # N4: narrow to strict soccer only — "football" alone covers American football (NFL)
+        is_soccer_like = sport_name == "soccer" or "association football" in sport_name
         if is_soccer_like:
             log.debug(f"[PolyYesNo] skip Yes/No soccer market: {best.get('question','')[:60]}")
             return None
@@ -2771,7 +2772,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
         live_profit, _, _ = calc_arb(live1, live2)
         drop_too_much = (orig_profit > 0 and
                         float(orig_profit - live_profit) / float(orig_profit) > 0.50)
-        # M3: abort ถ้า live < 0, drop > 50%, หรือ ต่ำกว่า MIN_PROFIT_PCT
+        # M3/N1: abort ถ้า live < 0, drop > 50%, หรือ ต่ำกว่า MIN_PROFIT_PCT
         if live_profit < Decimal("0") or drop_too_much or live_profit < MIN_PROFIT_PCT:
             _reason = (
                 "ติดลบ" if live_profit < 0
@@ -2779,6 +2780,12 @@ async def execute_both(opp: ArbOpportunity) -> str:
                 else "profit ลด >50%"
             )
             log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%} (was {float(orig_profit):.2%}) reason={_reason}")
+            raise ValueError(
+                f"🚫 *ABORT: Odds Dropped*\n"
+                f"ราคาเปลี่ยนขณะรอยืนยัน\n"
+                f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit):.2%}* ({_reason})\n"
+                f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
+            )
 
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
@@ -2803,12 +2810,13 @@ async def execute_both(opp: ArbOpportunity) -> str:
         w2 = (s2 * _leg2_disp).quantize(Decimal("1"))
         w3 = (s3 * _leg3_disp).quantize(Decimal("1"))
         tt = s1 + s2 + s3
-        # D3: post-rounding profitability guard for 3-way
+        # D3/N2: post-rounding profitability guard for 3-way
         rounded_profit_3 = (min(w1, w2, w3) - tt) / tt if tt > 0 else Decimal("0")
-        if rounded_profit_3 < Decimal("0"):
-            log.warning(f"[ProfitGuard-3way] ABORT {opp.event} — 3-way profit ติดลบหลัง rounding ({float(rounded_profit_3):.2%})")
+        if rounded_profit_3 < MIN_PROFIT_PCT:
+            _rp3_reason = "ติดลบ" if rounded_profit_3 < 0 else f"ต่ำกว่า threshold {float(MIN_PROFIT_PCT):.1%}"
+            log.warning(f"[ProfitGuard-3way] ABORT {opp.event} — 3-way profit {float(rounded_profit_3):.2%} after rounding ({_rp3_reason})")
             raise ValueError(
-                f"🚫 *Abort: 3-way profit ติดลบหลัง rounding* ({float(rounded_profit_3):.2%})\n"
+                f"🚫 *Abort: 3-way profit ต่ำกว่า threshold หลัง rounding* ({float(rounded_profit_3):.2%} < {float(MIN_PROFIT_PCT):.1%})\n"
                 f"edge บางเกินไปสำหรับทุนนี้ — รอ signal ใหม่"
             )
     else:
@@ -2841,6 +2849,15 @@ async def execute_both(opp: ArbOpportunity) -> str:
         w1 = (s1 * _od1).quantize(Decimal("1"))
         w2 = (s2 * _od2).quantize(Decimal("1"))
         tt = s1 + s2
+        # N2: final threshold check หลัง rebalance
+        _final_profit_2way = (min(w1, w2) - tt) / tt if tt > 0 else Decimal("0")
+        if _final_profit_2way < MIN_PROFIT_PCT:
+            _fp2_reason = "ติดลบ" if _final_profit_2way < 0 else f"ต่ำกว่า threshold {float(MIN_PROFIT_PCT):.1%}"
+            log.warning(f"[ProfitGuard-2way] ABORT {opp.event} — final profit {float(_final_profit_2way):.2%} after rebalance ({_fp2_reason})")
+            raise ValueError(
+                f"🚫 *Abort: profit ต่ำกว่า threshold หลัง rounding/rebalance* ({float(_final_profit_2way):.2%} < {float(MIN_PROFIT_PCT):.1%})\n"
+                f"รอ signal ใหม่ที่ profit สูงกว่า"
+            )
         w3 = None
 
     # D4: บันทึก live odds ที่ใช้จริง (after slippage) แทน odds_raw
@@ -3620,8 +3637,10 @@ async def watch_closing_lines():
                                     if mkt.get("key") != "h2h": continue
                                     for out in mkt.get("outcomes",[]):
                                         price = Decimal(str(out.get("price",1)))
-                                        # M2: ใช้ canonical key จาก info["event"] แทน ename จาก feed
-                                        update_clv(info["event"], out["name"], bk, price)
+                                        # M2: canonical key; N3: normalize Draw/Tie outcome
+                                        _out_name = out.get("name", "")
+                                        _norm_name = "Draw" if str(_out_name).strip().lower() in ("draw", "tie", "x") else _out_name
+                                        update_clv(info["event"], _norm_name, bk, price)
                                         if bk == "pinnacle":
                                             pinnacle_found = True
                             fetch_ok = True
