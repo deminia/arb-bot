@@ -1513,6 +1513,37 @@ async def async_fetch_polymarket(session: aiohttp.ClientSession) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════
 #  KALSHI FETCH
 # ══════════════════════════════════════════════════════════════════
+async def fetch_kalshi_market_detail(session: aiohttp.ClientSession, ticker: str) -> dict:
+    """G1: ดึง yes_bid/yes_ask ล่าสุดจาก Kalshi REST API ตาม ticker
+    Returns dict เดียวกับ fetch_poly_market_detail: {mid_price, ...}
+    ticker เช่น 'KXNBA-23NOV16-T225.5' — ไม่ใช่ synthetic '_yes'/'_no'
+    """
+    # strip synthetic suffix ที่เราต่อเองตอน build enriched
+    real_ticker = ticker.removesuffix("_yes").removesuffix("_no")
+    try:
+        _st, _data = await _http_get_with_retry(
+            session,
+            f"https://trading-api.kalshi.com/trade-api/v2/markets/{real_ticker}",
+            label=f"Kalshi/detail/{real_ticker}",
+        )
+        if _st != 200 or not isinstance(_data, dict): return {}
+        m = _data.get("market", _data)  # API v2 wraps in 'market'
+        yes_bid = float(m.get("yes_bid", 0) or 0) / 100
+        yes_ask = float(m.get("yes_ask", 0) or 0) / 100
+        if yes_bid <= 0 or yes_ask <= 0: return {}
+        yes_mid = (yes_bid + yes_ask) / 2
+        no_mid  = 1 - yes_mid
+        # return format เดียวกับ fetch_poly_market_detail
+        return {
+            "mid_price":     yes_mid,
+            "no_mid_price":  no_mid,
+            "best_bid":      yes_bid,
+            "best_ask":      yes_ask,
+            "spread":        yes_ask - yes_bid,
+        }
+    except Exception as e:
+        log.debug(f"[Kalshi/detail] {real_ticker}: {e}")
+        return {}
 async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
     """ดึง Kalshi sports markets — binary prediction markets (US regulated)
     Docs: https://trading-api.kalshi.com/trade-api/v2
@@ -1802,6 +1833,16 @@ def calc_valuebet_kelly(true_odds: float, soft_odds: float, grade: str) -> tuple
     return stake_thb, round(edge * 100, 2)
 
 
+def apply_vb_book_cap(stake_thb: Decimal, bookmaker: str) -> Decimal:
+    """G5: apply per-bookmaker max stake cap สำหรับ Value Bet (stake เป็น THB)"""
+    bm  = bookmaker.lower()
+    cap = next((v for k, v in MAX_STAKE_MAP.items() if k in bm), Decimal("0"))
+    if cap > 0 and stake_thb > cap:
+        log.debug(f"[VB-BookCap] {bookmaker}: ฿{int(stake_thb):,} → capped ฿{int(cap):,}")
+        return cap
+    return stake_thb
+
+
 def apply_max_stake(stake: Decimal, bookmaker: str) -> Decimal:
     """5. จำกัด stake ตาม MAX_STAKE ของแต่ละเว็บ"""
     bm  = bookmaker.lower()
@@ -1956,19 +1997,45 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     if not best: return None
 
     tokens   = best.get("tokens",[])
-    # ⚠️ Yes/No guard: ถ้า outcome labels เป็น Yes/No แต่ question ไม่ระบุเพียงทีมเดียว → skip (หลีก map ผิด)
+    # ⚠️ G2: Yes/No guard — parse proposition ก่อน map team เพื่อกัน swap เงียบ
     out_a = tokens[0].get("outcome","").lower()
     out_b = tokens[1].get("outcome","").lower()
     if out_a in ("yes","no") or out_b in ("yes","no"):
-        # Yes/No market: soccer มี draw — Yes ≠ home win เสมอไป (No อาจ = draw or away)
-        # รับเฉพาะระบุทั้ง 2 ทีม และ sport ไม่ใช่ soccer (basketball/MMA/tennis)
         question = best.get("question","").lower()
         sport_name = best.get("_sport", "").lower()
         is_soccer_like = any(s in sport_name for s in ("soccer", "football"))
-        both_teams = fuzzy_match(ta, question, 0.5) and fuzzy_match(tb, question, 0.5)
-        if is_soccer_like or not both_teams:
-            log.debug(f"[PolyYesNo] skip Yes/No market (soccer={is_soccer_like} both_teams={both_teams}): {best.get('question','')[:60]}")
+        if is_soccer_like:
+            log.debug(f"[PolyYesNo] skip Yes/No soccer market: {best.get('question','')[:60]}")
             return None
+        # parse proposition: เช่น "Will Celtics beat Lakers?" → Yes = Celtics, No = Lakers
+        ta_norm = normalize_team(ta)
+        tb_norm = normalize_team(tb)
+        q_lower  = question
+        # ตรวจว่า ta หรือ tb ปรากฏใน question
+        ta_in_q = fuzzy_match(ta_norm, q_lower, 0.4) or any(w in q_lower for w in ta_norm.split() if len(w)>3)
+        tb_in_q = fuzzy_match(tb_norm, q_lower, 0.4) or any(w in q_lower for w in tb_norm.split() if len(w)>3)
+        if not (ta_in_q and tb_in_q):
+            log.debug(f"[PolyYesNo] skip — can't parse both teams from question: {best.get('question','')[:60]}")
+            return None
+        # parse ว่า Yes = ทีมไหน (pattern: "Will X beat Y?" → Yes = X)
+        # ค้นหา pattern "Will <team> beat/win/defeat"
+        import re as _re
+        yes_team, no_team = ta, tb  # default: ta=home=Yes
+        _pat = _re.search(r'will\s+(.*?)\s+(?:beat|win|defeat)', q_lower)
+        if _pat:
+            subject = _pat.group(1).strip()
+            # subject ตรงกับทีมไหน
+            if fuzzy_match(subject, tb_norm, 0.5):
+                yes_team, no_team = tb, ta  # Yes = away
+            else:
+                yes_team, no_team = ta, tb  # Yes = home
+        # เซ็ต token ตาม mapping จริง — tokens[0]=Yes, tokens[1]=No
+        tokens_mapped = [
+            {**tokens[0], "outcome": yes_team},
+            {**tokens[1], "outcome": no_team},
+        ]
+        tokens = tokens_mapped
+        log.debug(f"[PolyYesNo] mapped Yes={yes_team} No={no_team} from: {best.get('question','')[:60]}")
     pa       = Decimal(str(tokens[0].get("price",0)))
     pb       = Decimal(str(tokens[1].get("price",0)))
     if pa <= 0 or pb <= 0: return None
@@ -2446,17 +2513,10 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
 
 async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
     """B2: ดึง live odds ของ soft book ก่อน VB confirm
+    G3: รวม EXTRA_BOOKMAKERS path — ถ้า bm ไม่อยู่ใน BOOKMAKERS ให้ fetch extra feed แทน
     Returns: live soft_odds (float) — คืน vb.soft_odds เดิมถ้าหาไม่เจอ
     """
-    try:
-        cached_ts, cached_events = _refetch_cache.get(vb.sport, (0, []))
-        if time.time() - cached_ts < 15 and cached_events:
-            events = cached_events
-        else:
-            async with aiohttp.ClientSession() as session:
-                events = await async_fetch_odds(session, vb.sport)
-            _refetch_cache[vb.sport] = (time.time(), events)
-        bm_key_norm = norm_bm_key(vb.bookmaker)
+    def _search_events(events: list, bm_key_norm: str) -> float | None:
         for event in events:
             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
             if not fuzzy_match(ename, vb.event, 0.7):
@@ -2466,11 +2526,34 @@ async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
                 if norm_bm_key(bk) != bm_key_norm:
                     continue
                 for mkt in bm.get("markets", []):
-                    if mkt.get("key") != "h2h":
-                        continue
+                    if mkt.get("key") != "h2h": continue
                     for out in mkt.get("outcomes", []):
                         if fuzzy_match(out.get("name", ""), vb.outcome, 0.8):
                             return float(out.get("price", vb.soft_odds))
+        return None
+
+    try:
+        bm_key_norm = norm_bm_key(vb.bookmaker)
+        # ตรวจว่า bm อยู่ใน BOOKMAKERS หรือ EXTRA
+        bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
+        extra_norm      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
+        use_extra = bm_key_norm not in bookmakers_norm and bm_key_norm in extra_norm
+
+        cache_key = f"{vb.sport}{'__extra' if use_extra else ''}"
+        cached_ts, cached_events = _refetch_cache.get(cache_key, (0, []))
+        if time.time() - cached_ts < 15 and cached_events:
+            events = cached_events
+        else:
+            async with aiohttp.ClientSession() as session:
+                if use_extra:
+                    events = await async_fetch_extra_books(session, vb.sport)
+                    log.debug(f"[VBGuard] refetch via extra feed for {vb.bookmaker}")
+                else:
+                    events = await async_fetch_odds(session, vb.sport)
+            _refetch_cache[cache_key] = (time.time(), events)
+        result = _search_events(events, bm_key_norm)
+        if result is not None:
+            return result
     except Exception as e:
         log.warning(f"[VBGuard] refetch failed: {e}")
     return vb.soft_odds
@@ -2492,13 +2575,17 @@ async def execute_both(opp: ArbOpportunity) -> str:
         live3 = opp.leg3.odds  # default = cached
         # F2: per-leg refetch ตาม source — Polymarket/Kalshi ยิง CLOB, sportsbook ใช้ live1/live2
         leg3_token = opp.leg3.raw.get("token_id", "") if opp.leg3.raw else ""
+        _leg3_bm   = opp.leg3.bookmaker.lower()
         if leg3_token:
             try:
                 async with aiohttp.ClientSession() as _sess:
-                    _book = await fetch_poly_market_detail(_sess, leg3_token)
+                    # G1: แยก endpoint ตาม source
+                    _book = (await fetch_kalshi_market_detail(_sess, leg3_token)
+                             if "kalshi" in _leg3_bm
+                             else await fetch_poly_market_detail(_sess, leg3_token))
                 if _book and _book.get("mid_price", 0) > 0:
                     _mid = Decimal(str(_book["mid_price"]))
-                    live3 = apply_slippage(Decimal("1") / _mid, opp.leg3.bookmaker.lower())
+                    live3 = apply_slippage(Decimal("1") / _mid, _leg3_bm)
                     log.info(f"[SlippageGuard-3way] live Draw refetched: {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
             except Exception as _e:
                 log.debug(f"[SlippageGuard-3way] draw refetch failed: {_e} — using cached")
@@ -2510,7 +2597,10 @@ async def execute_both(opp: ArbOpportunity) -> str:
             if _tok and ("polymarket" in _bm or "kalshi" in _bm):
                 try:
                     async with aiohttp.ClientSession() as _sess2:
-                        _b2 = await fetch_poly_market_detail(_sess2, _tok)
+                        # G1: แยก endpoint — Kalshi ใช้ REST API, Polymarket ใช้ CLOB
+                        _b2 = (await fetch_kalshi_market_detail(_sess2, _tok)
+                               if "kalshi" in _bm
+                               else await fetch_poly_market_detail(_sess2, _tok))
                     if _b2 and _b2.get("mid_price", 0) > 0:
                         _mid2 = Decimal(str(_b2["mid_price"]))
                         _live_val = apply_slippage(Decimal("1") / _mid2, _bm)
@@ -2543,7 +2633,10 @@ async def execute_both(opp: ArbOpportunity) -> str:
             if _tok2 and ("polymarket" in _bm2 or "kalshi" in _bm2):
                 try:
                     async with aiohttp.ClientSession() as _s3:
-                        _b3 = await fetch_poly_market_detail(_s3, _tok2)
+                        # G1: แยก endpoint — Kalshi ใช้ REST API, Polymarket ใช้ CLOB
+                        _b3 = (await fetch_kalshi_market_detail(_s3, _tok2)
+                               if "kalshi" in _bm2
+                               else await fetch_poly_market_detail(_s3, _tok2))
                     if _b3 and _b3.get("mid_price", 0) > 0:
                         _live_new = apply_slippage(Decimal("1") / Decimal(str(_b3["mid_price"])), _bm2)
                         if _leg_attr is opp.leg1: live1 = _live_new
@@ -2570,10 +2663,14 @@ async def execute_both(opp: ArbOpportunity) -> str:
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
     s3_raw = (opp.stake3*USD_TO_THB).quantize(Decimal("1")) if opp.stake3 else None
-    # Natural rounding
-    s1 = natural_round(s1_raw)
-    s2 = natural_round(s2_raw)
-    s3 = natural_round(s3_raw) if s3_raw is not None else None
+    # Natural rounding + G4: re-apply per-book cap หลัง round (ป้องกัน jitter ดันเกิน cap)
+    s1 = apply_max_stake(natural_round(s1_raw)/USD_TO_THB, opp.leg1.bookmaker)*USD_TO_THB
+    s2 = apply_max_stake(natural_round(s2_raw)/USD_TO_THB, opp.leg2.bookmaker)*USD_TO_THB
+    s1 = s1.quantize(Decimal("1"))
+    s2 = s2.quantize(Decimal("1"))
+    s3 = None
+    if s3_raw is not None and opp.leg3:
+        s3 = (apply_max_stake(natural_round(s3_raw)/USD_TO_THB, opp.leg3.bookmaker)*USD_TO_THB).quantize(Decimal("1"))
     # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
 
     if is_3way:
@@ -2784,7 +2881,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # recalc stake ตาม live edge
         # F1: return order คือ (stake, edge) — ไม่ใช่ (edge, stake)
         executed_stake_dec, executed_edge_recalc = calc_valuebet_kelly(vb.true_odds, executed_soft_odds, vb.grade)
-        executed_stake_thb = int(executed_stake_dec) if executed_stake_dec else int(vb.rec_stake_thb)
+        _raw_stake = Decimal(str(int(executed_stake_dec))) if executed_stake_dec else Decimal(str(int(vb.rec_stake_thb)))
+        # G5: apply per-book cap (MAX_STAKE_* env) ก่อนส่ง Telegram
+        executed_stake_thb = int(apply_vb_book_cap(_raw_stake, vb.bookmaker))
         # vb_confirm — แจ้ง Telegram พร้อม step-by-step
         sp = sport_to_path(vb.sport)
         bm_lower = vb.bookmaker.lower()
@@ -3681,6 +3780,11 @@ async def settle_completed_trades():
                             except Exception: pass
                     continue  # ไม่ append settled_ids — ค้างใน _pending_settlement จนคนกด settle เอง
 
+                # G8: double-settle guard — ป้องกัน race กับ /settle command
+                if trade.actual_profit_thb is not None or trade.settled_at is not None:
+                    log.info(f"[Settle] {trade.signal_id} already settled — skip auto-settle")
+                    settled_ids.append(signal_id)
+                    continue
                 # คำนวณ P&L จริง
                 actual_profit = calc_actual_pnl(trade, winner)
                 total_staked  = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
@@ -3873,16 +3977,23 @@ def calc_stats() -> dict:
 
     # เชื่อม RLM กับ trade ที่เกิดขึ้นหลังสัญญาณ (ภายใน 30 นาที)
     # C2: แยก signal_conversion_rate (signal → confirmed) vs settled_win_rate (actual outcome)
+    # G9: helper กัน naive vs aware datetime TypeError
+    def _parse_ts(s: str) -> datetime:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
     def signal_conversion_rate(moves):
         """วัด % ของ line-move signals ที่ถูก confirm เป็น trade ภายใน 30 นาที"""
         if not moves: return None, len(moves)
         converted = 0
         total_m = 0
         for m in moves:
-            m_ts = datetime.fromisoformat(m.ts.replace("Z","+00:00")) if "Z" in m.ts else datetime.fromisoformat(m.ts)
+            try: m_ts = _parse_ts(m.ts)
+            except Exception: continue
             total_m += 1
             for t in confirmed:
-                t_ts = datetime.fromisoformat(t.created_at)
+                try: t_ts = _parse_ts(t.created_at)
+                except Exception: continue
                 if abs((t_ts - m_ts).total_seconds()) < 1800 and (m.event in t.event or t.event in m.event):
                     converted += 1
                     break
@@ -3895,9 +4006,11 @@ def calc_stats() -> dict:
         total = 0
         settled_confirmed = [t for t in confirmed if t.actual_profit_thb is not None]
         for m in moves:
-            m_ts = datetime.fromisoformat(m.ts.replace("Z","+00:00")) if "Z" in m.ts else datetime.fromisoformat(m.ts)
+            try: m_ts = _parse_ts(m.ts)
+            except Exception: continue
             for t in settled_confirmed:
-                t_ts = datetime.fromisoformat(t.created_at)
+                try: t_ts = _parse_ts(t.created_at)
+                except Exception: continue
                 if abs((t_ts - m_ts).total_seconds()) < 1800 and (m.event in t.event or t.event in m.event):
                     total += 1
                     if t.actual_profit_thb >= 0:
@@ -4090,6 +4203,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # save ลง DB ด้วย
                 if ok:
                     db_save_state(f"cfg_{key}", value)
+                    # G6: clear stats cache เมื่อ config เปลี่ยน
+                    _stats_cache["data"] = None
+                    _stats_cache["ts"]   = 0
                 resp = json.dumps({"ok": ok, "msg": msg}).encode()
                 self.send_response(200 if ok else 400)
                 self.send_header("Content-Type","application/json")
@@ -4471,31 +4587,35 @@ async def post_init(app: Application):
 
 
 def handle_shutdown(signum, frame):
-    """สาย shutdown — บันทึก state ขึ้น Turso (sync) หรือ SQLite fallback"""
+    """G7: save state — SQLite sync ก่อนเสมอ (fast, signal-safe), Turso เฉพาะ loop ไม่วิ่ง"""
     log.info("[Shutdown] กำลังบันทึก state...")
-    stmts = []
-    for k, v in [
+    state_pairs = [
         ("scan_count",     str(scan_count)),
         ("auto_scan",      str(auto_scan)),
         ("last_scan_time", last_scan_time),
         ("api_remaining",  str(api_remaining)),
-    ]:
-        stmts.append({"sql": "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", "args": [k, v]})
+    ]
+    # 1) SQLite local ก่อนเสมอ — sync-safe ใน signal handler
     try:
-        # E9: ใช้ _turso_url/_turso_token ตรงๆ — fallback ไป TURSO_URL ถ้า init ยังไม่เสร็จ (SIGTERM ระหว่าง startup)
-        _url   = _turso_url or TURSO_URL.replace("libsql://", "https://").replace("wss://", "https://")
-        _token = _turso_token or TURSO_TOKEN
-        if _url and _token:
-            _turso_http(stmts)  # sync via urllib — ใช้ได้ใน signal handler
-            log.info("[Shutdown] saved to Turso. Bye!")
-        else:
-            with sqlite3.connect(DB_PATH, timeout=5) as con:
-                for s in stmts:
-                    con.execute(s["sql"], s["args"])
-                con.commit()
-            log.info("[Shutdown] saved to SQLite. Bye!")
+        with sqlite3.connect(DB_PATH, timeout=3) as con:
+            for k, v in state_pairs:
+                con.execute("INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", (k, v))
+            con.commit()
+        log.info("[Shutdown] saved to SQLite")
     except Exception as ex:
-        log.error(f"[Shutdown] save failed: {ex}")
+        log.error(f"[Shutdown] sqlite save failed: {ex}")
+    # 2) Turso เฉพาะถ้า init เสร็จ และ asyncio loop ไม่ได้วิ่งอยู่ (ป้องกัน deadlock)
+    _url   = _turso_url or TURSO_URL.replace("libsql://", "https://").replace("wss://", "https://")
+    _token = _turso_token or TURSO_TOKEN
+    _loop_running = _main_loop is not None and _main_loop.is_running()
+    if _turso_ok and _url and _token and not _loop_running:
+        try:
+            stmts = [{"sql": "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
+                      "args": [k, v]} for k, v in state_pairs]
+            _turso_http(stmts)
+            log.info("[Shutdown] saved to Turso. Bye!")
+        except Exception as ex:
+            log.error(f"[Shutdown] turso save failed: {ex}")
     os._exit(0)
 
 
