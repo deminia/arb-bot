@@ -1109,21 +1109,26 @@ def update_clv(event: str, outcome: str, bookmaker: str, final_odds: Decimal):
 def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
     CLV = (odds_got / closing_odds - 1) × 100%
-    บวก = เอาชนะตลาด | ลบ = แพ้ตลาด
+    L2: ใช้ Pinnacle closing line เป็น benchmark กลาง — ไม่ใช้ per-book lookup
+    ทำให้ CLV comparable ข้าม book (รวม alt markets ที่ไม่มี closing data ผ่าน Odds API)
     Returns: (clv_leg1, clv_leg2, clv_leg3)  — clv_leg3 = None for 2-way trades
     """
-    def _clv(event, outcome, bm, odds_got):
+    def _clv(event, outcome, odds_got):
         key = f"{event}|{outcome}"
-        co  = closing_odds.get(key, {}).get(norm_bm_key(bm))
+        bm_data = closing_odds.get(key, {})
+        # L2: Pinnacle เป็น benchmark ก่อน — fallback per-book ถ้าไม่มี Pinnacle
+        co = bm_data.get("pinnacle") or next(
+            (v for k, v in bm_data.items() if v and v > 0), None
+        )
         if co and co > 0:
             return round((float(odds_got) / float(co) - 1) * 100, 2)
         return None
 
-    clv1 = _clv(trade.event, trade.leg1_team or trade.leg1_bm, trade.leg1_bm, trade.leg1_odds)
-    clv2 = _clv(trade.event, trade.leg2_team or trade.leg2_bm, trade.leg2_bm, trade.leg2_odds)
+    clv1 = _clv(trade.event, trade.leg1_team or trade.leg1_bm, trade.leg1_odds)
+    clv2 = _clv(trade.event, trade.leg2_team or trade.leg2_bm, trade.leg2_odds)
     clv3 = None
     if trade.leg3_team and trade.leg3_bm and trade.leg3_odds:
-        clv3 = _clv(trade.event, trade.leg3_team, trade.leg3_bm, trade.leg3_odds)
+        clv3 = _clv(trade.event, trade.leg3_team, trade.leg3_odds)
     return clv1, clv2, clv3
 
 
@@ -1925,13 +1930,17 @@ def is_valid_odds(odds: Decimal) -> bool:
     """2. กรอง odds ที่ผิดปกติ"""
     return MIN_ODDS_ALLOWED <= odds <= MAX_ODDS_ALLOWED
 
-def make_cooldown_key(event: str, bm1: str, bm2: str, market_type: str = "2way") -> str:
-    """สร้าง cooldown key ที่ consistent สำหรับทั้ง read/write"""
+def make_cooldown_key(event: str, bm1: str, bm2: str, market_type: str = "2way", bm_draw: str = "") -> str:
+    """สร้าง cooldown key ที่ consistent สำหรับทั้ง read/write
+    L4: 3-way รวม draw bm เพื่อป้องกันผสม key กับ setup ที่ต่าง draw bm
+    """
+    if market_type == "3way" and bm_draw:
+        return f"3way|{event}|{bm1}|{bm_draw}|{bm2}"
     return f"{market_type}|{event}|{bm1}|{bm2}"
 
-def is_on_cooldown(event: str, bm1: str, bm2: str, market_type: str = "2way") -> bool:
+def is_on_cooldown(event: str, bm1: str, bm2: str, market_type: str = "2way", bm_draw: str = "") -> bool:
     """3. เช็ค alert cooldown"""
-    key  = make_cooldown_key(event, bm1, bm2, market_type)
+    key  = make_cooldown_key(event, bm1, bm2, market_type, bm_draw)
     last = alert_cooldown.get(key)
     if last and (datetime.now(timezone.utc) - last).total_seconds() < ALERT_COOLDOWN_MIN * 60:
         return True
@@ -2221,7 +2230,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                     bh, bd, ba = best[home_key], best[draw_key], best[away_key]
                     bms = {bh.bookmaker, bd.bookmaker, ba.bookmaker}
                     if len(bms) >= 2:
-                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker, "3way"):
+                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker, "3way", bd.bookmaker):
                             profit3, sh, sd, sa = calc_arb_3way(bh.odds, bd.odds, ba.odds)
                             if profit3 >= MIN_PROFIT_PCT:
                                 # Kelly — scale total stake by edge
@@ -2261,7 +2270,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                         profit_pct=profit3, stake1=sh, stake2=sa, stake3=sd,
                                     )
                                     found.append(opp)
-                                    alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker, "3way")] = datetime.now(timezone.utc)
+                                    alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker, "3way", bd.bookmaker)] = datetime.now(timezone.utc)
                                     log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%} stake=({float(sh):.2f},{float(sd):.2f},{float(sa):.2f})")
                 elif home_key and away_key and not draw_key:
                     # ไม่มี Draw — cross-book H vs A เท่านั้น (ไม่ใช่ 1X2 ครบ 3 หน้า)
@@ -2539,6 +2548,7 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
         # C10: cache แยกตาม feed (15s TTL)
         std_events   = []
         extra_events = []
+        # L1: ใช้ semaphore wrappers — ไม่ยิง direct
         async with aiohttp.ClientSession() as session:
             if need_standard:
                 _ck = opp.sport
@@ -2546,7 +2556,7 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
                 if now_ts - _cts < 15 and _cev:
                     std_events = _cev
                 else:
-                    std_events = await async_fetch_odds(session, opp.sport)
+                    std_events = await _fetch_odds_sem(session, opp.sport)
                     _refetch_cache[_ck] = (now_ts, std_events)
             if need_extra and _extra_norm:
                 _ck2 = f"{opp.sport}__extra"
@@ -2554,7 +2564,7 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
                 if now_ts - _cts2 < 15 and _cev2:
                     extra_events = _cev2
                 else:
-                    extra_events = await async_fetch_extra_books(session, opp.sport)
+                    extra_events = await _fetch_extra_books_sem(session, opp.sport)
                     _refetch_cache[_ck2] = (now_ts, extra_events)
 
         if leg1_extra != leg2_extra:
@@ -3140,10 +3150,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
     except Exception as e:  # C4: generic catch — network/parse/decimal errors
         log.error(f"[Confirm] execute_both failed: {e}", exc_info=True)
+        # L3: ส่ง reply_markup กลับไปเหมือน abort path — ให้ user กด retry ได้
+        _err_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Retry",   callback_data=f"confirm:{sid}"),
+            InlineKeyboardButton("❌ Reject",   callback_data=f"reject:{sid}"),
+        ]])
         try:
             await query.edit_message_text(
                 orig + "\n\n❌ *Execution failed*\nระบบขัดข้องระหว่างยืนยัน กรุณาลองใหม่",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=_err_kb,
             )
         except Exception: pass
 
@@ -3575,8 +3591,14 @@ async def watch_closing_lines():
             if to_fetch:
                 async with aiohttp.ClientSession() as session:
                     for key, info in to_fetch:
-                        sport = info["sport"]
-                        events = await async_fetch_odds(session, sport)
+                        sport  = info["sport"]
+                        # L6: fetch both standard + extra feeds for closing lines
+                        std_ev   = await _fetch_odds_sem(session, sport)
+                        extra_ev = await _fetch_extra_books_sem(session, sport) if _s("EXTRA_BOOKMAKERS", "") else []
+                        # merge: extra events not in std (by home+away key)
+                        _std_keys = {(e.get("home_team",""), e.get("away_team","")) for e in std_ev}
+                        events = std_ev + [e for e in extra_ev
+                                          if (e.get("home_team",""), e.get("away_team","")) not in _std_keys]
                         fetch_ok = False
                         for event in events:
                             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
@@ -4239,8 +4261,8 @@ def calc_stats() -> dict:
         "steam_conversion_rate": steam_conv,
         "steam_win_rate":        steam_wr,
         "steam_count":           steam_cnt,
-        "arb_win_rate":    confirm_rate,
-        "confirm_rate":    confirm_rate,
+        "confirm_rate":    confirm_rate,  # L5: ลบ arb_win_rate (ทำให้สับสน) — ใช้ confirm_rate เอก
+
         "confirmed_trades":len(confirmed),
         "sharp_count":     sharp_count,
         "public_count":    public_count,
