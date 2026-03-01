@@ -691,7 +691,7 @@ async def db_load_all() -> tuple[list, list, list]:
                     settled_at=r[14],created_at=r[15]))
 
         opps_rows = await turso_query(
-            "SELECT * FROM opportunity_log ORDER BY created_at ASC LIMIT 100")  # S2: ASC
+            "SELECT * FROM opportunity_log ORDER BY created_at DESC LIMIT 50")  # newest 50; reversed below → oldest-first in memory
         opps = []
         for r in opps_rows:
             n = len(r)
@@ -718,6 +718,7 @@ async def db_load_all() -> tuple[list, list, list]:
             is_steam=bool(int(r[9] or 0)),is_rlm=bool(int(r[10] or 0)),ts=r[11])
                for r in lm_rows]
 
+        opps.reverse()  # loaded DESC (newest first) → reverse to oldest-first for runtime append semantics
         log.info(f"[DB] loaded: trades={len(trades)}, opps={len(opps)}, moves={len(lms)}")
         return trades, opps, lms
     except Exception as e:
