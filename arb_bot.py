@@ -1043,6 +1043,10 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             if _is_soft_with_edge:
                 rec_stake_thb, edge_pct = calc_valuebet_kelly(true_odds, soft_odds, grade)
             rec_stake_int = int(rec_stake_thb)
+            # H6: apply per-book cap ตั้งแต่สร้าง signal — alert กับ confirm แสดงตัวเลขเดียวกัน
+            if _is_soft_with_edge and rec_stake_thb > 0:
+                rec_stake_thb = apply_vb_book_cap(rec_stake_thb, lm.bookmaker)
+            rec_stake_int = int(rec_stake_thb)
             if _is_soft_with_edge and rec_stake_int > 0 and edge_pct > 0:
                 payout = int(rec_stake_int * soft_odds)
                 profit = payout - rec_stake_int
@@ -1736,16 +1740,29 @@ def natural_round(amount: Decimal) -> Decimal:
     < 50,000  → ปัดเป็นทวีคูณ 500  (เช่น 10,230 → 10,000 หรือ 10,500)
     >= 50,000 → ปัดเป็นทวีคูณ 1,000 (เช่น 52,300 → 52,000)
     + random jitter ±1 step เพื่อให้ไม่ซ้ำกันทุกครั้ง
+    ใช้สำหรับ Kelly total stake sizing — apply MIN/MAX KELLY clamp
     """
     step = Decimal("500") if amount < Decimal("50000") else Decimal("1000")
-    # ปัดลงก่อน แล้วสุ่ม +0 หรือ +1 step (50/50)
     base = (amount // step) * step
     jitter = step if random.random() < 0.5 else Decimal("0")
     result = base + jitter
-    # R7: clamp อีกรอบหลัง round — natural_round อาจดัน stake เกิน MAX_KELLY_STAKE
+    # R7: clamp — Kelly stake ไม่ควรเกิน MAX_KELLY_STAKE
     result = min(result, MAX_KELLY_STAKE)
     result = max(result, MIN_KELLY_STAKE)
     return result
+
+
+def natural_round_leg(amount: Decimal) -> Decimal:
+    """H3: per-leg rounding — ไม่ได้ floor ขึ้น MIN_KELLY_STAKE
+    ใช้ใน execute_both() เท่านั้น — per-leg stake ควร round ไม่ควรถูก force ขึ้นเป็น 10,000
+    """
+    step = Decimal("500") if amount < Decimal("50000") else Decimal("1000")
+    base = (amount // step) * step
+    jitter = step if random.random() < 0.5 else Decimal("0")
+    result = base + jitter
+    # clamp เฉพาะ MAX — ไม่ floor MIN (ไม่งั้น stake ต่อ leg)
+    result = min(result, MAX_KELLY_STAKE)
+    return max(result, Decimal("100"))  # floor ต่ำมาก 100 บาทเพื่อกัน 0
 
 
 def get_current_bankroll() -> Decimal:
@@ -2017,18 +2034,20 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
         if not (ta_in_q and tb_in_q):
             log.debug(f"[PolyYesNo] skip — can't parse both teams from question: {best.get('question','')[:60]}")
             return None
-        # parse ว่า Yes = ทีมไหน (pattern: "Will X beat Y?" → Yes = X)
-        # ค้นหา pattern "Will <team> beat/win/defeat"
+        # H5: parse ว่า Yes = ทีมไหน — ถ้า parse ไม่ชัด return None แทนเดา
         import re as _re
-        yes_team, no_team = ta, tb  # default: ta=home=Yes
-        _pat = _re.search(r'will\s+(.*?)\s+(?:beat|win|defeat)', q_lower)
-        if _pat:
-            subject = _pat.group(1).strip()
-            # subject ตรงกับทีมไหน
-            if fuzzy_match(subject, tb_norm, 0.5):
-                yes_team, no_team = tb, ta  # Yes = away
-            else:
-                yes_team, no_team = ta, tb  # Yes = home
+        _pat = _re.search(r'will\s+(.*?)\s+(?:beat|win|defeat|cover)', q_lower)
+        if not _pat:
+            log.debug(f"[PolyYesNo] skip — can't parse Yes team from: {best.get('question','')[:60]}")
+            return None
+        subject = _pat.group(1).strip()
+        if fuzzy_match(subject, tb_norm, 0.5):
+            yes_team, no_team = tb, ta  # Yes = away
+        elif fuzzy_match(subject, ta_norm, 0.5):
+            yes_team, no_team = ta, tb  # Yes = home
+        else:
+            log.debug(f"[PolyYesNo] skip — subject '{subject}' doesn't match either team")
+            return None
         # เซ็ต token ตาม mapping จริง — tokens[0]=Yes, tokens[1]=No
         tokens_mapped = [
             {**tokens[0], "outcome": yes_team},
@@ -2233,15 +2252,18 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                 s_h_cap = apply_max_stake(s_h, bh.bookmaker)
                                 s_a_cap = apply_max_stake(s_a, ba.bookmaker)
                                 if s_h_cap != s_h or s_a_cap != s_a:
+                                    # I20: แปลง cap stake เป็น THB ก่อนคำนวณ new_total (USD)
                                     if s_h_cap < s_h:
+                                        limited_thb = s_h_cap * USD_TO_THB
                                         ratio = Decimal("1") / bh.odds
                                         margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
-                                        new_total = (s_h_cap * USD_TO_THB / USD_TO_THB) / ratio * margin
+                                        new_total = (limited_thb / USD_TO_THB) / ratio * margin
                                         profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
                                     else:
+                                        limited_thb = s_a_cap * USD_TO_THB
                                         ratio = Decimal("1") / ba.odds
                                         margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
-                                        new_total = (s_a_cap * USD_TO_THB / USD_TO_THB) / ratio * margin
+                                        new_total = (limited_thb / USD_TO_THB) / ratio * margin
                                         profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
                                 if profit >= MIN_PROFIT_PCT:
                                     opp = ArbOpportunity(
@@ -2472,18 +2494,33 @@ _refetch_cache: dict[str, tuple[float, list]] = {}  # C10: sport -> (ts, events)
 async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
     """
     Re-fetch ราคาล่าสุดจาก API ก่อนยืนยันการเดิมพัน
+    H2: รวม EXTRA_BOOKMAKERS path — ถ้า leg อยู่ใน extra ให้ fetch extra feed แทน
     Returns: (live_odds_leg1, live_odds_leg2)
     ถ้าหาไม่เจอ → คืนค่าเดิม (ไม่ abort)
     """
+    # H2: ตรวจ leg bookmakers ว่าอยู่ใน extra หรือไม่
+    _bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
+    _extra_norm      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
+    def _is_extra(bm: str) -> bool:
+        k = norm_bm_key(bm)
+        return k not in _bookmakers_norm and k in _extra_norm
+
     try:
         # C10: ใช้ cache ถ้าเพิ่ง fetch กีฬานี้ภายใน 15 วินาที
-        cached_ts, cached_events = _refetch_cache.get(opp.sport, (0, []))
+        leg1_extra = _is_extra(opp.leg1.bookmaker)
+        leg2_extra = _is_extra(opp.leg2.bookmaker)
+        cache_key = f"{opp.sport}{'__extra' if (leg1_extra or leg2_extra) else ''}"
+        cached_ts, cached_events = _refetch_cache.get(cache_key, (0, []))
         if time.time() - cached_ts < 15 and cached_events:
             events = cached_events
         else:
             async with aiohttp.ClientSession() as session:
-                events = await async_fetch_odds(session, opp.sport)
-            _refetch_cache[opp.sport] = (time.time(), events)
+                if leg1_extra or leg2_extra:
+                    events = await async_fetch_extra_books(session, opp.sport)
+                    log.debug(f"[SlippageGuard] refetch via extra feed ({opp.leg1.bookmaker}/{opp.leg2.bookmaker})")
+                else:
+                    events = await async_fetch_odds(session, opp.sport)
+            _refetch_cache[cache_key] = (time.time(), events)
         for event in events:
             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
             if not fuzzy_match(ename, opp.event, 0.7): continue
@@ -2583,8 +2620,10 @@ async def execute_both(opp: ArbOpportunity) -> str:
                     _book = (await fetch_kalshi_market_detail(_sess, leg3_token)
                              if "kalshi" in _leg3_bm
                              else await fetch_poly_market_detail(_sess, leg3_token))
-                if _book and _book.get("mid_price", 0) > 0:
-                    _mid = Decimal(str(_book["mid_price"]))
+                # H1: leg3 Draw token — ใช้ no_mid_price ถ้าเป็น _no token
+                _is_no_leg3 = leg3_token.endswith("_no")
+                if _book and (_book.get("mid_price", 0) > 0 or _book.get("no_mid_price", 0) > 0):
+                    _mid = Decimal(str(_book["no_mid_price"] if _is_no_leg3 else _book["mid_price"]))
                     live3 = apply_slippage(Decimal("1") / _mid, _leg3_bm)
                     log.info(f"[SlippageGuard-3way] live Draw refetched: {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
             except Exception as _e:
@@ -2601,8 +2640,9 @@ async def execute_both(opp: ArbOpportunity) -> str:
                         _b2 = (await fetch_kalshi_market_detail(_sess2, _tok)
                                if "kalshi" in _bm
                                else await fetch_poly_market_detail(_sess2, _tok))
-                    if _b2 and _b2.get("mid_price", 0) > 0:
-                        _mid2 = Decimal(str(_b2["mid_price"]))
+                    _is_no_tok2 = _tok.endswith("_no")
+                    if _b2 and (_b2.get("mid_price", 0) > 0 or _b2.get("no_mid_price", 0) > 0):
+                        _mid2 = Decimal(str(_b2["no_mid_price"] if _is_no_tok2 else _b2["mid_price"]))
                         _live_val = apply_slippage(Decimal("1") / _mid2, _bm)
                         if _live_ref == "live1": live1 = _live_val
                         else: live2 = _live_val
@@ -2628,17 +2668,19 @@ async def execute_both(opp: ArbOpportunity) -> str:
         live1, live2 = await refetch_live_odds(opp)
         # F2: 2-way per-leg refetch ถ้า leg มาจาก Polymarket/Kalshi
         for _leg_attr, _live_init in [(opp.leg1, live1), (opp.leg2, live2)]:
-            _bm2  = _leg_attr.bookmaker.lower()
-            _tok2 = _leg_attr.raw.get("token_id", "") if _leg_attr.raw else ""
-            if _tok2 and ("polymarket" in _bm2 or "kalshi" in _bm2):
+            _leg = _leg_attr
+            _bm  = _leg.bookmaker.lower()
+            _tok = _leg.raw.get("token_id", "") if _leg.raw else ""
+            if _tok and ("polymarket" in _bm or "kalshi" in _bm):
                 try:
                     async with aiohttp.ClientSession() as _s3:
                         # G1: แยก endpoint — Kalshi ใช้ REST API, Polymarket ใช้ CLOB
-                        _b3 = (await fetch_kalshi_market_detail(_s3, _tok2)
-                               if "kalshi" in _bm2
-                               else await fetch_poly_market_detail(_s3, _tok2))
-                    if _b3 and _b3.get("mid_price", 0) > 0:
-                        _live_new = apply_slippage(Decimal("1") / Decimal(str(_b3["mid_price"])), _bm2)
+                        _b3 = (await fetch_kalshi_market_detail(_s3, _tok)
+                               if "kalshi" in _bm
+                               else await fetch_poly_market_detail(_s3, _tok))
+                    _is_no_tok3 = _tok.endswith("_no")
+                    if _b3 and (_b3.get("mid_price", 0) > 0 or _b3.get("no_mid_price", 0) > 0):
+                        _live_new = apply_slippage(Decimal("1") / Decimal(str(_b3["no_mid_price"] if _is_no_tok3 else _b3["mid_price"])), _bm)
                         if _leg_attr is opp.leg1: live1 = _live_new
                         else: live2 = _live_new
                         log.info(f"[SlippageGuard-2way] alt-market refetched: {_leg_attr.bookmaker} {float(_live_new):.3f}")
@@ -2663,14 +2705,15 @@ async def execute_both(opp: ArbOpportunity) -> str:
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
     s3_raw = (opp.stake3*USD_TO_THB).quantize(Decimal("1")) if opp.stake3 else None
-    # Natural rounding + G4: re-apply per-book cap หลัง round (ป้องกัน jitter ดันเกิน cap)
-    s1 = apply_max_stake(natural_round(s1_raw)/USD_TO_THB, opp.leg1.bookmaker)*USD_TO_THB
-    s2 = apply_max_stake(natural_round(s2_raw)/USD_TO_THB, opp.leg2.bookmaker)*USD_TO_THB
+    # H3: natural_round_leg() — per-leg, ไม่ floor MIN_KELLY_STAKE
+    # G4: re-apply per-book cap หลัง round (ป้องกัน jitter ดันเกิน cap)
+    s1 = apply_max_stake(natural_round_leg(s1_raw)/USD_TO_THB, opp.leg1.bookmaker)*USD_TO_THB
+    s2 = apply_max_stake(natural_round_leg(s2_raw)/USD_TO_THB, opp.leg2.bookmaker)*USD_TO_THB
     s1 = s1.quantize(Decimal("1"))
     s2 = s2.quantize(Decimal("1"))
     s3 = None
     if s3_raw is not None and opp.leg3:
-        s3 = (apply_max_stake(natural_round(s3_raw)/USD_TO_THB, opp.leg3.bookmaker)*USD_TO_THB).quantize(Decimal("1"))
+        s3 = (apply_max_stake(natural_round_leg(s3_raw)/USD_TO_THB, opp.leg3.bookmaker)*USD_TO_THB).quantize(Decimal("1"))
     # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
 
     if is_3way:
@@ -2702,6 +2745,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
         if rounded_profit < Decimal("0"):
             # rebalance: หา s2 ที่ทำให้ w2 >= w1 (worst-case break-even)
             s2_rebalanced = (w1 / _od2).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
+            # H4: re-apply cap หลัง rebalance — s2_rebalanced อาจเกิน cap
+            s2_rebalanced = (apply_max_stake(s2_rebalanced/USD_TO_THB, opp.leg2.bookmaker)*USD_TO_THB).quantize(Decimal("1"))
             # D2: ใช้ _od2 ตลอด — ไม่ย้อนกลับไป odds_raw
             rebalanced_profit = (min(w1, (s2_rebalanced * _od2).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
             if rebalanced_profit >= Decimal("0"):
@@ -3925,7 +3970,8 @@ async def scanner_loop():
 async def keep_alive_ping():
     """#31 Render keep-alive — self-ping /health ทุก 14 นาที เพื่อกัน Render free tier sleep"""
     await asyncio.sleep(60)  # รอ bot start ก่อน
-    url = f"http://localhost:{PORT}/health"
+    # I22: ใช้ 127.0.0.1 แทน localhost — Railway/Render container policy
+    url = f"http://127.0.0.1:{PORT}/health"
     log.info(f"[KeepAlive] self-ping loop started → {url}")
     while True:
         try:
@@ -4537,10 +4583,9 @@ async def post_init(app: Application):
                 if ct_str:
                     commence_dt = parse_commence(ct_str)
                 else:
-                    # fallback สำหรับ trade เก่าที่ไม่มี commence_time
-                    commence_dt = datetime.fromisoformat(
-                        t.created_at.replace("Z", "+00:00")
-                    ) + timedelta(hours=3)
+                    # I21: ไม่รู้เวลาแข่ง — ตั้ง +24h จากตอนนี้ กัน settle ก่อนกำหนด
+                    commence_dt = datetime.now(timezone.utc) + timedelta(hours=24)
+                    log.warning(f"[Settle] trade {t.signal_id} ไม่มี commence_time — ตั้ง settle check ใน 24h")
             except Exception:
                 commence_dt = datetime.now(timezone.utc)
             _pending_settlement[t.signal_id] = (t, commence_dt)
