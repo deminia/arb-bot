@@ -471,7 +471,7 @@ async def turso_exec(sql: str, params: tuple = ()):
                 emsg = str(e).lower()
                 # benign migration errors — skip retry, no warning
                 if "duplicate column" in emsg or "already exists" in emsg:
-                    log.info(f"[DB] turso_exec migration (ok): {e}")
+                    log.debug(f"[DB] turso_exec migration (ok): {e}")
                     return
                 if attempt < 2:
                     log.warning(f"[DB] turso_exec attempt {attempt+1} failed: {e!r}")
