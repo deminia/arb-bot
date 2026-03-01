@@ -3570,7 +3570,6 @@ async def do_scan() -> int:
         return 0
     await _scan_lock.acquire()
     try:
-     try:
         # C9: Bankroll guard — หยุด scan ถ้าทุนหมด
         _cur_bankroll = get_current_bankroll()
         if _cur_bankroll < MIN_KELLY_STAKE and auto_scan:
@@ -3659,7 +3658,7 @@ async def do_scan() -> int:
         _last_error = ""  # F4: เคลียร์ error เก่าหลัง scan สำเร็จ
         save_snapshot()   # 💾 บันทึก state
         return sent
-     except Exception as e:
+    except Exception as e:
         _last_error = f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {e!r}"
         log.error(f"[Scan] error: {e}", exc_info=True)
         return 0
@@ -4305,14 +4304,16 @@ _stats_cache_lock = threading.Lock()  # B3: protect _stats_cache read/write acro
 
 def calc_stats_cached() -> dict:
     """calc_stats พร้อม cache 15 วินาที — ลดภาระ CPU ตอน dashboard refresh"""
-    # Issue38: hold lock for full check+compute+write — prevents double-compute when 2 threads both miss cache
+    # G1/Issue43: short-lock check, compute outside lock, short-lock write
+    # avoids blocking dashboard threads during heavy calc_stats() computation
     with _stats_cache_lock:
         if time.time() - _stats_cache["ts"] < 15 and _stats_cache["data"] is not None:
             return _stats_cache["data"]
-        result = calc_stats()
+    result = calc_stats()
+    with _stats_cache_lock:
         _stats_cache["data"] = result
         _stats_cache["ts"]   = time.time()
-        return result
+    return result
 
 def calc_stats() -> dict:
     """คำนวณสถิติทั้งหมดสำหรับ /api/stats"""
@@ -4666,8 +4667,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "uptime":  uptime_str,
             }
             body = json.dumps(health).encode()
-            # F3: liveness probe — 503 when DB halted so monitors can detect degraded state
-            self.send_response(503 if _db_write_halted else 200)
+            # G2: /health = liveness (process alive) → always 200; /ready = readiness → 503 when DB halted
+            self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
             self.end_headers()
