@@ -561,11 +561,23 @@ def db_save_opportunity(opp: dict):
     _schedule_coro(_async_save_opp(opp))
 
 async def _async_save_opp(opp: dict):
+    # C9: migrate opportunity_log table ให้มี 3-way columns
+    for _col, _sql in [
+        ("leg3_bm",        "ALTER TABLE opportunity_log ADD COLUMN leg3_bm TEXT DEFAULT NULL"),
+        ("stake3_thb",     "ALTER TABLE opportunity_log ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
+        ("total_stake_thb","ALTER TABLE opportunity_log ADD COLUMN total_stake_thb INTEGER DEFAULT NULL"),
+    ]:
+        try: await turso_exec(_sql)
+        except Exception: pass  # column exists
     await turso_exec(
-        "INSERT OR REPLACE INTO opportunity_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        """INSERT OR REPLACE INTO opportunity_log
+           (id,event,sport,profit_pct,leg1_bm,leg1_odds,leg2_bm,leg2_odds,
+            stake1_thb,stake2_thb,created_at,status,leg3_bm,stake3_thb,total_stake_thb)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (opp["id"],opp["event"],opp["sport"],opp["profit_pct"],
          opp["leg1_bm"],opp["leg1_odds"],opp["leg2_bm"],opp["leg2_odds"],
-         opp["stake1_thb"],opp["stake2_thb"],opp["created_at"],opp["status"])
+         opp["stake1_thb"],opp["stake2_thb"],opp["created_at"],opp["status"],
+         opp.get("leg3_bm"), opp.get("stake3_thb"), opp.get("total_stake_thb"))
     )
 
 def db_update_opp_status(signal_id: str, status: str):
@@ -796,7 +808,7 @@ def fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
 # ══════════════════════════════════════════════════════════════════
 #  7/10/11. LINE MOVEMENT DETECTOR
 # ══════════════════════════════════════════════════════════════════
-async def detect_line_movements(odds_by_sport: dict):
+async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None = None):
     """
     เปรียบเทียบ odds ใหม่กับ history
     ตรวจจับ: Line Move, Steam Move, Reverse Line Movement
@@ -854,14 +866,35 @@ async def detect_line_movements(odds_by_sport: dict):
                                         pct_change=pct, direction=direction,
                                         is_steam=is_steam, is_rlm=is_sharp_move,
                                     )
-                                    # ผนวม liquidity จาก odds_history ถ้ามี (Polymarket tracks it)
-                                    liq_key = f"{ename}|{outcome}"
-                                    liq_usd = getattr(odds_history.get(liq_key, {}).get("_liquidity", None), 'real', 0) or 0
+                                    # C5: liquidity จาก Polymarket จริง
+                                    liq_usd = 0.0
+                                    if poly_markets:
+                                        poly_match = find_polymarket(ename, poly_markets)
+                                        if poly_match:
+                                            liq_usd = float(poly_match.get("_liquidity", 0) or 0)
+
+                                    # C4: สร้าง all_odds dict — odds ของ outcome นี้จากทุก bm
+                                    # (ใช้ history ที่เก็บไว้แล้ว + ค่าปัจจุบัน)
+                                    _hist_for_outcome = odds_history.get(hist_key, {})
+                                    all_odds_for_ctx: dict[str, float] = {
+                                        _bk: float(_o)
+                                        for _bk, _o in _hist_for_outcome.items()
+                                        if isinstance(_o, (int, float, Decimal))
+                                    }
+                                    all_odds_for_ctx[bk] = float(new_odds)  # อัพเดทค่าล่าสุด
+
+                                    # C4: หา sharp_odds (Pinnacle) vs soft_odds (bm นี้)
+                                    sharp_odds_val = float(all_odds_for_ctx.get("pinnacle", 0))
+                                    soft_odds_val  = float(new_odds)
+
                                     ctx = {
                                         "commence_time": commence,
                                         "num_bm_moved": num_bm_moved,
                                         "bm_key": bk,
-                                        "liquidity_usd": float(liq_usd),
+                                        "liquidity_usd": liq_usd,
+                                        "all_odds": all_odds_for_ctx,
+                                        "sharp_odds": sharp_odds_val,
+                                        "soft_odds": soft_odds_val,
                                     }
                                     new_movements.append((lm, ctx))
                                     with _data_lock:
@@ -964,8 +997,11 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
                 msg += (f"\n💡 *สังเกต:* odds ขึ้น → อาจเป็น value ฝั่งตรงข้าม\n")
 
             # Dynamic Kelly Payout Calculator
-            true_odds = float(lm.odds_before)   # Sharp reference (ก่อนไหล)
-            soft_odds = float(lm.odds_after)     # ราคาปัจจุบัน (Soft book ยังไม่ตาม)
+            # C4: ใช้ sharp_odds จาก ctx ถ้ามี (Pinnacle current price)
+            # ถ้าไม่มี fallback ไป odds_before (ราคาก่อนขยับ = Sharp reference ประมาณ)
+            sharp_ctx = ctx.get("sharp_odds", 0.0)
+            true_odds = sharp_ctx if sharp_ctx > 1.0 else float(lm.odds_before)
+            soft_odds = float(lm.odds_after)     # ราคา Soft book ที่จะวาง
             rec_stake_thb, edge_pct = calc_valuebet_kelly(true_odds, soft_odds, grade)
             rec_stake_int = int(rec_stake_thb)
 
@@ -2177,21 +2213,25 @@ async def send_alert(opp: ArbOpportunity):
 
     urgent_prefix = f"{urgency_tag}\n" if urgency_tag else ""
     arb_type = "3-WAY ARB" if is_3way_alert else "ARB FOUND"
+    _bm1 = "🏠 " + opp.leg1.bookmaker[:10]
+    _bm2 = "🟠 " + opp.leg2.bookmaker[:10]
+    _bm3 = "⚪ " + (opp.leg3.bookmaker[:10] if opp.leg3 else "")
+    _pfx_blue = "🔵 " + opp.leg1.bookmaker[:10]
     if is_3way_alert:
         table_rows = (
-            f"{'\ud83c\udfe0 '+opp.leg1.bookmaker[:10]:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'\u0e3f'+str(int(s1)):>8} {'\u0e3f'+str(int(w1)):>8}\n"
-            f"{'\u26aa '+opp.leg3.bookmaker[:10]:<12} {'Draw'[:15]:<15} {float(opp.leg3.odds):>5.3f} {'\u0e3f'+str(int(s3_alert)):>8} {'\u0e3f'+str(int(w3_alert)):>8}\n"
-            f"{'\ud83d\udfe0 '+opp.leg2.bookmaker[:10]:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'\u0e3f'+str(int(s2)):>8} {'\u0e3f'+str(int(w2)):>8}\n"
+            f"{_bm1:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'฿'+str(int(s1)):>8} {'฿'+str(int(w1)):>8}\n"
+            f"{_bm3:<12} {'Draw'[:15]:<15} {float(opp.leg3.odds):>5.3f} {'฿'+str(int(s3_alert)):>8} {'฿'+str(int(w3_alert)):>8}\n"
+            f"{_bm2:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'฿'+str(int(s2)):>8} {'฿'+str(int(w2)):>8}\n"
         )
         outcome_lines = (
-            f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,}\n"
-            f"   Draw → ฿{int(w3_alert):,}\n"
-            f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,}"
+            f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
+            f"   Draw → ฿{int(w3_alert):,} *(+฿{int(w3_alert-tt):,})*\n"
+            f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*"
         )
     else:
         table_rows = (
-            f"{'\ud83d\udd35 '+opp.leg1.bookmaker[:10]:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'\u0e3f'+str(int(s1)):>8} {'\u0e3f'+str(int(w1)):>8}\n"
-            f"{'\ud83d\udfe0 '+opp.leg2.bookmaker[:10]:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'\u0e3f'+str(int(s2)):>8} {'\u0e3f'+str(int(w2)):>8}\n"
+            f"{_pfx_blue:<12} {opp.leg1.outcome[:15]:<15} {float(opp.leg1.odds):>5.3f} {'฿'+str(int(s1)):>8} {'฿'+str(int(w1)):>8}\n"
+            f"{_bm2:<12} {opp.leg2.outcome[:15]:<15} {float(opp.leg2.odds):>5.3f} {'฿'+str(int(s2)):>8} {'฿'+str(int(w2)):>8}\n"
         )
         outcome_lines = (
             f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
@@ -2475,12 +2515,9 @@ async def execute_both(opp: ArbOpportunity) -> str:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # v10-6: เช็ค user_id โดยตรง (ไม่ใช่ chat_id — CHAT_ID ไม่ใช่ user_id)
-    _owner_id = os.getenv("OWNER_USER_ID", "")
-    if not _owner_id:
-        log.warning("[Auth] OWNER_USER_ID ไม่ได้ตั้ง — fallback CHAT_ID (ควรตั้ง OWNER_USER_ID ใน .env)")
-        _owner_id = str(CHAT_ID)
-    if str(query.from_user.id) != str(_owner_id):
+    # v10-6: เช็ค user_id โดยตรง — ถ้าไม่ได้ตั้ง OWNER_USER_ID ให้ผ่านได้ (ไม่ fallback CHAT_ID)
+    _owner_id = os.getenv("OWNER_USER_ID", "").strip()
+    if _owner_id and str(query.from_user.id) != _owner_id:
         await query.answer("⛔ Not authorized", show_alert=True)
         return
     try: action, sid = query.data.split(":",1)
@@ -2543,6 +2580,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
             except Exception as e:
                 log.error(f"[VB] confirm msg error: {e}")
+        # C2: บันทึก TradeRecord (1-leg Value Bet) ลง DB + ส่งเข้า auto-settle
+        tr_vb = TradeRecord(
+            signal_id=vb.signal_id, event=vb.event, sport=vb.sport,
+            leg1_bm=vb.bookmaker, leg2_bm="-",
+            leg1_team=vb.outcome, leg2_team="-",
+            leg1_odds=float(vb.soft_odds), leg2_odds=0.0,
+            stake1_thb=int(vb.rec_stake_thb), stake2_thb=0,
+            profit_pct=float(vb.edge_pct / 100.0), status="confirmed",
+            commence_time=vb.commence_time,
+        )
+        with _data_lock:
+            trade_records.append(tr_vb)
+        db_save_trade(tr_vb)
+        if vb.commence_time:
+            register_for_settlement(tr_vb, vb.commence_time)
         return
 
     # ── Arb confirm/reject ────────────────────────────────────────
@@ -2569,6 +2621,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "reject":
         with _data_lock:
             pending.pop(sid, None)  # B2: pop ตอน reject จริง
+        _is_3w = opp.leg3 is not None and opp.stake3 is not None
         tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
             leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
@@ -2577,6 +2630,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
             stake1_thb=int(opp.stake1*USD_TO_THB), stake2_thb=int(opp.stake2*USD_TO_THB),
             profit_pct=float(opp.profit_pct), status="rejected",
+            leg3_bm=opp.leg3.bookmaker if _is_3w else None,
+            leg3_team=opp.leg3.outcome if _is_3w else None,
+            leg3_odds=float(opp.leg3.odds_raw) if _is_3w else None,
+            stake3_thb=int(opp.stake3*USD_TO_THB) if _is_3w else None,
         )
         with _data_lock:
             trade_records.append(tr_rej)
@@ -2758,10 +2815,18 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ct_th = (_ct + timedelta(hours=7)).strftime("%d/%m %H:%M")
             except Exception:
                 pass
+        is_vb = t.stake2_thb == 0 and t.leg2_team == "-"
+        is_3w = t.stake3_thb is not None and t.stake3_thb > 0
+        if is_vb:
+            stake_str = f"฿{t.stake1_thb:,} (ValueBet)"
+        elif is_3w:
+            stake_str = f"฿{t.stake1_thb:,}+฿{t.stake2_thb:,}+฿{t.stake3_thb:,} (3-way)"
+        else:
+            stake_str = f"฿{t.stake1_thb:,}+฿{t.stake2_thb:,}"
         lines.append(
             f"{i}. {md_escape(t.event[:28])}\n"
             f"   {SPORT_EMOJI.get(t.sport,'🏆')} {md_escape(t.leg1_bm)} vs {md_escape(t.leg2_bm)} | profit {t.profit_pct:.1%}\n"
-            f"   ฿{t.stake1_thb:,}+฿{t.stake2_thb:,} | {ct_th} | {settled}"
+            f"   {stake_str} | {ct_th} | {settled}"
         )
     await update.message.reply_text(
         f"📋 *Confirmed Trades ({len(recent)} ล่าสุด)*\n━━━━━━━━━━━━━━━━━━\n" + "\n\n".join(lines),
@@ -2904,7 +2969,7 @@ async def do_scan() -> int:
         odds_by_sport, poly_markets = await fetch_all_async(scan_sports)
 
         # B7: await detect_line_movements ไม่ใช้ create_task — ป้องกัน race condition
-        await detect_line_movements(odds_by_sport)
+        await detect_line_movements(odds_by_sport, poly_markets)
 
         all_opps = scan_all(odds_by_sport, poly_markets)
         sent = 0
@@ -3136,8 +3201,16 @@ def parse_winner(event: dict, sport: str = "") -> Optional[str]:
 
 def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     """
-    คำนวณกำไร/ขาดทุนจริง รองรับ 2-way และ 3-way (leg3 = Draw)
+    คำนวณกำไร/ขาดทุนจริง รองรับ 2-way, 3-way และ ValueBet (1-leg)
     """
+    # C3: Value Bet guard — 1-leg trade (stake2=0, leg2_team="-")
+    is_valuebet = trade.stake2_thb == 0 and trade.leg2_team == "-"
+    if is_valuebet:
+        if fuzzy_match(winner, trade.leg1_team or "", threshold=0.5):
+            return int(trade.stake1_thb * trade.leg1_odds) - trade.stake1_thb
+        else:
+            return -trade.stake1_thb
+
     total_staked = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
 
     # บันทึกทุก leg (รวม leg3 ถ้ามี)
@@ -3828,31 +3901,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                        for m in lm_snap]
 
             # serialize trade_records for dashboard Force Settle UI
-            tr_list = [{
-                "signal_id":  t.signal_id,
-                "event":      t.event,
-                "sport":      t.sport,
-                "leg1_bm":    t.leg1_bm,
-                "leg2_bm":    t.leg2_bm,
-                "leg1_team":  t.leg1_team,
-                "leg2_team":  t.leg2_team,
-                "leg1_odds":  t.leg1_odds,
-                "leg2_odds":  t.leg2_odds,
-                "stake1_thb": t.stake1_thb,
-                "stake2_thb": t.stake2_thb,
-                "profit_pct": t.profit_pct,
-                "status":     t.status,
-                "clv_leg1":   t.clv_leg1,
-                "actual_profit_thb": t.actual_profit_thb,
-                "settled_at": t.settled_at,
-                "created_at": t.created_at,
-                "commence_time": t.commence_time,
-                # 3-way fields
-                "leg3_bm":    t.leg3_bm,
-                "leg3_team":  t.leg3_team,
-                "leg3_odds":  t.leg3_odds,
-                "stake3_thb": t.stake3_thb,
-            } for t in tr_snap]
+            def _tr_to_dict(t: TradeRecord) -> dict:
+                c1, c2, c3 = calc_clv(t)  # C8: use computed CLV not stale field
+                return {
+                    "signal_id":  t.signal_id,
+                    "event":      t.event,
+                    "sport":      t.sport,
+                    "leg1_bm":    t.leg1_bm,
+                    "leg2_bm":    t.leg2_bm,
+                    "leg1_team":  t.leg1_team,
+                    "leg2_team":  t.leg2_team,
+                    "leg1_odds":  t.leg1_odds,
+                    "leg2_odds":  t.leg2_odds,
+                    "stake1_thb": t.stake1_thb,
+                    "stake2_thb": t.stake2_thb,
+                    "profit_pct": t.profit_pct,
+                    "status":     t.status,
+                    "clv_leg1":   c1,
+                    "clv_leg2":   c2,
+                    "clv_leg3":   c3,
+                    "actual_profit_thb": t.actual_profit_thb,
+                    "settled_at": t.settled_at,
+                    "created_at": t.created_at,
+                    "commence_time": t.commence_time,
+                    "leg3_bm":    t.leg3_bm,
+                    "leg3_team":  t.leg3_team,
+                    "leg3_odds":  t.leg3_odds,
+                    "stake3_thb": t.stake3_thb,
+                }
+            tr_list = [_tr_to_dict(t) for t in tr_snap]
 
             data = {
                 "auto_scan":       auto_scan,
@@ -3897,6 +3974,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "est_profit": round(est_profit),
                     "avg_clv":    round(avg_clv,2) if avg_clv is not None else None,
                 },
+                "pending_valuebets": [
+                    {
+                        "signal_id": sid,
+                        "event":     vb.event,
+                        "bookmaker": vb.bookmaker,
+                        "outcome":   vb.outcome,
+                        "grade":     vb.grade,
+                        "edge_pct":  vb.edge_pct,
+                        "stake":     vb.rec_stake_thb,
+                        "soft_odds": vb.soft_odds,
+                    }
+                    for sid, (vb, _ts) in list(_pending_vb.items())
+                ],
             }
             body = json.dumps(data, default=str).encode()
             self.send_response(200)
