@@ -2528,12 +2528,12 @@ def parse_commence(raw: str) -> datetime:
 # ══════════════════════════════════════════════════════════════════
 _refetch_cache: dict[str, tuple[float, list]] = {}  # C10: sport -> (ts, events)
 
-async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
+async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal, bool, bool]:
     """
     Re-fetch ราคาล่าสุดจาก API ก่อนยืนยันการเดิมพัน
     J1: mixed-source arb — fetch ทั้ง standard + extra feeds ถ้า legs มาจากต่าง source
-    Returns: (live_odds_leg1, live_odds_leg2)
-    ถ้าหาไม่เจอ → คืนค่าเดิม (ไม่ abort)
+    O1: fail-closed — Returns: (live1, live2, found1, found2)
+    ถ้า found=False แสดงว่า market suspended / mapping miss — caller ต้อง abort
     """
     _bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
     _extra_norm      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
@@ -2573,8 +2573,8 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
         if leg1_extra != leg2_extra:
             log.debug(f"[SlippageGuard] mixed-source refetch: leg1={'extra' if leg1_extra else 'std'} leg2={'extra' if leg2_extra else 'std'}")
 
-        def _lookup_leg(leg, is_extra_leg, std_ev, extra_ev) -> Decimal:
-            """หา live odds ของ leg จาก feed ที่ถูก"""
+        def _lookup_leg(leg, is_extra_leg, std_ev, extra_ev) -> tuple[Decimal, bool]:
+            """หา live odds ของ leg จาก feed ที่ถูก — คืน (price, found)"""
             source_events = extra_ev if is_extra_leg else std_ev
             leg_key = leg.raw.get("bm_key", "") if leg.raw else ""
             for event in source_events:
@@ -2587,22 +2587,23 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
                         if mkt.get("key") != "h2h": continue
                         for out in mkt.get("outcomes", []):
                             if fuzzy_match(out.get("name",""), leg.outcome, 0.8):
-                                return apply_slippage(Decimal(str(out.get("price", 1))), bk)
-            return leg.odds  # fallback คืนค่าเดิม
+                                return apply_slippage(Decimal(str(out.get("price", 1))), bk), True
+            return leg.odds, False  # O1: not found — caller must abort
 
-        live1 = _lookup_leg(opp.leg1, leg1_extra, std_events, extra_events)
-        live2 = _lookup_leg(opp.leg2, leg2_extra, std_events, extra_events)
-        return live1, live2
+        live1, found1 = _lookup_leg(opp.leg1, leg1_extra, std_events, extra_events)
+        live2, found2 = _lookup_leg(opp.leg2, leg2_extra, std_events, extra_events)
+        return live1, live2, found1, found2
     except Exception as e:
         log.warning(f"[SlippageGuard] re-fetch failed: {e}")
-    return opp.leg1.odds, opp.leg2.odds
+    return opp.leg1.odds, opp.leg2.odds, False, False
 
 
-async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
+async def refetch_valuebet_odds(vb: "ValueBetSignal") -> tuple[float, bool]:
     """B2: ดึง live odds ของ soft book ก่อน VB confirm
     G3: รวม EXTRA_BOOKMAKERS path — ถ้า bm ไม่อยู่ใน BOOKMAKERS ให้ fetch extra feed แทน
     K3: ใช้ semaphore wrapper เหมือน scan หลัก
-    Returns: live soft_odds (float) — คืน vb.soft_odds เดิมถ้าหาไม่เจอ
+    O1: fail-closed — Returns: (live_price, found)
+    ถ้า found=False → market suspended หรือ mapping miss — caller ต้อง abort
     """
     def _search_events(events: list, bm_key_norm: str) -> float | None:
         for event in events:
@@ -2642,10 +2643,10 @@ async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
             _refetch_cache[cache_key] = (time.time(), events)
         result = _search_events(events, bm_key_norm)
         if result is not None:
-            return result
+            return result, True
     except Exception as e:
         log.warning(f"[VBGuard] refetch failed: {e}")
-    return vb.soft_odds
+    return vb.soft_odds, False  # O1: not found — caller must abort
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2660,7 +2661,18 @@ async def execute_both(opp: ArbOpportunity) -> str:
     slippage_warn = ""
     if is_3way:
         # BugC/R4: refetch all 3 legs including Draw
-        live1, live2 = await refetch_live_odds(opp)
+        live1, live2, _found1, _found2 = await refetch_live_odds(opp)
+        # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ (market suspended / mapping miss)
+        if not _found1 or not _found2:
+            _missing = []
+            if not _found1: _missing.append(opp.leg1.bookmaker)
+            if not _found2: _missing.append(opp.leg2.bookmaker)
+            log.warning(f"[SlippageGuard-3way] ABORT {opp.event} — live odds unavailable: {_missing}")
+            raise ValueError(
+                f"🚫 *ABORT: Live odds unavailable*\n"
+                f"ดึงราคา live ไม่ได้: {', '.join(_missing)}\n"
+                f"_(market อาจถูก suspend หรือ mapping miss — รอ signal ใหม่)_"
+            )
         live3 = opp.leg3.odds  # default = cached
         # F2/K1: per-leg refetch ตาม source
         leg3_token = opp.leg3.raw.get("token_id", "") if opp.leg3.raw else ""
@@ -2748,7 +2760,18 @@ async def execute_both(opp: ArbOpportunity) -> str:
         if profit_drop_3 > 0.30:
             slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop_3:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit3):.2%})"
     else:
-        live1, live2 = await refetch_live_odds(opp)
+        live1, live2, _found1, _found2 = await refetch_live_odds(opp)
+        # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ
+        if not _found1 or not _found2:
+            _missing = []
+            if not _found1: _missing.append(opp.leg1.bookmaker)
+            if not _found2: _missing.append(opp.leg2.bookmaker)
+            log.warning(f"[SlippageGuard] ABORT {opp.event} — live odds unavailable: {_missing}")
+            raise ValueError(
+                f"🚫 *ABORT: Live odds unavailable*\n"
+                f"ดึงราคา live ไม่ได้: {', '.join(_missing)}\n"
+                f"_(market อาจถูก suspend หรือ mapping miss — รอ signal ใหม่)_"
+            )
         # F2: 2-way per-leg refetch ถ้า leg มาจาก Polymarket/Kalshi
         # K3: ใช้ semaphore wrapper สำหรับ aiohttp session ภายใน
         for _leg_attr, _live_init in [(opp.leg1, live1), (opp.leg2, live2)]:
@@ -2800,6 +2823,22 @@ async def execute_both(opp: ArbOpportunity) -> str:
     if s3_raw is not None and opp.leg3:
         s3 = (apply_max_stake(natural_round_leg(s3_raw)/USD_TO_THB, opp.leg3.bookmaker)*USD_TO_THB).quantize(Decimal("1"))
     # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
+    # O3: budget clamp — ถ้า jitter ทำให้ actual_total เกิน Kelly target > 5% ให้ลด leg ที่ใหญ่สุดลง
+    _target_total = (opp.stake1 + opp.stake2 + (opp.stake3 or Decimal("0"))) * USD_TO_THB
+    _actual_total = s1 + s2 + (s3 or Decimal("0"))
+    _tolerance = _target_total * Decimal("0.05")
+    if _actual_total > _target_total + _tolerance:
+        _excess = _actual_total - _target_total
+        _step = Decimal("500") if _target_total < Decimal("50000") else Decimal("1000")
+        _reduce = ((_excess // _step) + 1) * _step
+        if s3 is not None and s3 >= s2 and s3 >= s1:
+            s3 = max(s3 - _reduce, Decimal("100")).quantize(Decimal("1"))
+        elif s2 >= s1:
+            s2 = max(s2 - _reduce, Decimal("100")).quantize(Decimal("1"))
+        else:
+            s1 = max(s1 - _reduce, Decimal("100")).quantize(Decimal("1"))
+        log.info(f"[BudgetClamp] total {float(_actual_total):.0f} → reduced by {float(_reduce):.0f} (target {float(_target_total):.0f})")
+
 
     if is_3way:
         # B10/D3: ใช้ live odds (after slippage) สำหรับ payout display
@@ -3013,14 +3052,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # B2: VB slippage guard — refetch live odds ก่อน confirm
         try: await query.edit_message_text(orig+"\n\n⏳ *ตรวจราคาล่าสุด...*", parse_mode="Markdown")
         except Exception: pass
-        live_soft_odds = await refetch_valuebet_odds(vb)
+        live_soft_odds, _vb_found = await refetch_valuebet_odds(vb)
         _, live_edge = calc_valuebet_kelly(vb.true_odds, live_soft_odds, vb.grade)
+        _retry_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Retry",   callback_data=f"vb_confirm:{sid}"),
+            InlineKeyboardButton("❌ Skip",    callback_data=f"vb_reject:{sid}"),
+        ]])
+        # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ
+        if not _vb_found:
+            try:
+                await query.edit_message_text(
+                    orig + (
+                        f"\n\n🚫 *ABORT: Live odds unavailable*\n"
+                        f"ดึงราคา {vb.bookmaker} live ไม่ได้ (market อาจถูก suspend)\n"
+                        f"_(กด Retry ถ้าจะลองใหม่)_"
+                    ),
+                    parse_mode="Markdown", reply_markup=_retry_kb
+                )
+            except Exception: pass
+            return
         if live_soft_odds < vb.soft_odds * 0.98 or live_edge <= 0:  # tolerance 2%
             # K4: ไม่ pop — ยังเก็บ signal ไว้ให้ retry ได้ (one-shot abort ไม่ pop)
-            _retry_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Retry",   callback_data=f"vb_confirm:{sid}"),
-                InlineKeyboardButton("❌ Skip",    callback_data=f"vb_reject:{sid}"),
-            ]])
             try:
                 await query.edit_message_text(
                     orig + (
@@ -4737,9 +4789,15 @@ async def post_init(app: Application):
                 if ct_str:
                     commence_dt = parse_commence(ct_str)
                 else:
-                    # I21: ไม่รู้เวลาแข่ง — ตั้ง +24h จากตอนนี้ กัน settle ก่อนกำหนด
-                    commence_dt = datetime.now(timezone.utc) + timedelta(hours=24)
-                    log.warning(f"[Settle] trade {t.signal_id} ไม่มี commence_time — ตั้ง settle check ใน 24h")
+                    # O2: ใช้ created_at + 24h แทน now + 24h — กัน zombie drift หลัง restart
+                    _base_dt = datetime.now(timezone.utc)
+                    if t.created_at:
+                        try:
+                            _base_dt = parse_commence(t.created_at) if isinstance(t.created_at, str) else t.created_at.replace(tzinfo=timezone.utc) if not t.created_at.tzinfo else t.created_at
+                        except Exception:
+                            pass
+                    commence_dt = _base_dt + timedelta(hours=24)
+                    log.warning(f"[Settle] trade {t.signal_id} ไม่มี commence_time — settle check ที่ created_at+24h ({commence_dt.isoformat()})")
             except Exception:
                 commence_dt = datetime.now(timezone.utc)
             _pending_settlement[t.signal_id] = (t, commence_dt)
