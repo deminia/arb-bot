@@ -3669,10 +3669,22 @@ async def watch_closing_lines():
                         # L6: fetch both standard + extra feeds for closing lines
                         std_ev   = await _fetch_odds_sem(session, sport)
                         extra_ev = await _fetch_extra_books_sem(session, sport) if _s("EXTRA_BOOKMAKERS", "") else []
-                        # merge: extra events not in std (by home+away key)
-                        _std_keys = {(e.get("home_team",""), e.get("away_team","")) for e in std_ev}
-                        events = std_ev + [e for e in extra_ev
-                                          if (e.get("home_team",""), e.get("away_team","")) not in _std_keys]
+                        # R2: fuzzy merge extra events (same logic as fetch_all_async)
+                        events = list(std_ev)
+                        for _ex_ev in extra_ev:
+                            _ex_name = f"{_ex_ev.get('home_team','')} vs {_ex_ev.get('away_team','')}"
+                            _merged = False
+                            for _st_ev in events:
+                                _st_name = f"{_st_ev.get('home_team','')} vs {_st_ev.get('away_team','')}"
+                                if fuzzy_match(_ex_name, _st_name, 0.80):
+                                    _exist_bms = {_b["key"] for _b in _st_ev.get("bookmakers", [])}
+                                    for _b in _ex_ev.get("bookmakers", []):
+                                        if _b["key"] not in _exist_bms:
+                                            _st_ev.setdefault("bookmakers", []).append(_b)
+                                    _merged = True
+                                    break
+                            if not _merged:
+                                events.append(_ex_ev)
                         fetch_ok = False
                         for event in events:
                             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
@@ -3700,11 +3712,14 @@ async def watch_closing_lines():
                             if not pinnacle_found:
                                 log.warning(f"[CLV] ⚠️ Pinnacle closing line missing for {ename} — CLV benchmark unreliable")
                             log.info(f"[CLV] closing line saved: {ename} (pinnacle={'✅' if pinnacle_found else '❌'})")
-                        # Fix 3: mark done ONLY after successful fetch
-                        if fetch_ok:
+                        # R3: mark done ONLY after successful fetch WITH Pinnacle closing line
+                        # ถ้า match event ได้แต่ไม่มี Pinnacle → ยังไม่ mark done (retry ต่อ)
+                        if fetch_ok and pinnacle_found:
                             with _data_lock:
                                 if key in _closing_line_watch:
                                     _closing_line_watch[key]["done"] = True
+                        elif fetch_ok and not pinnacle_found:
+                            log.warning(f"[CLV] Pinnacle line missing for {info['event']} — will retry next window")
                         else:
                             log.warning(f"[CLV] fetch returned no match for {info['event']} — will retry")
         except Exception as e:
@@ -3939,8 +3954,16 @@ async def settle_completed_trades():
                     home = ev.get("home_team", "")
                     away = ev.get("away_team", "")
                     ev_name = f"{home} vs {away}"
-                    if fuzzy_match(home, trade.event.split(" vs ")[0], 0.5) and \
-                       fuzzy_match(away, trade.event.split(" vs ")[-1], 0.5):
+                    # R6/Issue29: guard ก่อน split — event อาจไม่มี " vs " (Tennis/MMA)
+                    _ev_parts = trade.event.split(" vs ")
+                    if len(_ev_parts) < 2:
+                        # ไม่สามารถ auto-settle ได้ — format ไม่ตรง
+                        log.debug(f"[Settle] skip {trade.signal_id} — event has no ' vs ' separator: {trade.event!r}")
+                        break
+                    _home_part = _ev_parts[0].strip()
+                    _away_part = _ev_parts[-1].strip()
+                    if fuzzy_match(home, _home_part, 0.5) and \
+                       fuzzy_match(away, _away_part, 0.5):
                         matched_event = ev
                         break
 
@@ -4122,6 +4145,9 @@ def periodic_cleanup():
         for k in expired_vb:
             del _pending_vb[k]
         # E7: เคลียร settled signal IDs ออกจาก alert sets (ป้องกัน memory leak)
+        # R7/Issue30: _settle_alerted / _manual_review_alerted เป็น asyncio-only sets
+        # ทั้ง writers (settle_completed_trades) และ cleanup นี้อยู่ใน event loop เดียวกัน
+        # → single-threaded asyncio ไม่มี race condition จริง — ไม่ต้องใช้ lock
         _settled_in_cleanup = {s.signal_id for s in trade_records if s.actual_profit_thb is not None}
         _settle_alerted      -= _settled_in_cleanup
         _manual_review_alerted -= _settled_in_cleanup
@@ -4158,29 +4184,29 @@ async def scanner_loop():
             with _data_lock:
                 for _sid in expired:
                     pending.pop(_sid, None)
-                    # Q3: mark in-memory opportunity_log status=expired
+                    # R1: opportunity_log เก็บเป็น dict — ใช้ .get("id") ไม่ใช่ getattr
                     for opp_rec in opportunity_log:
-                        if getattr(opp_rec, 'signal_id', None) == _sid:
-                            opp_rec.status = 'expired'
+                        if opp_rec.get("id") == _sid:
+                            opp_rec["status"] = "expired"
                             break
             log.info(f"[Pending] expired {len(expired)} signal(s)")
-            # Q3: persist expired status to SQLite (sync, best-effort)
-            try:
-                with sqlite3.connect(DB_PATH, timeout=2) as _con:
-                    for _sid in expired:
-                        _con.execute("UPDATE opportunity_log SET status='expired' WHERE signal_id=?", (_sid,))
-                    _con.commit()
-            except Exception as _qe:
-                log.debug(f"[Pending] expire DB update failed: {_qe}")
-            # Q3: Turso async (best-effort, non-blocking)
+            # R1/R4: persist expired status — Turso เท่านั้นถ้า Turso mode, SQLite ถ้าไม่มี Turso
             if _turso_ok:
                 async def _expire_turso(_sids=list(expired)):
                     for _sid in _sids:
                         try:
-                            await turso_query("UPDATE opportunity_log SET status='expired' WHERE signal_id=?",
-                                              [_sid])
+                            # R1: PK ของ opportunity_log คือ id ไม่ใช่ signal_id
+                            await turso_exec("UPDATE opportunity_log SET status='expired' WHERE id=?", (_sid,))
                         except Exception: pass
                 asyncio.get_running_loop().create_task(_expire_turso())
+            else:
+                try:
+                    with sqlite3.connect(DB_PATH, timeout=2) as _con:
+                        for _sid in expired:
+                            _con.execute("UPDATE opportunity_log SET status='expired' WHERE id=?", (_sid,))
+                        _con.commit()
+                except Exception as _qe:
+                    log.debug(f"[Pending] expire DB update failed: {_qe}")
         # v10-1: รอแบบ ถ้า apply_runtime_config เปลี่ยน interval/auto_scan จะปลุก event นี้เพื่อตื่นทันที
         _scan_wakeup.clear()
         try:
@@ -4473,7 +4499,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 value  = str(body.get("value",""))
                 ok, msg = apply_runtime_config(key, value)
                 # save ลง DB ด้วย
-                if ok:
+                # R5: one-shot actions ไม่ควร save เป็น persistent cfg_*
+                _non_persistent = {"scan_now", "clear_seen"}
+                if ok and key not in _non_persistent:
                     db_save_state(f"cfg_{key}", value)
                     # G6: clear stats cache เมื่อ config เปลี่ยน
                     _stats_cache["data"] = None
