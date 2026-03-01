@@ -3511,8 +3511,9 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("result ต้องเป็น: leg1 / leg2 / draw / void")
         return
 
+    # K1: get-validate-pop — peek first, validate, then pop on commit
     with _data_lock:
-        entry = _pending_settlement.pop(sid, None)
+        entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
     if not entry:
         await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
         return
@@ -3532,6 +3533,10 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
+    # K1: validation passed — now pop from whichever queue holds it
+    with _data_lock:
+        _pending_settlement.pop(sid, None)
+        _manual_review_pending.pop(sid, None)
     tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
 
     if result == "leg1":
@@ -3814,6 +3819,7 @@ def register_closing_watch(opp: "ArbOpportunity"):
 _pending_settlement: dict[str, tuple] = {}   # signal_id → (TradeRecord, datetime)
 _settle_alerted: set[str] = set()            # B6: signal_ids ที่แจ้ง postponed ไปแล้ว
 _manual_review_alerted: set[str] = set()     # D5: signal_ids ที่แจ้ง MANUAL_REVIEW ไปแล้ว
+_manual_review_pending: dict[str, tuple] = {}  # K3: trades ที่ parse_winner() = MANUAL_REVIEW — แยกออกจาก _pending_settlement เพื่อให้ queue สะอาด
 
 
 def _settle_hint(trade: TradeRecord) -> str:
@@ -4140,6 +4146,10 @@ async def settle_completed_trades():
 
                 if winner == "MANUAL_REVIEW":
                     log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
+                    # K3: move trade to _manual_review_pending — remove from auto-settle queue
+                    with _data_lock:
+                        _manual_review_pending[signal_id] = _pending_settlement.pop(signal_id, (trade, _cdt))
+                    settled_ids.append(signal_id)  # mark as removed from pending loop
                     # D5: แจ้งครั้งเดียว — ไม่ spam ทุก 5 นาที
                     if _app and signal_id not in _manual_review_alerted:
                         _manual_review_alerted.add(signal_id)
@@ -4148,9 +4158,10 @@ async def settle_completed_trades():
                                 await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
                                     text=f"⚠️ *Manual Review Required*\n`{md_escape(trade.event)}`\n"
                                          f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(trade.sport)})\n"
-                                         f"กรุณาตรวจสอบผลเองใน Dashboard")
+                                         f"กรุณาตรวจสอบผลเองใน Dashboard\n"
+                                         + _settle_hint(trade))
                             except Exception: pass
-                    continue  # ไม่ append settled_ids — ค้างใน _pending_settlement จนคนกด settle เอง
+                    continue
 
                 # G8: double-settle guard — ป้องกัน race กับ /settle command
                 if trade.actual_profit_thb is not None or trade.settled_at is not None:
@@ -4256,8 +4267,12 @@ def periodic_cleanup():
     with _data_lock:
         _trade_snap = list(trade_records)
         _settled_in_cleanup = {s.signal_id for s in _trade_snap if s.actual_profit_thb is not None}
-        _settle_alerted      -= _settled_in_cleanup
+        _settle_alerted        -= _settled_in_cleanup
         _manual_review_alerted -= _settled_in_cleanup
+        # K3: prune _manual_review_pending for trades that got settled externally
+        for _sid in list(_manual_review_pending):
+            if _sid in _settled_in_cleanup:
+                del _manual_review_pending[_sid]
 
 
 async def scanner_loop():
@@ -4665,20 +4680,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = body.get("result", "").strip().lower()  # leg1|leg2|draw|void
                 if not sid or result not in ("leg1","leg2","draw","void"):
                     raise ValueError("signal_id and result (leg1/leg2/draw/void) required")
+                # K2: get-validate-pop — peek from pending or manual_review, validate, then pop
                 with _data_lock:
-                    entry = _pending_settlement.pop(sid, None)
+                    entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
                 if not entry:
-                    # ลอง trade_records โดยตรง
-                    with _data_lock:
-                        tr_list = [t for t in trade_records if t.signal_id == sid]
-                    if not tr_list:
-                        raise ValueError(f"signal_id '{sid}' not found")
-                    t = tr_list[0]
-                    # Fix 2: prevent re-settling an already-settled trade
-                    if t.actual_profit_thb is not None or t.settled_at is not None:
-                        raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
-                else:
-                    t, _ = entry
+                    raise ValueError(f"signal_id '{sid}' not found in pending settlement")
+                t, _ = entry
+                # J2: status guard
+                if t.status != "confirmed":
+                    raise ValueError(f"Trade {sid} status='{t.status}' — only confirmed trades can be settled")
+                # Fix 2: prevent re-settling an already-settled trade
+                if t.actual_profit_thb is not None or t.settled_at is not None:
+                    raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
+                # K2: validation passed — pop now
+                with _data_lock:
+                    _pending_settlement.pop(sid, None)
+                    _manual_review_pending.pop(sid, None)
                 tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
                 if result == "leg1":
                     actual = int(t.leg1_odds * t.stake1_thb) - tt
@@ -4769,6 +4786,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 opp_snap   = list(opportunity_log[-50:])
                 tr_snap    = list(trade_records[-30:])
                 ps_snap    = list(_pending_settlement.values())
+                mr_snap    = list(_manual_review_pending.values())  # K3: manual review queue
                 pending_ct = len(pending)
             # J3/I3: est_profit = unsettled arb only (matches calc_stats logic)
             _arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
@@ -4837,6 +4855,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "db_write_halted": _db_write_halted,
                 "line_move_count": len(lm_snap),
                 "confirmed_trades":len(confirmed),
+                "manual_review_count": len(mr_snap),  # K3: separate from unsettled_trades count
                 "opportunities":   opp_snap,
                 "line_movements":  lm_list,
                 "trade_records":   tr_list,
