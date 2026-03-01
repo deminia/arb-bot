@@ -4625,11 +4625,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if not self._check_auth(): return
-
         # strip query params for path matching
         from urllib.parse import urlparse
         clean_path = urlparse(self.path).path
+
+        # R8: HTML page \u0e42\u0e2b\u0e25\u0e14\u0e44\u0e14\u0e49\u0e40\u0e2a\u0e21\u0e2d (login form \u0e2d\u0e22\u0e39\u0e48\u0e43\u0e19 HTML) \u2014 auth \u0e40\u0e09\u0e1e\u0e32\u0e30 /api/* \u0e40\u0e17\u0e48\u0e32\u0e19\u0e31\u0e49\u0e19
+        if clean_path.startswith("/api/"):
+            if not self._check_auth(): return
 
         if clean_path == "/api/state":
             # v10-12: lock ครอบ read ทั้งหมด
