@@ -319,7 +319,7 @@ def _turso_http(statements: list) -> list:
     body = json.dumps({"requests": [
         {"type": "execute", "stmt": {
             "sql": s["sql"],
-            "args": [{"type": _turso_val_type(v), "value": _turso_val_json(v)} for v in s.get("args", [])]
+            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
         }} for s in statements
     ] + [{"type": "close"}]}).encode()
     req = urllib.request.Request(
