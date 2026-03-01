@@ -3518,6 +3518,13 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     t, _ = entry
+    # J2: guard status — only confirmed trades can be settled
+    if t.status != "confirmed":
+        await update.message.reply_text(
+            f"⚠️ Trade `{sid}` status=`{t.status}` — settle ได้เฉพาะ confirmed trades",
+            parse_mode="Markdown"
+        )
+        return
     # C8: double-settle guard
     if t.actual_profit_thb is not None or t.settled_at is not None:
         await update.message.reply_text(
@@ -4750,9 +4757,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse
         clean_path = urlparse(self.path).path
 
-        # C3: protect all non-health paths when DASHBOARD_TOKEN is set
-        if clean_path.startswith("/api/") or DASHBOARD_TOKEN:
-            if not self._check_auth(): return
+        # J4/C3: protect ALL non-health paths — both /api/* and HTML page
+        # _check_auth() blocks if no token and ALLOW_INSECURE_DASHBOARD!=true
+        if not self._check_auth(): return
 
         if clean_path == "/api/state":
             with _data_lock:
@@ -4763,9 +4770,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 tr_snap    = list(trade_records[-30:])
                 ps_snap    = list(_pending_settlement.values())
                 pending_ct = len(pending)
-            # H1: exclude VB trades from est_profit — profit_pct for VB = edge, not guaranteed return
+            # J3/I3: est_profit = unsettled arb only (matches calc_stats logic)
             _arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
-            est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in _arb_confirmed)
+            _unsettled_arb = [t for t in _arb_confirmed if t.actual_profit_thb is None]
+            est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in _unsettled_arb)
             clv_values = []
             for t in confirmed:
                 c1, c2, c3 = calc_clv(t)
@@ -5066,9 +5074,13 @@ def handle_shutdown(signum, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT,  handle_shutdown)
-    # H3: warn if dashboard is unauthenticated (DASHBOARD_TOKEN not set)
+    # J5/H3: warn about auth mode on startup
     if not DASHBOARD_TOKEN:
-        log.warning("[Security] DASHBOARD_TOKEN not set — dashboard and /api/* are publicly accessible! Set DASHBOARD_TOKEN env var to protect.")
+        _insecure = os.getenv("ALLOW_INSECURE_DASHBOARD", "").lower() == "true"
+        if _insecure:
+            log.warning("[Security] DASHBOARD_TOKEN not set + ALLOW_INSECURE_DASHBOARD=true — dashboard fully open!")
+        else:
+            log.warning("[Security] DASHBOARD_TOKEN not set — dashboard returns 401 until token is set (or ALLOW_INSECURE_DASHBOARD=true).")
 
     app = (
         Application.builder()
