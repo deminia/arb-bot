@@ -3487,19 +3487,26 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return  # C3
     args = context.args
     if len(args) < 2:
-        # Fix 5: snapshot _pending_settlement before reading
+        # L1: snapshot both queues
         with _data_lock:
             ps_snap = dict(_pending_settlement)
-        if not ps_snap:
+            mr_snap = dict(_manual_review_pending)
+        if not ps_snap and not mr_snap:
             await update.message.reply_text("ไม่มี trade ที่รอ settle")
             return
         lines = []
-        for sid, (t, dt) in list(ps_snap.items())[:40]:  # limit 40 เพื่อไม่เกิน Telegram 4096 chars
-            dt_th = (dt + timedelta(hours=7)).strftime("%d/%m %H:%M") if dt else "?"
-            lines.append(f"`{sid}` — {md_escape(t.event[:30])} ({dt_th})")
+        if ps_snap:
+            lines.append(f"⏳ *รอ auto-settle* ({len(ps_snap)} รายการ)")
+            for sid, (t, dt) in list(ps_snap.items())[:20]:
+                dt_th = (dt + timedelta(hours=7)).strftime("%d/%m %H:%M") if dt else "?"
+                lines.append(f"`{sid}` — {md_escape(t.event[:28])} ({dt_th})")
+        if mr_snap:
+            lines.append(f"\n⚠️ *ต้องตรวจเอง (Manual Review)* ({len(mr_snap)} รายการ)")
+            for sid, (t, dt) in list(mr_snap.items())[:20]:
+                dt_th = (dt + timedelta(hours=7)).strftime("%d/%m %H:%M") if dt else "?"
+                lines.append(f"`{sid}` — {md_escape(t.event[:28])} ({dt_th})\n  ↳ {_settle_hint(t)}")
         await update.message.reply_text(
-            f"⏳ *Trade รอ settle* ({len(ps_snap)} รายการ)\n"
-            + "\n".join(lines)
+            "\n".join(lines)
             + "\n\nใช้: `/settle <signal_id> <leg1|leg2|draw|void>`",
             parse_mode="Markdown",
         )
@@ -3721,7 +3728,7 @@ async def watch_closing_lines():
                             _closing_line_watch[key]["done"] = True
                     log.info(f"[CLV] auto-expired stale watch: {info['event']}")
 
-            if api_remaining <= 5:
+            if not _quota_ok():
                 log.warning("[Quota] Credits ต่ำเกินไป — ระงับ CLV fetch ชั่วคราว")
                 await asyncio.sleep(300)
                 continue
@@ -3820,6 +3827,11 @@ _pending_settlement: dict[str, tuple] = {}   # signal_id → (TradeRecord, datet
 _settle_alerted: set[str] = set()            # B6: signal_ids ที่แจ้ง postponed ไปแล้ว
 _manual_review_alerted: set[str] = set()     # D5: signal_ids ที่แจ้ง MANUAL_REVIEW ไปแล้ว
 _manual_review_pending: dict[str, tuple] = {}  # K3: trades ที่ parse_winner() = MANUAL_REVIEW — แยกออกจาก _pending_settlement เพื่อให้ queue สะอาด
+
+
+def _quota_ok(min_remaining: int = 5) -> bool:
+    """L3/Issue49: centralized quota check — asyncio single-thread so no lock needed"""
+    return api_remaining > min_remaining
 
 
 def _settle_hint(trade: TradeRecord) -> str:
@@ -4014,7 +4026,7 @@ async def settle_completed_trades():
                 await asyncio.sleep(300)
                 continue
 
-            if api_remaining <= 5:
+            if not _quota_ok():
                 log.warning("[Quota] Credits ต่ำเกินไป — ระงับ settle fetch ชั่วคราว")
                 await asyncio.sleep(300)
                 continue
@@ -4855,7 +4867,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "db_write_halted": _db_write_halted,
                 "line_move_count": len(lm_snap),
                 "confirmed_trades":len(confirmed),
-                "manual_review_count": len(mr_snap),  # K3: separate from unsettled_trades count
+                "manual_review_count": len(mr_snap),  # K3
                 "opportunities":   opp_snap,
                 "line_movements":  lm_list,
                 "trade_records":   tr_list,
@@ -4870,13 +4882,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "stake2_thb": t.stake2_thb,
                         "created_at": t.created_at,
                         "commence_time": t.commence_time,
-                        # 3-way fields
                         "leg3_bm":    t.leg3_bm,
                         "leg3_team":  t.leg3_team,
                         "leg3_odds":  t.leg3_odds,
                         "stake3_thb": t.stake3_thb,
                     }
                     for t, _dt in ps_snap
+                ],
+                "manual_review_trades": [  # L2: full details for dashboard Force Settle UI
+                    {
+                        "signal_id":  t.signal_id,
+                        "event":      t.event,
+                        "sport":      t.sport,
+                        "leg1_bm":    t.leg1_bm,
+                        "leg2_bm":    t.leg2_bm,
+                        "leg1_team":  t.leg1_team,
+                        "leg2_team":  t.leg2_team,
+                        "leg1_odds":  t.leg1_odds,
+                        "leg2_odds":  t.leg2_odds,
+                        "profit_pct": t.profit_pct,
+                        "stake1_thb": t.stake1_thb,
+                        "stake2_thb": t.stake2_thb,
+                        "created_at": t.created_at,
+                        "commence_time": t.commence_time,
+                        "leg3_bm":    t.leg3_bm,
+                        "leg3_team":  t.leg3_team,
+                        "leg3_odds":  t.leg3_odds,
+                        "stake3_thb": t.stake3_thb,
+                        "needs_manual_review": True,
+                    }
+                    for t, _dt in mr_snap
                 ],
                 "pnl": {
                     "confirmed":  len(confirmed),
