@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  DEMINIA BOT V.2 —  Production Ready                                  ║
+║  DEMINIA BOT V.3 —  Production Ready                                  ║
 ║  1.  Odds Staleness + Slippage Guard   9.  Profitability Guard        ║
 ║  2.  Max/Min Odds Filter              10.  CLV Benchmark + Settlement ║
 ║  3.  Alert Cooldown + Multi-chat      11.  Manual Settle (/settle)    ║
@@ -14,6 +14,10 @@
 ║  18. Bearer-only dashboard auth  20. VB slippage refetch guard         ║
 ║  21. opp_log confirmed-after-exec 22. 3-way post-round profit guard    ║
 ║  23. Live odds in TradeRecord    24. MANUAL_REVIEW no-spam alert       ║
+║  25. Arb/VB P&L separation       26. Manual review queue persist       ║
+║  27. Smart settle hints          28. ALLOW_INSECURE_DASHBOARD guard    ║
+║  29. get-validate-pop settle     30. _quota_ok() helper                ║
+║  31. needs_manual_review field   32. Dashboard V.3 login overlay       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
