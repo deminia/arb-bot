@@ -4283,14 +4283,14 @@ _stats_cache_lock = threading.Lock()  # B3: protect _stats_cache read/write acro
 
 def calc_stats_cached() -> dict:
     """calc_stats พร้อม cache 15 วินาที — ลดภาระ CPU ตอน dashboard refresh"""
+    # Issue38: hold lock for full check+compute+write — prevents double-compute when 2 threads both miss cache
     with _stats_cache_lock:
         if time.time() - _stats_cache["ts"] < 15 and _stats_cache["data"] is not None:
             return _stats_cache["data"]
-    result = calc_stats()
-    with _stats_cache_lock:
+        result = calc_stats()
         _stats_cache["data"] = result
         _stats_cache["ts"]   = time.time()
-    return result
+        return result
 
 def calc_stats() -> dict:
     """คำนวณสถิติทั้งหมดสำหรับ /api/stats"""
