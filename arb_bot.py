@@ -17,7 +17,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import asyncio, json, logging, os, random, re, signal, sqlite3, threading, time, uuid
+import asyncio, json, logging, os, random, re, signal, sqlite3, threading, time, uuid  # re already imported at top (Q6)
 import urllib.request, urllib.error
 # v10-6: ใช้ Turso HTTP REST API ตรงๆ — ไม่พึ่ง libsql_client
 _TURSO_API = "http"  # always http mode
@@ -1697,22 +1697,26 @@ async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
     poly_markets  = results[n]       # Polymarket
     kalshi_markets = results[n + 1]  # Kalshi
 
-    # Merge extra bookmaker events into odds_by_sport
+    # Q4: Merge extra bookmaker events into odds_by_sport — fuzzy match ชื่อทีม
     if _s("EXTRA_BOOKMAKERS", ""):
         for i, s in enumerate(sports):
             extra_events = results[n + 2 + i]
             if not extra_events: continue
-            existing = {(e.get("home_team",""), e.get("away_team","")): e for e in odds_by_sport[s]}
+            std_events = odds_by_sport[s]
             for ev in extra_events:
-                key = (ev.get("home_team",""), ev.get("away_team",""))
-                if key in existing:
-                    # merge bookmakers into existing event
-                    existing_bms = {bm["key"] for bm in existing[key].get("bookmakers", [])}
-                    for bm in ev.get("bookmakers", []):
-                        if bm["key"] not in existing_bms:
-                            existing[key].setdefault("bookmakers", []).append(bm)
-                else:
-                    odds_by_sport[s].append(ev)
+                ev_name = f"{ev.get('home_team','')} vs {ev.get('away_team','')}"
+                merged = False
+                for std_ev in std_events:
+                    std_name = f"{std_ev.get('home_team','')} vs {std_ev.get('away_team','')}"
+                    if fuzzy_match(ev_name, std_name, 0.80):
+                        existing_bms = {bm["key"] for bm in std_ev.get("bookmakers", [])}
+                        for bm in ev.get("bookmakers", []):
+                            if bm["key"] not in existing_bms:
+                                std_ev.setdefault("bookmakers", []).append(bm)
+                        merged = True
+                        break
+                if not merged:
+                    std_events.append(ev)
 
     # Combine Polymarket + Kalshi into single alt-markets list
     all_alt_markets = list(poly_markets) + list(kalshi_markets)
@@ -2068,8 +2072,8 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
             log.debug(f"[PolyYesNo] skip — can't parse both teams from question: {best.get('question','')[:60]}")
             return None
         # H5: parse ว่า Yes = ทีมไหน — ถ้า parse ไม่ชัด return None แทนเดา
-        import re as _re
-        _pat = _re.search(r'will\s+(.*?)\s+(?:beat|win|defeat|cover)', q_lower)
+        # Q6: re imported at top-level — ไม่ต้อง import ซ้ำใน function
+        _pat = re.search(r'will\s+(.*?)\s+(?:beat|win|defeat|cover)', q_lower)
         if not _pat:
             log.debug(f"[PolyYesNo] skip — can't parse Yes team from: {best.get('question','')[:60]}")
             return None
@@ -2673,6 +2677,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
         _bm  = leg.bookmaker.lower()
         _tok = leg.raw.get("token_id", "") if leg.raw else ""
         # 1) Polymarket / Kalshi — CLOB / REST API
+        # Q1: ใช้ ask side แทน mid_price — conservative execution price (buyer pays ask)
         if _tok and ("polymarket" in _bm or "kalshi" in _bm):
             try:
                 async with aiohttp.ClientSession() as _s:
@@ -2680,11 +2685,27 @@ async def execute_both(opp: ArbOpportunity) -> str:
                              if "kalshi" in _bm
                              else await fetch_poly_market_detail(_s, _tok))
                 _is_no = _tok.endswith("_no")
-                if _book and (_book.get("mid_price", 0) > 0 or _book.get("no_mid_price", 0) > 0):
-                    _mid = Decimal(str(_book["no_mid_price"] if _is_no else _book["mid_price"]))
-                    _price = apply_slippage(Decimal("1") / _mid, _bm)
-                    log.info(f"[SlippageGuard] {label} CLOB refetch: {float(_price):.3f}")
-                    return _price, True
+                if _book:
+                    # Q1: prefer ask price (executable) over mid — more conservative
+                    if "kalshi" in _bm:
+                        # Kalshi: yes_ask / (1-yes_ask) ฝั่ง no
+                        _ask_raw = _book.get("best_ask", 0)
+                        if _is_no:
+                            _no_ask = 1.0 - (_book.get("best_bid", 0) or _ask_raw)
+                            _exec_p = _no_ask if _no_ask > 0 else (1.0 - _ask_raw)
+                        else:
+                            _exec_p = _ask_raw
+                    else:
+                        # Polymarket: best_ask ของ token นั้น
+                        _exec_p = _book.get("best_ask", 0)
+                        if _is_no:
+                            # No token ask = 1 - Yes bid
+                            _yes_bid = _book.get("best_bid", 0)
+                            _exec_p = (1.0 - _yes_bid) if _yes_bid > 0 else _exec_p
+                    if _exec_p > 0.01:
+                        _price = apply_slippage(Decimal("1") / Decimal(str(_exec_p)), _bm)
+                        log.info(f"[SlippageGuard] {label} CLOB ask refetch: {float(_price):.3f} (ask={_exec_p:.4f})")
+                        return _price, True
                 log.warning(f"[SlippageGuard] {label} CLOB empty response")
                 return leg.odds, False
             except Exception as _e:
@@ -3848,8 +3869,9 @@ def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     ]
 
     # หา leg ที่ match winner
-    matched = [leg for leg in legs if fuzzy_match(winner, leg["team"], threshold=0.5)]
-    unmatched = [leg for leg in legs if not fuzzy_match(winner, leg["team"], threshold=0.5)]
+    # Q5: ใช้ threshold 0.65 แทน 0.5 — ป้องกัน Man Utd / Man City ambiguous match
+    matched = [leg for leg in legs if fuzzy_match(winner, leg["team"], threshold=0.65)]
+    unmatched = [leg for leg in legs if not fuzzy_match(winner, leg["team"], threshold=0.65)]
 
     if len(matched) == 1:
         payout = matched[0]["stake"] * matched[0]["odds"]
@@ -4136,7 +4158,29 @@ async def scanner_loop():
             with _data_lock:
                 for _sid in expired:
                     pending.pop(_sid, None)
+                    # Q3: mark in-memory opportunity_log status=expired
+                    for opp_rec in opportunity_log:
+                        if getattr(opp_rec, 'signal_id', None) == _sid:
+                            opp_rec.status = 'expired'
+                            break
             log.info(f"[Pending] expired {len(expired)} signal(s)")
+            # Q3: persist expired status to SQLite (sync, best-effort)
+            try:
+                with sqlite3.connect(DB_PATH, timeout=2) as _con:
+                    for _sid in expired:
+                        _con.execute("UPDATE opportunity_log SET status='expired' WHERE signal_id=?", (_sid,))
+                    _con.commit()
+            except Exception as _qe:
+                log.debug(f"[Pending] expire DB update failed: {_qe}")
+            # Q3: Turso async (best-effort, non-blocking)
+            if _turso_ok:
+                async def _expire_turso(_sids=list(expired)):
+                    for _sid in _sids:
+                        try:
+                            await turso_query("UPDATE opportunity_log SET status='expired' WHERE signal_id=?",
+                                              [_sid])
+                        except Exception: pass
+                asyncio.get_running_loop().create_task(_expire_turso())
         # v10-1: รอแบบ ถ้า apply_runtime_config เปลี่ยน interval/auto_scan จะปลุก event นี้เพื่อตื่นทันที
         _scan_wakeup.clear()
         try:
@@ -4743,6 +4787,15 @@ async def post_init(app: Application):
         saved_scan     = db_load_state("auto_scan", "")
     if saved_scan:
         auto_scan = saved_scan.lower() == "true"
+
+    # Q2: restore runtime config keys saved via dashboard /api/control
+    _cfg_keys = ["min_profit_pct", "scan_interval", "max_odds", "min_odds",
+                 "cooldown", "total_stake", "kelly_fraction", "use_kelly"]
+    for _ck in _cfg_keys:
+        _cv = (await db_load_state_async(f"cfg_{_ck}", "")) if _turso_ok else db_load_state(f"cfg_{_ck}", "")
+        if _cv:
+            ok, msg = apply_runtime_config(_ck, _cv)
+            log.info(f"[Config] restored cfg_{_ck}={_cv} → {msg}" if ok else f"[Config] cfg_{_ck} restore failed: {msg}")
 
     # โหลด records จาก DB (Turso หรือ SQLite)
     loaded_trades, loaded_opps, lms = await db_load_all()
