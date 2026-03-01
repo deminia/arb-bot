@@ -1228,25 +1228,36 @@ def grade_signal(lm: LineMovement, liquidity_usd: float = 0,
 
 
 def sport_to_path(sport_key: str) -> dict:
-    """แปลง sport_key เป็น path สำหรับแต่ละ bookmaker"""
+    """แปลง sport_key เป็น path สำหรับแต่ละ bookmaker
+    K5: เพิ่ม stake/cloudbet keys
+    """
     s = sport_key.lower()
     if "basketball" in s:
-        return {"pinnacle": "basketball", "1xbet": "basketball", "dafabet": "sports/basketball"}
+        return {"pinnacle": "basketball", "1xbet": "basketball", "dafabet": "sports/basketball",
+                "stake": "basketball", "cloudbet": "basketball"}
     if "soccer" in s:
-        return {"pinnacle": "soccer", "1xbet": "football", "dafabet": "sports/football"}
+        return {"pinnacle": "soccer", "1xbet": "football", "dafabet": "sports/football",
+                "stake": "soccer", "cloudbet": "soccer"}
     if "americanfootball" in s:
-        return {"pinnacle": "american-football", "1xbet": "american-football", "dafabet": "sports/american-football"}
+        return {"pinnacle": "american-football", "1xbet": "american-football", "dafabet": "sports/american-football",
+                "stake": "american-football", "cloudbet": "american-football"}
     if "baseball" in s:
-        return {"pinnacle": "baseball", "1xbet": "baseball", "dafabet": "sports/baseball"}
+        return {"pinnacle": "baseball", "1xbet": "baseball", "dafabet": "sports/baseball",
+                "stake": "baseball", "cloudbet": "baseball"}
     if "icehockey" in s:
-        return {"pinnacle": "ice-hockey", "1xbet": "ice-hockey", "dafabet": "sports/ice-hockey"}
+        return {"pinnacle": "ice-hockey", "1xbet": "ice-hockey", "dafabet": "sports/ice-hockey",
+                "stake": "ice-hockey", "cloudbet": "ice-hockey"}
     if "cricket" in s:
-        return {"pinnacle": "cricket", "1xbet": "cricket", "dafabet": "sports/cricket"}
+        return {"pinnacle": "cricket", "1xbet": "cricket", "dafabet": "sports/cricket",
+                "stake": "cricket", "cloudbet": "cricket"}
     if "tennis" in s:
-        return {"pinnacle": "tennis", "1xbet": "tennis", "dafabet": "sports/tennis"}
+        return {"pinnacle": "tennis", "1xbet": "tennis", "dafabet": "sports/tennis",
+                "stake": "tennis", "cloudbet": "tennis"}
     if "mma" in s or "martial" in s:
-        return {"pinnacle": "mixed-martial-arts", "1xbet": "mixed-martial-arts", "dafabet": "sports/mma"}
-    return {"pinnacle": "sports", "1xbet": "sports", "dafabet": "sports"}
+        return {"pinnacle": "mixed-martial-arts", "1xbet": "mixed-martial-arts", "dafabet": "sports/mma",
+                "stake": "mma", "cloudbet": "mma"}
+    return {"pinnacle": "sports", "1xbet": "sports", "dafabet": "sports",
+            "stake": "sports", "cloudbet": "sports"}
 
 
 def build_betting_links(event_name: str, outcome: str, sport: str,
@@ -2577,6 +2588,7 @@ async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
 async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
     """B2: ดึง live odds ของ soft book ก่อน VB confirm
     G3: รวม EXTRA_BOOKMAKERS path — ถ้า bm ไม่อยู่ใน BOOKMAKERS ให้ fetch extra feed แทน
+    K3: ใช้ semaphore wrapper เหมือน scan หลัก
     Returns: live soft_odds (float) — คืน vb.soft_odds เดิมถ้าหาไม่เจอ
     """
     def _search_events(events: list, bm_key_norm: str) -> float | None:
@@ -2607,12 +2619,13 @@ async def refetch_valuebet_odds(vb: "ValueBetSignal") -> float:
         if time.time() - cached_ts < 15 and cached_events:
             events = cached_events
         else:
+            # K3: ใช้ semaphore wrapper — ไม่ยิง direct
             async with aiohttp.ClientSession() as session:
                 if use_extra:
-                    events = await async_fetch_extra_books(session, vb.sport)
+                    events = await _fetch_extra_books_sem(session, vb.sport)
                     log.debug(f"[VBGuard] refetch via extra feed for {vb.bookmaker}")
                 else:
-                    events = await async_fetch_odds(session, vb.sport)
+                    events = await _fetch_odds_sem(session, vb.sport)
             _refetch_cache[cache_key] = (time.time(), events)
         result = _search_events(events, bm_key_norm)
         if result is not None:
@@ -2636,24 +2649,49 @@ async def execute_both(opp: ArbOpportunity) -> str:
         # BugC/R4: refetch all 3 legs including Draw
         live1, live2 = await refetch_live_odds(opp)
         live3 = opp.leg3.odds  # default = cached
-        # F2: per-leg refetch ตาม source — Polymarket/Kalshi ยิง CLOB, sportsbook ใช้ live1/live2
+        # F2/K1: per-leg refetch ตาม source
         leg3_token = opp.leg3.raw.get("token_id", "") if opp.leg3.raw else ""
         _leg3_bm   = opp.leg3.bookmaker.lower()
         if leg3_token:
+            # Polymarket / Kalshi: ใช้ CLOB / REST API
             try:
                 async with aiohttp.ClientSession() as _sess:
-                    # G1: แยก endpoint ตาม source
                     _book = (await fetch_kalshi_market_detail(_sess, leg3_token)
                              if "kalshi" in _leg3_bm
                              else await fetch_poly_market_detail(_sess, leg3_token))
-                # H1: leg3 Draw token — ใช้ no_mid_price ถ้าเป็น _no token
                 _is_no_leg3 = leg3_token.endswith("_no")
                 if _book and (_book.get("mid_price", 0) > 0 or _book.get("no_mid_price", 0) > 0):
                     _mid = Decimal(str(_book["no_mid_price"] if _is_no_leg3 else _book["mid_price"]))
                     live3 = apply_slippage(Decimal("1") / _mid, _leg3_bm)
-                    log.info(f"[SlippageGuard-3way] live Draw refetched: {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
+                    log.info(f"[SlippageGuard-3way] live Draw refetched (CLOB): {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
             except Exception as _e:
-                log.debug(f"[SlippageGuard-3way] draw refetch failed: {_e} — using cached")
+                log.debug(f"[SlippageGuard-3way] draw CLOB refetch failed: {_e} — using cached")
+        else:
+            # K1: Draw leg มาจาก sportsbook ปกติ — lookup จาก odds feed เหมือน leg1/leg2
+            try:
+                _leg3_extra = norm_bm_key(opp.leg3.bookmaker) not in \
+                    [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
+                _leg3_key = opp.leg3.raw.get("bm_key", "") if opp.leg3.raw else ""
+                async with aiohttp.ClientSession() as _sess3:
+                    if _leg3_extra:
+                        _leg3_events = await _fetch_extra_books_sem(_sess3, opp.sport)
+                    else:
+                        _leg3_events = await _fetch_odds_sem(_sess3, opp.sport)
+                for _ev3 in _leg3_events:
+                    _ename3 = f"{_ev3.get('home_team','')} vs {_ev3.get('away_team','')}"
+                    if not fuzzy_match(_ename3, opp.event, 0.7): continue
+                    for _bm3 in _ev3.get("bookmakers", []):
+                        _bk3 = _bm3.get("key", "")
+                        if not (_bk3 == _leg3_key or opp.leg3.bookmaker.lower() in _bk3.lower()): continue
+                        for _mkt3 in _bm3.get("markets", []):
+                            if _mkt3.get("key") != "h2h": continue
+                            for _out3 in _mkt3.get("outcomes", []):
+                                if fuzzy_match(_out3.get("name", ""), opp.leg3.outcome, 0.8):
+                                    live3 = apply_slippage(Decimal(str(_out3.get("price", 1))), _bk3)
+                                    log.info(f"[SlippageGuard-3way] live Draw refetched (sportsbook): {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
+                                    break
+            except Exception as _e3:
+                log.debug(f"[SlippageGuard-3way] draw sportsbook refetch failed: {_e3} — using cached")
         # F2: refetch leg1/leg2 ถ้ามาจาก Polymarket/Kalshi ด้วย CLOB (ไม่ใช่ Odds API)
         for _leg_attr, _live_ref in [("leg1", "live1"), ("leg2", "live2")]:
             _leg = getattr(opp, _leg_attr)
@@ -2693,6 +2731,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
     else:
         live1, live2 = await refetch_live_odds(opp)
         # F2: 2-way per-leg refetch ถ้า leg มาจาก Polymarket/Kalshi
+        # K3: ใช้ semaphore wrapper สำหรับ aiohttp session ภายใน
         for _leg_attr, _live_init in [(opp.leg1, live1), (opp.leg2, live2)]:
             _leg = _leg_attr
             _bm  = _leg.bookmaker.lower()
@@ -2700,7 +2739,6 @@ async def execute_both(opp: ArbOpportunity) -> str:
             if _tok and ("polymarket" in _bm or "kalshi" in _bm):
                 try:
                     async with aiohttp.ClientSession() as _s3:
-                        # G1: แยก endpoint — Kalshi ใช้ REST API, Polymarket ใช้ CLOB
                         _b3 = (await fetch_kalshi_market_detail(_s3, _tok)
                                if "kalshi" in _bm
                                else await fetch_poly_market_detail(_s3, _tok))
@@ -2935,9 +2973,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
             except Exception:
                 pass
-        with _data_lock:
-            _pending_vb.pop(sid, None)
         if action == "vb_reject":
+            with _data_lock:
+                _pending_vb.pop(sid, None)
             try: await query.edit_message_text(orig+"\n\n❌ *Value Bet Skipped*", parse_mode="Markdown")
             except Exception: pass
             return
@@ -2947,14 +2985,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         live_soft_odds = await refetch_valuebet_odds(vb)
         _, live_edge = calc_valuebet_kelly(vb.true_odds, live_soft_odds, vb.grade)
         if live_soft_odds < vb.soft_odds * 0.98 or live_edge <= 0:  # tolerance 2%
+            # K4: ไม่ pop — ยังเก็บ signal ไว้ให้ retry ได้ (one-shot abort ไม่ pop)
+            _retry_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Retry",   callback_data=f"vb_confirm:{sid}"),
+                InlineKeyboardButton("❌ Skip",    callback_data=f"vb_reject:{sid}"),
+            ]])
             try:
                 await query.edit_message_text(
                     orig + (
                         f"\n\n🚫 *ABORT: Value เปลี่ยนแล้ว*\n"
                         f"คาด `{vb.soft_odds:.3f}` → จริง `{live_soft_odds:.3f}`\n"
-                        f"edge ใหม่ = {live_edge:.2f}%"
+                        f"edge ใหม่ = {live_edge:.2f}%\n"
+                        f"_(กด Retry ถ้าจะลองใหม่)_"
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=_retry_kb,
                 )
             except Exception: pass
             return
@@ -2998,6 +3043,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"_(ยืนยันแล้ว — วางด้วยมือ)_"
         )
+        # K4: pop เมื่อ confirm สำเร็จแล้ว
+        with _data_lock:
+            _pending_vb.pop(sid, None)
         try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
         except Exception: pass
         for cid in ALL_CHAT_IDS:
@@ -3078,7 +3126,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass  # C8
     except ValueError as abort_msg:
         # B2: ไม่ pop pending ถ้า execute abort — user ยังกดอีกครั้งได้
-        try: await query.edit_message_text(orig+"\n\n"+str(abort_msg)+"\n\n_กด Confirm ใหม่ได้_", parse_mode="Markdown")
+        # K2: ส่ง reply_markup ปุ่ม Confirm กลับไปพร้อม abort message เพื่อให้กดได้
+        _abort_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Confirm อีกครั้ง", callback_data=f"confirm:{sid}"),
+            InlineKeyboardButton("❌ Reject",           callback_data=f"reject:{sid}"),
+        ]])
+        try:
+            await query.edit_message_text(
+                orig+"\n\n"+str(abort_msg)+"\n\n_กด Confirm อีกครั้งได้_",
+                parse_mode="Markdown",
+                reply_markup=_abort_kb,
+            )
         except Exception: pass
     except Exception as e:  # C4: generic catch — network/parse/decimal errors
         log.error(f"[Confirm] execute_both failed: {e}", exc_info=True)
