@@ -2080,9 +2080,13 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
         if not (ta_in_q and tb_in_q):
             log.debug(f"[PolyYesNo] skip — can't parse both teams from question: {best.get('question','')[:60]}")
             return None
+        # C4: skip non-winner propositions — cover/spread/handicap/over/under map to different outcomes than H2H
+        if any(x in q_lower for x in ("cover", "spread", "handicap", "over", "under", "total")):
+            log.debug(f"[PolyYesNo] skip non-H2H proposition (cover/spread/total): {best.get('question','')[:60]}")
+            return None
         # H5: parse ว่า Yes = ทีมไหน — ถ้า parse ไม่ชัด return None แทนเดา
         # Q6: re imported at top-level — ไม่ต้อง import ซ้ำใน function
-        _pat = re.search(r'will\s+(.*?)\s+(?:beat|win|defeat|cover)', q_lower)
+        _pat = re.search(r'will\s+(.*?)\s+(?:beat|win|defeat)', q_lower)
         if not _pat:
             log.debug(f"[PolyYesNo] skip — can't parse Yes team from: {best.get('question','')[:60]}")
             return None
@@ -3989,7 +3993,8 @@ async def settle_completed_trades():
                     # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
                     try:
                         ct = parse_commence(matched_event.get("commence_time",""))
-                        if (datetime.now(timezone.utc) - ct).total_seconds() > 6 * 3600:
+                        _elapsed = (datetime.now(timezone.utc) - ct).total_seconds()
+                        if 6 * 3600 < _elapsed < 72 * 3600:  # Issue36: alert 6h–72h only; after 72h = postponed → manual
                             log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
                             # B6: แจ้งครั้งเดียว — ไม่ spam ทุกรอบ
                             if _app and signal_id not in _settle_alerted:
@@ -4165,9 +4170,10 @@ def periodic_cleanup():
         expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
         for k in expired_vb:
             del _pending_vb[k]
-    # E7/Issue33: ย้ายออกนอก _data_lock — asyncio-only sets ไม่ต้องการ lock
-    # แต่ต้องอยู่นอก with block เพื่อ consistency และ maintainability
-    _settled_in_cleanup = {s.signal_id for s in trade_records if s.actual_profit_thb is not None}
+    # Issue35: snapshot trade_records inside lock, iterate outside — avoid RuntimeError on concurrent append
+    with _data_lock:
+        _trade_snap = list(trade_records)
+    _settled_in_cleanup = {s.signal_id for s in _trade_snap if s.actual_profit_thb is not None}
     _settle_alerted      -= _settled_in_cleanup
     _manual_review_alerted -= _settled_in_cleanup
 
@@ -4622,30 +4628,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if _up_health(self.path).path == "/health":
             uptime_s = int(time.time() - _bot_start_ts)
             uptime_str = f"{uptime_s//3600}h{(uptime_s%3600)//60}m"
-            with _data_lock:
-                ps_snap = dict(_pending_settlement)
-            ready_to_settle = sum(
-                1 for sid, (trade, cdt) in ps_snap.items()
-                if datetime.now(timezone.utc) >= cdt + timedelta(hours=2)
-            )
-            with _data_lock:
-                confirmed_ct = len([t for t in trade_records if t.status=="confirmed"])
-                pending_snap = len(pending)
+            # C5: /health is public (Railway check) — minimal response only, no internal telemetry
             health = {
-                "status":            "ok" if not _db_write_halted else "degraded",
-                "uptime":            uptime_str,
-                "db_mode":           "turso" if _turso_ok else ("halted" if _db_write_halted else "sqlite"),
-                "turso_ok":          _turso_ok,
-                "db_write_halted":   _db_write_halted,
-                "last_scan":         last_scan_time,
-                "scan_in_progress":  bool(_scan_lock and _scan_lock.locked()),  # C1
-                "scan_count":        scan_count,
-                "pending":           pending_snap,
-                "api_remaining":     api_remaining,
-                "auto_scan":         auto_scan,
-                "confirmed_trades":  confirmed_ct,
-                "ready_to_settle":   ready_to_settle,
-                "last_error":        _last_error or None,
+                "status":  "ok" if not _db_write_halted else "degraded",
+                "uptime":  uptime_str,
             }
             body = json.dumps(health).encode()
             self.send_response(200)
@@ -4659,20 +4645,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse
         clean_path = urlparse(self.path).path
 
-        # R8: HTML page \u0e42\u0e2b\u0e25\u0e14\u0e44\u0e14\u0e49\u0e40\u0e2a\u0e21\u0e2d (login form \u0e2d\u0e22\u0e39\u0e48\u0e43\u0e19 HTML) \u2014 auth \u0e40\u0e09\u0e1e\u0e32\u0e30        # B4: if DASHBOARD_TOKEN set, protect HTML page too (full private dashboard)
-        # /api/* always requires auth; HTML page requires auth only when token is configured
-        if clean_path.startswith("/api/") or (DASHBOARD_TOKEN and clean_path in ("/", "")):
+        # C3: protect all non-health paths when DASHBOARD_TOKEN is set
+        if clean_path.startswith("/api/") or DASHBOARD_TOKEN:
             if not self._check_auth(): return
 
         if clean_path == "/api/state":
-            # v10-12: lock ครอบ read ทั้งหมด
             with _data_lock:
                 confirmed  = [t for t in trade_records if t.status=="confirmed"]
                 rejected   = [t for t in trade_records if t.status=="rejected"]
                 lm_snap    = list(line_movements[-50:])
                 opp_snap   = list(opportunity_log[-50:])
                 tr_snap    = list(trade_records[-30:])
-                ps_snap    = list(_pending_settlement.values())  # Fix 4: full unsettled list
+                ps_snap    = list(_pending_settlement.values())
                 pending_ct = len(pending)
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in confirmed)
             clv_values = []
