@@ -247,7 +247,7 @@ class TradeRecord:
     leg3_team:   Optional[str]   = None
     leg3_odds:   Optional[float] = None
     stake3_thb:  Optional[int]   = None
-
+    needs_manual_review: bool = False  # M2: True = ถูกย้ายไป _manual_review_pending (persist ข้าม restart)
 
 # ══════════════════════════════════════════════════════════════════
 #  STATE
@@ -572,14 +572,15 @@ def db_save_trade(t: "TradeRecord"):
 
 async def _async_save_trade(t: "TradeRecord"):
     await turso_exec(
-        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (t.signal_id,t.event,t.sport,t.leg1_bm,t.leg2_bm,
          t.leg1_team,t.leg2_team,
          t.leg1_odds,t.leg2_odds,t.stake1_thb,t.stake2_thb,
          t.profit_pct,t.status,t.clv_leg1,t.clv_leg2,
          t.actual_profit_thb,t.settled_at,t.created_at,
          t.commence_time,
-         t.leg3_bm,t.leg3_team,t.leg3_odds,t.stake3_thb)
+         t.leg3_bm,t.leg3_team,t.leg3_odds,t.stake3_thb,
+         int(t.needs_manual_review))  # M2: col 23
     )
 
 def db_save_opportunity(opp: dict):
@@ -641,6 +642,7 @@ async def db_load_all() -> tuple[list, list, list]:
             ("leg3_team", "ALTER TABLE trade_records ADD COLUMN leg3_team TEXT DEFAULT NULL"),
             ("leg3_odds", "ALTER TABLE trade_records ADD COLUMN leg3_odds REAL DEFAULT NULL"),
             ("stake3_thb","ALTER TABLE trade_records ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
+            ("needs_manual_review", "ALTER TABLE trade_records ADD COLUMN needs_manual_review INTEGER DEFAULT 0"),  # M2
             # B5: opportunity_log 3-way migration ย้ายมาไว้ที่นี่ — ยิงแค่ครั้งเดียวตอน startup
             ("opp_leg3_bm",        "ALTER TABLE opportunity_log ADD COLUMN leg3_bm TEXT DEFAULT NULL"),
             ("opp_stake3_thb",     "ALTER TABLE opportunity_log ADD COLUMN stake3_thb INTEGER DEFAULT NULL"),
@@ -675,7 +677,9 @@ async def db_load_all() -> tuple[list, list, list]:
                     leg3_bm=r[19] if n >= 20 else None,
                     leg3_team=r[20] if n >= 21 else None,
                     leg3_odds=float(r[21]) if n >= 22 and r[21] is not None else None,
-                    stake3_thb=int(float(r[22])) if n >= 23 and r[22] is not None else None))
+                    stake3_thb=int(float(r[22])) if n >= 23 and r[22] is not None else None,
+                    needs_manual_review=bool(int(r[23])) if n >= 24 and r[23] is not None else False)  # M2
+                )
             else:
                 # DB เก่า — ไม่มี leg1_team/leg2_team
                 ev = r[1] if n>1 else ""
@@ -3387,7 +3391,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         actual_pnl   = sum(t.actual_profit_thb for t in trade_records
                            if t.status=="confirmed" and t.actual_profit_thb is not None)
         _pending_ct  = len(pending)
-        _unsettled_ct = len(_pending_settlement)
+        _unsettled_ct = len(_pending_settlement) + len(_manual_review_pending)  # M1: include manual review queue
         _lm_ct       = len(line_movements)
     # C13: rotation info
     rotation_size = int(os.getenv("SPORT_ROTATION_SIZE", "0"))
@@ -4158,7 +4162,9 @@ async def settle_completed_trades():
 
                 if winner == "MANUAL_REVIEW":
                     log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
-                    # K3: move trade to _manual_review_pending — remove from auto-settle queue
+                    # K3/M2: set flag + save to DB so it survives restart
+                    trade.needs_manual_review = True
+                    db_save_trade(trade)
                     with _data_lock:
                         _manual_review_pending[signal_id] = _pending_settlement.pop(signal_id, (trade, _cdt))
                     settled_ids.append(signal_id)  # mark as removed from pending loop
@@ -5023,6 +5029,7 @@ async def post_init(app: Application):
         log.warning("[DB] ⚠️ Running WITHOUT Turso — all stats will reset on next deploy")
 
     # restore pending settlement — trades ที่ confirmed แต่ยังไม่มีผล
+    # M2: restore to correct queue — needs_manual_review=True → _manual_review_pending, else → _pending_settlement
     # #34 เรียก register_closing_watch ด้วยเพื่อให้ CLV tracking ทำงานหลัง restart
     for t in trade_records:
         if t.status == "confirmed" and t.actual_profit_thb is None and t.settled_at is None:
@@ -5043,7 +5050,11 @@ async def post_init(app: Application):
                     log.warning(f"[Settle] trade {t.signal_id} ไม่มี commence_time — settle check ที่ created_at+24h ({commence_dt.isoformat()})")
             except Exception:
                 commence_dt = datetime.now(timezone.utc)
-            _pending_settlement[t.signal_id] = (t, commence_dt)
+            # M2: restore to correct queue
+            if t.needs_manual_review:
+                _manual_review_pending[t.signal_id] = (t, commence_dt)
+            else:
+                _pending_settlement[t.signal_id] = (t, commence_dt)
             # restore CLV watch
             try:
                 key = f"{t.event}|{t.sport}"
@@ -5057,7 +5068,7 @@ async def post_init(app: Application):
                     }
             except Exception:
                 pass
-    log.info(f"[Settle] restored {len(_pending_settlement)} unsettled trades | CLV watch={len(_closing_line_watch)}")
+    log.info(f"[Settle] restored {len(_pending_settlement)} auto + {len(_manual_review_pending)} manual-review trades | CLV watch={len(_closing_line_watch)}")
 
     app.add_error_handler(error_handler)
     threading.Thread(target=start_dashboard, daemon=True).start()
