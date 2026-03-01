@@ -10,10 +10,10 @@
 ║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
 ║  8.  Soccer 3-way Arb (1X2 calc)     16.  Signal TTL + WAL DB        ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  Patch B/C/D: asyncio.Lock scan, VB/arb slippage guard, require_owner║
-║  confirm_rate/settled_win_rate split, 3-way live payout+guard, D1-D9 ║
-║  17. Auth guard all cmds    19. Bankroll auto-stop guard             ║
-║  18. Bearer-only dashboard  20. VB slippage refetch guard            ║
+║  17. Auth guard all slash cmds   19. Bankroll auto-stop guard          ║
+║  18. Bearer-only dashboard auth  20. VB slippage refetch guard         ║
+║  21. opp_log confirmed-after-exec 22. 3-way post-round profit guard    ║
+║  23. Live odds in TradeRecord    24. MANUAL_REVIEW no-spam alert       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -2596,7 +2596,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
     # D4: บันทึก live odds ที่ใช้จริง (after slippage) แทน odds_raw
     _save_od1 = float(_leg1_disp if is_3way else _od1) if is_3way or '_od1' in locals() else float(opp.leg1.odds)
     _save_od2 = float(_leg2_disp if is_3way else _od2) if is_3way or '_od2' in locals() else float(opp.leg2.odds)
-    _save_od3 = float(_leg3_disp) if is_3way and '_leg3_disp' in locals() else (float(opp.leg3.odds_raw) if is_3way else None)
+    # E8: fallback ใช้ opp.leg3.odds (after slippage) แทน odds_raw
+    _save_od3 = float(_leg3_disp) if is_3way and '_leg3_disp' in locals() else (float(opp.leg3.odds) if is_3way else None)
     tr = TradeRecord(
         signal_id=opp.signal_id, event=opp.event, sport=opp.sport,
         leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
@@ -2620,12 +2621,14 @@ async def execute_both(opp: ArbOpportunity) -> str:
     db_update_opp_status(opp.signal_id, "confirmed")  # save to DB
 
     sp = sport_to_path(opp.sport)
-    def steps(leg, stake):
+    # E3: steps() รับ display_odds เพื่อโชว์ live odds แทน odds_raw
+    def steps(leg, stake, display_odds=None):
         bm  = leg.bookmaker.lower()
         eid = leg.raw.get("event_id","")
         bk  = leg.raw.get("bm_key", bm)
         cap = apply_max_stake(stake/USD_TO_THB, leg.bookmaker)*USD_TO_THB
         cap_note = f"\n  ⚠️ Capped ที่ ฿{int(cap):,}" if cap < stake else ""
+        show_odds = display_odds if display_odds is not None else leg.odds_raw
         if "kalshi" in bm:
             link = leg.market_url or "https://kalshi.com"
             usd_amt = round(stake / float(USD_TO_THB), 2)
@@ -2637,34 +2640,36 @@ async def execute_both(opp: ArbOpportunity) -> str:
         elif "pinnacle" in bk:
             path = sp["pinnacle"]
             link = f"https://www.pinnacle.com/en/{path}/matchup/{eid}" if eid else f"https://www.pinnacle.com/en/{path}"
-            return f"  🔗 [เปิด Pinnacle]({link})\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
+            return f"  🔗 [เปิด Pinnacle]({link})\n  2. เลือก *{leg.outcome}* @ {show_odds}\n  3. วาง ฿{int(stake)}{cap_note}"
         elif "onexbet" in bk or "1xbet" in bm:
             path = sp["1xbet"]
             link = f"https://1xbet.com/en/line/{path}/{eid}" if eid else f"https://1xbet.com/en/line/{path}"
-            return f"  🔗 [เปิด 1xBet]({link})\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
+            return f"  🔗 [เปิด 1xBet]({link})\n  2. เลือก *{leg.outcome}* @ {show_odds}\n  3. วาง ฿{int(stake)}{cap_note}"
         elif "dafabet" in bk:
             path = sp["dafabet"]
             return f"  🔗 [เปิด Dafabet](https://www.dafabet.com/en/{path})\n  2. ค้นหา *{leg.outcome}*\n  3. วาง ฿{int(stake)}{cap_note}"
-        return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {leg.odds_raw}\n  3. วาง ฿{int(stake)}{cap_note}"
+        return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {show_odds}\n  3. วาง ฿{int(stake)}{cap_note}"
 
     if is_3way:
+        # E3: ส่ง live odds เข้า steps()
         return (
             f"📋 *วางเงิน 3-WAY — {md_escape(opp.event)}*{slippage_warn}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏠 *Home — {md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1)}\n\n"
-            f"⚪ Draw — *{md_escape(opp.leg3.bookmaker)}*\n{steps(opp.leg3, s3)}\n\n"
-            f"🟠 *Away — {md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2)}\n"
+            f"🏠 *Home — {md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1, _leg1_disp)}\n\n"
+            f"⚪ Draw — *{md_escape(opp.leg3.bookmaker)}*\n{steps(opp.leg3, s3, _leg3_disp)}\n\n"
+            f"🟠 *Away — {md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2, _leg2_disp)}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💵 ทุน ฿{int(tt):,}  _(คาด profit: {float(opp.profit_pct):.2%})_\n"
             f"   {md_escape(opp.leg1.outcome)} ชนะ → ฿{int(w1):,}\n"
             f"   Draw → ฿{int(w3):,}\n"
             f"   {md_escape(opp.leg2.outcome)} ชนะ → ฿{int(w2):,}"
         )
+    # E3: 2-way — ส่ง _od1/_od2 เข้า steps()
     return (
         f"📋 *วางเงิน — {md_escape(opp.event)}*{slippage_warn}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔵 *{md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1)}\n\n"
-        f"🟠 *{md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2)}\n"
+        f"🔵 *{md_escape(opp.leg1.bookmaker)}*\n{steps(opp.leg1, s1, _od1)}\n\n"
+        f"🟠 *{md_escape(opp.leg2.bookmaker)}*\n{steps(opp.leg2, s2, _od2)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 ทุน ฿{int(tt):,}  _(Live profit: {float(live_profit):.2%})_\n"
         f"   {md_escape(str(opp.leg1.outcome))} ชนะ → ฿{int(w1):,} (+฿{int(w1-tt):,})\n"
@@ -2743,6 +2748,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception: pass
             return
+        # E2: ใช้ executed odds/edge ที่ผ่าน guard แล้ว — ไม่ย้อนไป vb.soft_odds
+        executed_soft_odds = live_soft_odds
+        executed_edge_pct  = live_edge
+        # recalc stake ตาม live edge
+        _, executed_rec_stake = calc_valuebet_kelly(vb.true_odds, executed_soft_odds, vb.grade)
+        executed_stake_thb = int(executed_rec_stake) if executed_rec_stake else int(vb.rec_stake_thb)
         # vb_confirm — แจ้ง Telegram พร้อม step-by-step
         sp = sport_to_path(vb.sport)
         bm_lower = vb.bookmaker.lower()
@@ -2759,31 +2770,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏆 {md_escape(vb.event)}\n"
             f"📡 {md_escape(vb.bookmaker)} — *{md_escape(vb.outcome)}*\n"
-            f"💰 Edge: *+{vb.edge_pct:.2f}%* | Stake: *฿{vb.rec_stake_thb:,}* @ `{vb.soft_odds:.3f}`\n"
+            f"💰 Edge: *+{executed_edge_pct:.2f}%* | Stake: *฿{executed_stake_thb:,}* @ `{executed_soft_odds:.3f}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📋 *วิธีวาง:*\n"
             f"  1. [เปิด {md_escape(vb.bookmaker)}]({link})\n"
             f"  2. ค้นหา *{md_escape(vb.event)}*\n"
-            f"  3. เลือก *{md_escape(vb.outcome)}* @ `{vb.soft_odds:.3f}`\n"
-            f"  4. วาง *฿{vb.rec_stake_thb:,}*\n"
+            f"  3. เลือก *{md_escape(vb.outcome)}* @ `{executed_soft_odds:.3f}`\n"
+            f"  4. วาง *฿{executed_stake_thb:,}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"_(ยืนยันแล้ว — วางด้วยมือ)_"
         )
-        try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{vb.rec_stake_thb:,}", parse_mode="Markdown")
+        try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
         except Exception: pass
         for cid in ALL_CHAT_IDS:
             try:
                 await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
             except Exception as e:
                 log.error(f"[VB] confirm msg error: {e}")
-        # C2: บันทึก TradeRecord (1-leg Value Bet) ลง DB + ส่งเข้า auto-settle
+        # E2: บันทึก TradeRecord ด้วย executed odds/edge (ไม่ใช้ vb.soft_odds เดิม)
         tr_vb = TradeRecord(
             signal_id=vb.signal_id, event=vb.event, sport=vb.sport,
             leg1_bm=vb.bookmaker, leg2_bm="-",
             leg1_team=vb.outcome, leg2_team="-",
-            leg1_odds=float(vb.soft_odds), leg2_odds=0.0,
-            stake1_thb=int(vb.rec_stake_thb), stake2_thb=0,
-            profit_pct=float(vb.edge_pct / 100.0), status="confirmed",
+            leg1_odds=float(executed_soft_odds), leg2_odds=0.0,
+            stake1_thb=executed_stake_thb, stake2_thb=0,
+            profit_pct=float(executed_edge_pct / 100.0), status="confirmed",
             commence_time=vb.commence_time,
         )
         with _data_lock:
@@ -3292,7 +3303,13 @@ async def watch_closing_lines():
                         fetch_ok = False
                         for event in events:
                             ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
-                            if ename != info["event"]: continue
+                            # E6: fuzzy match — ตรวจ token overlap แทน string ตรง ทน alias/punctuation
+                            _tgt = info["event"].lower()
+                            _src = ename.lower()
+                            _tgt_tokens = set(re.split(r'[\s\-_/]+', _tgt))
+                            _src_tokens = set(re.split(r'[\s\-_/]+', _src))
+                            _overlap = len(_tgt_tokens & _src_tokens) / max(len(_tgt_tokens), 1)
+                            if _overlap < 0.6 and ename != info["event"]: continue
                             pinnacle_found = False
                             for bm in event.get("bookmakers", []):
                                 bk = bm.get("key","")
@@ -3646,6 +3663,9 @@ async def settle_completed_trades():
                             trade_records[idx] = trade
                             break
                 settled_ids.append(signal_id)
+                # E7: เคลียร signal ออกจาก alert sets หลัง settle เสร็จ
+                _settle_alerted.discard(signal_id)
+                _manual_review_alerted.discard(signal_id)
 
                 log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
 
@@ -3714,11 +3734,13 @@ def periodic_cleanup():
             del _refetch_cache[k]
         # trim _pending_vb — ลบ Value Bet signals ที่หมดอายุ (> SIGNAL_TTL)
         _vb_ttl = int(os.getenv("SIGNAL_TTL_SEC", "900"))
-        # D8: snapshot _pending_vb ใต้ _data_lock
-        with _data_lock:
-            expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
-            for k in expired_vb:
-                del _pending_vb[k]
+        expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
+        for k in expired_vb:
+            del _pending_vb[k]
+        # E7: เคลียร settled signal IDs ออกจาก alert sets (ป้องกัน memory leak)
+        _settled_in_cleanup = {s.signal_id for s in trade_records if s.actual_profit_thb is not None}
+        _settle_alerted      -= _settled_in_cleanup
+        _manual_review_alerted -= _settled_in_cleanup
 
 
 async def scanner_loop():
@@ -4424,7 +4446,10 @@ def handle_shutdown(signum, frame):
     ]:
         stmts.append({"sql": "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)", "args": [k, v]})
     try:
-        if _turso_ok and _turso_url:
+        # E9: ใช้ _turso_url/_turso_token ตรงๆ — fallback ไป TURSO_URL ถ้า init ยังไม่เสร็จ (SIGTERM ระหว่าง startup)
+        _url   = _turso_url or TURSO_URL.replace("libsql://", "https://").replace("wss://", "https://")
+        _token = _turso_token or TURSO_TOKEN
+        if _url and _token:
             _turso_http(stmts)  # sync via urllib — ใช้ได้ใน signal handler
             log.info("[Shutdown] saved to Turso. Bye!")
         else:
