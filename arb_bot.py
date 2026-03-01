@@ -1623,6 +1623,7 @@ async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
 async def async_fetch_extra_books(session: aiohttp.ClientSession, sport_key: str) -> list[dict]:
     """ดึง odds จาก Stake.com และ Cloudbet ผ่าน The Odds API
     ต้องเพิ่ม stake,cloudbet ใน EXTRA_BOOKMAKERS env var
+    J2: อ่าน x-requests-remaining และเรียก update_quota()
     """
     extra = _s("EXTRA_BOOKMAKERS", "")
     if not extra:
@@ -1635,15 +1636,27 @@ async def async_fetch_extra_books(session: aiohttp.ClientSession, sport_key: str
             "bookmakers": extra,
         }
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            # J2: อัปเดต quota เหมือน main odds
+            remaining = int(r.headers.get("x-requests-remaining", api_remaining))
+            await update_quota(remaining)
             if r.status != 200: return []
             data = await r.json(content_type=None)
             if isinstance(data, list):
-                log.debug(f"[ExtraBooks] {sport_key} extra={extra} events={len(data)}")
+                log.debug(f"[ExtraBooks] {sport_key} extra={extra} events={len(data)} remaining={remaining}")
                 return data
         return []
     except Exception as e:
         log.debug(f"[ExtraBooks] {sport_key}: {e}")
         return []
+
+
+async def _fetch_extra_books_sem(session: aiohttp.ClientSession, sport: str) -> list[dict]:
+    """J2: wrap async_fetch_extra_books ด้วย Semaphore ตัวเดียวกับ main odds"""
+    sem = _ODDS_API_SEM
+    if sem is None:
+        return await async_fetch_extra_books(session, sport)
+    async with sem:
+        return await async_fetch_extra_books(session, sport)
 
 _ODDS_API_SEM: Optional[asyncio.Semaphore] = None  # B8: จำกัด concurrent Odds API requests
 
@@ -1663,7 +1676,8 @@ async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
             *[_fetch_odds_sem(session, s) for s in sports],
             async_fetch_polymarket(session),
             async_fetch_kalshi(session),
-            *([async_fetch_extra_books(session, s) for s in sports] if _s("EXTRA_BOOKMAKERS","") else []),
+            # J2: ใช้ _fetch_extra_books_sem (ผ่าน semaphore + quota)
+            *([_fetch_extra_books_sem(session, s) for s in sports] if _s("EXTRA_BOOKMAKERS","") else []),
         )
     odds_by_sport = {s: results[i] for i, s in enumerate(sports)}
     poly_markets  = results[n]       # Polymarket
@@ -2494,55 +2508,67 @@ _refetch_cache: dict[str, tuple[float, list]] = {}  # C10: sport -> (ts, events)
 async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal]:
     """
     Re-fetch ราคาล่าสุดจาก API ก่อนยืนยันการเดิมพัน
-    H2: รวม EXTRA_BOOKMAKERS path — ถ้า leg อยู่ใน extra ให้ fetch extra feed แทน
+    J1: mixed-source arb — fetch ทั้ง standard + extra feeds ถ้า legs มาจากต่าง source
     Returns: (live_odds_leg1, live_odds_leg2)
     ถ้าหาไม่เจอ → คืนค่าเดิม (ไม่ abort)
     """
-    # H2: ตรวจ leg bookmakers ว่าอยู่ใน extra หรือไม่
     _bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
     _extra_norm      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
     def _is_extra(bm: str) -> bool:
         k = norm_bm_key(bm)
         return k not in _bookmakers_norm and k in _extra_norm
 
+    leg1_extra = _is_extra(opp.leg1.bookmaker)
+    leg2_extra = _is_extra(opp.leg2.bookmaker)
+    need_standard = not leg1_extra or not leg2_extra  # อย่างน้อย 1 leg เป็น standard
+    need_extra    = leg1_extra or leg2_extra           # อย่างน้อย 1 leg เป็น extra
+
     try:
-        # C10: ใช้ cache ถ้าเพิ่ง fetch กีฬานี้ภายใน 15 วินาที
-        leg1_extra = _is_extra(opp.leg1.bookmaker)
-        leg2_extra = _is_extra(opp.leg2.bookmaker)
-        cache_key = f"{opp.sport}{'__extra' if (leg1_extra or leg2_extra) else ''}"
-        cached_ts, cached_events = _refetch_cache.get(cache_key, (0, []))
-        if time.time() - cached_ts < 15 and cached_events:
-            events = cached_events
-        else:
-            async with aiohttp.ClientSession() as session:
-                if leg1_extra or leg2_extra:
-                    events = await async_fetch_extra_books(session, opp.sport)
-                    log.debug(f"[SlippageGuard] refetch via extra feed ({opp.leg1.bookmaker}/{opp.leg2.bookmaker})")
+        now_ts = time.time()
+        # C10: cache แยกตาม feed (15s TTL)
+        std_events   = []
+        extra_events = []
+        async with aiohttp.ClientSession() as session:
+            if need_standard:
+                _ck = opp.sport
+                _cts, _cev = _refetch_cache.get(_ck, (0, []))
+                if now_ts - _cts < 15 and _cev:
+                    std_events = _cev
                 else:
-                    events = await async_fetch_odds(session, opp.sport)
-            _refetch_cache[cache_key] = (time.time(), events)
-        for event in events:
-            ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
-            if not fuzzy_match(ename, opp.event, 0.7): continue
-            live1 = opp.leg1.odds
-            live2 = opp.leg2.odds
-            for bm in event.get("bookmakers", []):
-                bk = bm.get("key","")
-                for mkt in bm.get("markets", []):
-                    if mkt.get("key") != "h2h": continue
-                    # C4: ดึง bm_key ไว้ก่อน loop outcomes (ใช้ key ไม่ใช่ title)
-                    leg1_key = opp.leg1.raw.get("bm_key", "") if opp.leg1.raw else ""
-                    leg2_key = opp.leg2.raw.get("bm_key", "") if opp.leg2.raw else ""
-                    for out in mkt.get("outcomes", []):
-                        name = out.get("name","")
-                        price = Decimal(str(out.get("price", 1)))
-                        if fuzzy_match(name, opp.leg1.outcome, 0.8) and \
-                           (bk == leg1_key or opp.leg1.bookmaker.lower() in bk.lower()):
-                            live1 = apply_slippage(price, bk)
-                        elif fuzzy_match(name, opp.leg2.outcome, 0.8) and \
-                             (bk == leg2_key or opp.leg2.bookmaker.lower() in bk.lower()):
-                            live2 = apply_slippage(price, bk)
-            return live1, live2
+                    std_events = await async_fetch_odds(session, opp.sport)
+                    _refetch_cache[_ck] = (now_ts, std_events)
+            if need_extra and _extra_norm:
+                _ck2 = f"{opp.sport}__extra"
+                _cts2, _cev2 = _refetch_cache.get(_ck2, (0, []))
+                if now_ts - _cts2 < 15 and _cev2:
+                    extra_events = _cev2
+                else:
+                    extra_events = await async_fetch_extra_books(session, opp.sport)
+                    _refetch_cache[_ck2] = (now_ts, extra_events)
+
+        if leg1_extra != leg2_extra:
+            log.debug(f"[SlippageGuard] mixed-source refetch: leg1={'extra' if leg1_extra else 'std'} leg2={'extra' if leg2_extra else 'std'}")
+
+        def _lookup_leg(leg, is_extra_leg, std_ev, extra_ev) -> Decimal:
+            """หา live odds ของ leg จาก feed ที่ถูก"""
+            source_events = extra_ev if is_extra_leg else std_ev
+            leg_key = leg.raw.get("bm_key", "") if leg.raw else ""
+            for event in source_events:
+                ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
+                if not fuzzy_match(ename, opp.event, 0.7): continue
+                for bm in event.get("bookmakers", []):
+                    bk = bm.get("key","")
+                    if not (bk == leg_key or leg.bookmaker.lower() in bk.lower()): continue
+                    for mkt in bm.get("markets", []):
+                        if mkt.get("key") != "h2h": continue
+                        for out in mkt.get("outcomes", []):
+                            if fuzzy_match(out.get("name",""), leg.outcome, 0.8):
+                                return apply_slippage(Decimal(str(out.get("price", 1))), bk)
+            return leg.odds  # fallback คืนค่าเดิม
+
+        live1 = _lookup_leg(opp.leg1, leg1_extra, std_events, extra_events)
+        live2 = _lookup_leg(opp.leg2, leg2_extra, std_events, extra_events)
+        return live1, live2
     except Exception as e:
         log.warning(f"[SlippageGuard] re-fetch failed: {e}")
     return opp.leg1.odds, opp.leg2.odds
@@ -2897,6 +2923,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-vb_ts)//60)}m ago)", parse_mode="Markdown")
             except Exception: pass
             return
+        # J6: kick-off guard — ไม่ confirm VB หลังแม็ตช์เริ่ม
+        if vb.commence_time:
+            try:
+                _vb_cdt = parse_commence(vb.commence_time)
+                if datetime.now(timezone.utc) > _vb_cdt + timedelta(minutes=5):
+                    with _data_lock:
+                        _pending_vb.pop(sid, None)
+                    try: await query.edit_message_text(orig+"\n\n⏰ *แม็ตช์เริ่มแล้ว — signal หมดอายุ*", parse_mode="Markdown")
+                    except Exception: pass
+                    return
+            except Exception:
+                pass
         with _data_lock:
             _pending_vb.pop(sid, None)
         if action == "vb_reject":
@@ -2938,6 +2976,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link = f"https://1xbet.com/en/line/{sp['1xbet']}"
         elif "dafabet" in bm_lower:
             link = f"https://www.dafabet.com/en/{sp['dafabet']}"
+        # J4: stake.com / cloudbet — เพิ่ม mapping แทน fallback Pinnacle
+        elif "stake" in bm_lower:
+            link = f"https://stake.com/sports/{sp.get('stake', sp.get('pinnacle', 'soccer'))}"
+        elif "cloudbet" in bm_lower:
+            link = f"https://www.cloudbet.com/en/sports/{sp.get('cloudbet', sp.get('pinnacle', 'soccer'))}"
         else:
             link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
         confirm_msg = (
@@ -3012,12 +3055,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         with _data_lock:
             trade_records.append(tr_rej)
-        db_save_trade(tr_rej)    # 💾
+        db_save_trade(tr_rej)    # 
         with _data_lock:  # D1: update opp_log to rejected
             for _e in opportunity_log:
                 if _e["id"] == sid:
                     _e["status"] = "rejected"; break
-        db_update_opp_status(sid, "rejected")  # 💾
+        db_update_opp_status(sid, "rejected")  # 
         try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         except Exception: pass  # C8
         return
@@ -3376,7 +3419,7 @@ async def do_scan() -> int:
                     t.actual_profit_thb for t in trade_records
                     if t.actual_profit_thb is not None
                     and t.settled_at
-                    and (datetime.fromisoformat(t.settled_at) + timedelta(hours=7)).date() == today
+                    and (_parse_settled_at(t.settled_at) + timedelta(hours=7)).date() == today
                 )
             if daily_loss <= -int(MAX_DAILY_LOSS_THB):
                 if auto_scan:
@@ -4218,12 +4261,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 
     def _check_auth(self) -> bool:
-        """ตรวจ Dashboard token (ถ้าตั้งไว้)"""
+        """ตรวจ Dashboard token (ถ้าตั้งไว้)
+        J7: รองรับทั้ง Bearer header และ ?token= query param
+        """
         if not DASHBOARD_TOKEN:
             return True  # ไม่ได้ตั้ง token = ไม่บังคับ auth
+        # C6: Bearer header
         auth = self.headers.get("Authorization", "")
-        # C6: Bearer header เท่านั้น — ไม่รองรับ query param (ป้องกัน token หลุดใน URL/log)
         if auth == f"Bearer {DASHBOARD_TOKEN}":
+            return True
+        # J7: ?token= query param (สำหรับ browser เข้าผ่าน URL)
+        from urllib.parse import urlparse, parse_qs
+        _qs = parse_qs(urlparse(self.path).query)
+        if _qs.get("token", [""])[0] == DASHBOARD_TOKEN:
             return True
         self.send_response(401)
         body = b'{"error":"unauthorized"}'
