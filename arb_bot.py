@@ -2059,6 +2059,10 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
     if not best: return None
 
     tokens   = best.get("tokens",[])
+    if len(tokens) < 2: return None
+    # E1: find Yes/No tokens by label — API does not guarantee tokens[0]=Yes
+    _tok_yes = next((t for t in tokens if t.get("outcome","").lower() == "yes"), None)
+    _tok_no  = next((t for t in tokens if t.get("outcome","").lower() == "no"),  None)
     # ⚠️ G2: Yes/No guard — parse proposition ก่อน map team เพื่อกัน swap เงียบ
     out_a = tokens[0].get("outcome","").lower()
     out_b = tokens[1].get("outcome","").lower()
@@ -2080,13 +2084,19 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
         if not (ta_in_q and tb_in_q):
             log.debug(f"[PolyYesNo] skip — can't parse both teams from question: {best.get('question','')[:60]}")
             return None
-        # C4: skip non-winner propositions — cover/spread/handicap/over/under map to different outcomes than H2H
-        if any(x in q_lower for x in ("cover", "spread", "handicap", "over", "under", "total")):
-            log.debug(f"[PolyYesNo] skip non-H2H proposition (cover/spread/total): {best.get('question','')[:60]}")
+        # E2: allowlist approach — only accept clear outright winner propositions
+        # blocklist is incomplete; allowlist is safer
+        _non_h2h_terms = (
+            "cover", "spread", "handicap", "over", "under", "total",
+            "advance", "qualify", "series", "map ", "set ", "quarter",
+            "period", "first half", "game 1", "game 2", "lift the trophy",
+        )
+        if any(x in q_lower for x in _non_h2h_terms):
+            log.debug(f"[PolyYesNo] skip non-H2H proposition: {best.get('question','')[:60]}")
             return None
-        # H5: parse ว่า Yes = ทีมไหน — ถ้า parse ไม่ชัด return None แทนเดา
-        # Q6: re imported at top-level — ไม่ต้อง import ซ้ำใน function
-        _pat = re.search(r'will\s+(.*?)\s+(?:beat|win|defeat)', q_lower)
+        # H5: parse ว่า Yes = ทีมไหน — รับเฉพาะ beat/defeat/'win against' (allowlist)
+        # Q6: re imported at top-level
+        _pat = re.search(r'will\s+(.*?)\s+(?:beat|defeat|win against)', q_lower)
         if not _pat:
             log.debug(f"[PolyYesNo] skip — can't parse Yes team from: {best.get('question','')[:60]}")
             return None
@@ -2098,10 +2108,13 @@ def find_polymarket(event_name: str, poly_markets: list) -> Optional[dict]:
         else:
             log.debug(f"[PolyYesNo] skip — subject '{subject}' doesn't match either team")
             return None
-        # เซ็ต token ตาม mapping จริง — tokens[0]=Yes, tokens[1]=No
+        # E1: build tokens_mapped using label-resolved Yes/No tokens (not positional index)
+        if _tok_yes is None or _tok_no is None:
+            log.debug(f"[PolyYesNo] skip — no Yes/No tokens found in market")
+            return None
         tokens_mapped = [
-            {**tokens[0], "outcome": yes_team},
-            {**tokens[1], "outcome": no_team},
+            {**_tok_yes, "outcome": yes_team},
+            {**_tok_no,  "outcome": no_team},
         ]
         tokens = tokens_mapped
         log.debug(f"[PolyYesNo] mapped Yes={yes_team} No={no_team} from: {best.get('question','')[:60]}")
@@ -3165,6 +3178,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_save_trade(tr_vb)
         if vb.commence_time:
             register_for_settlement(tr_vb, vb.commence_time)
+            # E3: CLV watch for VB trades — adapt TradeRecord to ArbOpportunity interface
+            from types import SimpleNamespace as _NS
+            register_closing_watch(_NS(event=tr_vb.event, sport=tr_vb.sport, commence=tr_vb.commence_time))
         return
 
     # ── Arb confirm/reject ────────────────────────────────────────
@@ -4625,7 +4641,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         # Health check endpoint สำหรับ Railway (ไม่ต้อง auth) — D2: richer
         from urllib.parse import urlparse as _up_health
-        if _up_health(self.path).path == "/health":
+        _req_path = _up_health(self.path).path
+        # E4: /ready = readiness probe — returns 503 when DB is halted (for Railway/Render health checks)
+        if _req_path == "/ready":
+            body = json.dumps({"ready": not _db_write_halted}).encode()
+            self.send_response(200 if not _db_write_halted else 503)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if _req_path == "/health":
             uptime_s = int(time.time() - _bot_start_ts)
             uptime_str = f"{uptime_s//3600}h{(uptime_s%3600)//60}m"
             # C5: /health is public (Railway check) — minimal response only, no internal telemetry
