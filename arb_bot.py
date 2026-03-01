@@ -3920,9 +3920,15 @@ def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     ]
 
     # หา leg ที่ match winner
-    # Q5: ใช้ threshold 0.65 แทน 0.5 — ป้องกัน Man Utd / Man City ambiguous match
-    matched = [leg for leg in legs if fuzzy_match(winner, leg["team"], threshold=0.65)]
-    unmatched = [leg for leg in legs if not fuzzy_match(winner, leg["team"], threshold=0.65)]
+    # Q5/F2: fuzzy 0.65 กัน Man Utd/Man City ambiguous; substring fallback รับ short-form names เช่น 'Celtics' → 'Boston Celtics'
+    _winner_norm = normalize_team(winner)
+    def _leg_match(leg):
+        t = leg["team"]
+        return (fuzzy_match(winner, t, threshold=0.65)
+                or _winner_norm in normalize_team(t)
+                or normalize_team(t) in _winner_norm)
+    matched   = [leg for leg in legs if _leg_match(leg)]
+    unmatched = [leg for leg in legs if not _leg_match(leg)]
 
     if len(matched) == 1:
         payout = matched[0]["stake"] * matched[0]["odds"]
@@ -4186,12 +4192,12 @@ def periodic_cleanup():
         expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
         for k in expired_vb:
             del _pending_vb[k]
-    # Issue35: snapshot trade_records inside lock, iterate outside — avoid RuntimeError on concurrent append
+    # Issue35/41: snapshot + clear alert sets inside lock — consistent view, no conceptual race
     with _data_lock:
         _trade_snap = list(trade_records)
-    _settled_in_cleanup = {s.signal_id for s in _trade_snap if s.actual_profit_thb is not None}
-    _settle_alerted      -= _settled_in_cleanup
-    _manual_review_alerted -= _settled_in_cleanup
+        _settled_in_cleanup = {s.signal_id for s in _trade_snap if s.actual_profit_thb is not None}
+        _settle_alerted      -= _settled_in_cleanup
+        _manual_review_alerted -= _settled_in_cleanup
 
 
 async def scanner_loop():
@@ -4660,7 +4666,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "uptime":  uptime_str,
             }
             body = json.dumps(health).encode()
-            self.send_response(200)
+            # F3: liveness probe — 503 when DB halted so monitors can detect degraded state
+            self.send_response(503 if _db_write_halted else 200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
             self.end_headers()
@@ -4969,8 +4976,7 @@ def handle_shutdown(signum, frame):
         try:
             stmts = [{"sql": "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
                       "args": [k, v]} for k, v in state_pairs]
-            _body = json.dumps({"statements": [{"q": s["sql"], "params": s["args"]} for s in stmts]}).encode()
-            _req = urllib.request.Request(
+            _req = urllib.request.Request(  # F4: removed unused _body
                 f"{_url}/v2/pipeline",
                 data=json.dumps({"requests": [{"type":"execute","stmt":{"sql":s["sql"],"args":[{"type":"text","value":v} for v in s["args"]]}} for s in stmts] + [{"type":"close"}]}).encode(),
                 headers={"Authorization": f"Bearer {_token}", "Content-Type": "application/json"},
