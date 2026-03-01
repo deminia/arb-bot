@@ -1116,10 +1116,8 @@ def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Opti
     def _clv(event, outcome, odds_got):
         key = f"{event}|{outcome}"
         bm_data = closing_odds.get(key, {})
-        # L2: Pinnacle เป็น benchmark ก่อน — fallback per-book ถ้าไม่มี Pinnacle
-        co = bm_data.get("pinnacle") or next(
-            (v for k, v in bm_data.items() if v and v > 0), None
-        )
+        # M4: strict Pinnacle benchmark — ถ้าไม่มี Pinnacle closing line → None
+        co = bm_data.get("pinnacle")
         if co and co > 0:
             return round((float(odds_got) / float(co) - 1) * 100, 2)
         return None
@@ -2273,42 +2271,46 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                     alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker, "3way", bd.bookmaker)] = datetime.now(timezone.utc)
                                     log.info(f"[ARB-3WAY] {event_name} H={float(bh.odds):.3f} D={float(bd.odds):.3f} A={float(ba.odds):.3f} profit={profit3:.2%} stake=({float(sh):.2f},{float(sd):.2f},{float(sa):.2f})")
                 elif home_key and away_key and not draw_key:
-                    # ไม่มี Draw — cross-book H vs A เท่านั้น (ไม่ใช่ 1X2 ครบ 3 หน้า)
-                    bh, ba = best[home_key], best[away_key]
-                    if bh.bookmaker != ba.bookmaker:
-                        if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker):
-                            profit, s_h, s_a = calc_arb(bh.odds, ba.odds)
-                            if profit >= MIN_PROFIT_PCT:
-                                kelly_total = calc_kelly_stake(bh.odds, ba.odds, profit)
-                                if kelly_total != TOTAL_STAKE:
-                                    profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, kelly_total)
-                                # rebalance หลัง cap (เหมือน non-soccer branch)
-                                s_h_cap = apply_max_stake(s_h, bh.bookmaker)
-                                s_a_cap = apply_max_stake(s_a, ba.bookmaker)
-                                if s_h_cap != s_h or s_a_cap != s_a:
-                                    # I20: แปลง cap stake เป็น THB ก่อนคำนวณ new_total (USD)
-                                    if s_h_cap < s_h:
-                                        limited_thb = s_h_cap * USD_TO_THB
-                                        ratio = Decimal("1") / bh.odds
-                                        margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
-                                        new_total = (limited_thb / USD_TO_THB) / ratio * margin
-                                        profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
-                                    else:
-                                        limited_thb = s_a_cap * USD_TO_THB
-                                        ratio = Decimal("1") / ba.odds
-                                        margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
-                                        new_total = (limited_thb / USD_TO_THB) / ratio * margin
-                                        profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
+                    # M1: Soccer h2h คือ 1X2 — ถ้าไม่มี draw_key อาจเป็นแค่ข้อมูลหลุด — อย่า scan 2-way false arb
+                    if "soccer" in sport_key.lower():
+                        log.debug(f"[Scan] skip soccer 2-way fallback (no draw_key) for {event_name} — 1X2 market, draw may be missing from feed")
+                    else:
+                        # ไม่มี Draw — cross-book H vs A เท่านั้น (ไม่ใช่ 1X2 ครบ 3 หน้า)
+                        bh, ba = best[home_key], best[away_key]
+                        if bh.bookmaker != ba.bookmaker:
+                            if not is_on_cooldown(event_name, bh.bookmaker, ba.bookmaker):
+                                profit, s_h, s_a = calc_arb(bh.odds, ba.odds)
                                 if profit >= MIN_PROFIT_PCT:
-                                    opp = ArbOpportunity(
-                                        signal_id=str(uuid.uuid4())[:8], sport=sport_key,
-                                        event=event_name, commence=commence,
-                                        leg1=bh, leg2=ba,
-                                        profit_pct=profit, stake1=s_h, stake2=s_a,
-                                    )
-                                    found.append(opp)
-                                    alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker)] = datetime.now(timezone.utc)
-                                    log.info(f"[ARB-2WAY-SOCCER] {event_name} H vs A profit={profit:.2%}")
+                                    kelly_total = calc_kelly_stake(bh.odds, ba.odds, profit)
+                                    if kelly_total != TOTAL_STAKE:
+                                        profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, kelly_total)
+                                    # rebalance หลัง cap (เหมือน non-soccer branch)
+                                    s_h_cap = apply_max_stake(s_h, bh.bookmaker)
+                                    s_a_cap = apply_max_stake(s_a, ba.bookmaker)
+                                    if s_h_cap != s_h or s_a_cap != s_a:
+                                        # I20: แปลง cap stake เป็น THB ก่อนคำนวณ new_total (USD)
+                                        if s_h_cap < s_h:
+                                            limited_thb = s_h_cap * USD_TO_THB
+                                            ratio = Decimal("1") / bh.odds
+                                            margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
+                                            new_total = (limited_thb / USD_TO_THB) / ratio * margin
+                                            profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
+                                        else:
+                                            limited_thb = s_a_cap * USD_TO_THB
+                                            ratio = Decimal("1") / ba.odds
+                                            margin = Decimal("1")/bh.odds + Decimal("1")/ba.odds
+                                            new_total = (limited_thb / USD_TO_THB) / ratio * margin
+                                            profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
+                                    if profit >= MIN_PROFIT_PCT:
+                                        opp = ArbOpportunity(
+                                            signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                            event=event_name, commence=commence,
+                                            leg1=bh, leg2=ba,
+                                            profit_pct=profit, stake1=s_h, stake2=s_a,
+                                        )
+                                        found.append(opp)
+                                        alert_cooldown[make_cooldown_key(event_name, bh.bookmaker, ba.bookmaker)] = datetime.now(timezone.utc)
+                                        log.info(f"[ARB-2WAY] {event_name} H vs A profit={profit:.2%}")
             else:
                 # ══ Non-soccer: 2-way arb เหมือนเดิม ══
                 outcomes = list(best.keys())
@@ -2726,12 +2728,18 @@ async def execute_both(opp: ArbOpportunity) -> str:
         live_profit3, _, _, _ = calc_arb_3way(live1, live3, live2)  # H, D, A
         drop_too_much_3 = (orig_profit > 0 and
             float(orig_profit - live_profit3) / float(orig_profit) > 0.50)
-        if live_profit3 < Decimal("0") or drop_too_much_3:
-            log.warning(f"[SlippageGuard-3way] ABORT {opp.event} — live={live_profit3:.2%} (was {float(orig_profit):.2%})")
+        # M3: abort ถ้า live < 0, drop > 50%, หรือ ต่ำกว่า MIN_PROFIT_PCT
+        if live_profit3 < Decimal("0") or drop_too_much_3 or live_profit3 < MIN_PROFIT_PCT:
+            _reason3 = (
+                "ติดลบ" if live_profit3 < 0
+                else f"ต่ำกว่า threshold {float(MIN_PROFIT_PCT):.1%}" if live_profit3 < MIN_PROFIT_PCT
+                else "profit ลด >50%"
+            )
+            log.warning(f"[SlippageGuard-3way] ABORT {opp.event} — live={live_profit3:.2%} (was {float(orig_profit):.2%}) reason={_reason3}")
             raise ValueError(
                 f"🚫 *ABORT: Odds Dropped (3-way)*\n"
                 f"ราคาเปลี่ยนขณะรอยืนยัน\n"
-                f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit3):.2%}*\n"
+                f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit3):.2%}* ({_reason3})\n"
                 f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
             )
         live_profit = live_profit3
@@ -2763,18 +2771,14 @@ async def execute_both(opp: ArbOpportunity) -> str:
         live_profit, _, _ = calc_arb(live1, live2)
         drop_too_much = (orig_profit > 0 and
                         float(orig_profit - live_profit) / float(orig_profit) > 0.50)
-        if live_profit < Decimal("0") or drop_too_much:
-            log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%} (was {float(orig_profit):.2%})")
-            raise ValueError(
-                f"🚫 *ABORT: Odds Dropped*\n"
-                f"ราคาเปลี่ยนขณะรอยืนยัน\n"
-                f"คาด: *{float(orig_profit):.2%}* → จริง: *{float(live_profit):.2%}*\n"
-                f"{'(profit ติดลบ)' if live_profit < 0 else '(profit ลด >50%)'}\n"
-                f"_(กด Confirm ใหม่ถ้าต้องการลองอีกครั้ง หรือรอ signal ใหม่)_"
+        # M3: abort ถ้า live < 0, drop > 50%, หรือ ต่ำกว่า MIN_PROFIT_PCT
+        if live_profit < Decimal("0") or drop_too_much or live_profit < MIN_PROFIT_PCT:
+            _reason = (
+                "ติดลบ" if live_profit < 0
+                else f"ต่ำกว่า threshold {float(MIN_PROFIT_PCT):.1%}" if live_profit < MIN_PROFIT_PCT
+                else "profit ลด >50%"
             )
-        profit_drop = float(opp.profit_pct - live_profit) / float(opp.profit_pct) if opp.profit_pct > 0 else 0
-        if profit_drop > 0.30:
-            slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit):.2%})"
+            log.warning(f"[SlippageGuard] ABORT {opp.event} — live profit={live_profit:.2%} (was {float(orig_profit):.2%}) reason={_reason}")
 
     s1_raw = (opp.stake1*USD_TO_THB).quantize(Decimal("1"))
     s2_raw = (opp.stake2*USD_TO_THB).quantize(Decimal("1"))
@@ -3616,7 +3620,8 @@ async def watch_closing_lines():
                                     if mkt.get("key") != "h2h": continue
                                     for out in mkt.get("outcomes",[]):
                                         price = Decimal(str(out.get("price",1)))
-                                        update_clv(ename, out["name"], bk, price)
+                                        # M2: ใช้ canonical key จาก info["event"] แทน ename จาก feed
+                                        update_clv(info["event"], out["name"], bk, price)
                                         if bk == "pinnacle":
                                             pinnacle_found = True
                             fetch_ok = True
