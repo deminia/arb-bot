@@ -2508,6 +2508,12 @@ def md_escape(text: str) -> str:
     return text
 
 
+def _parse_settled_at(s: str) -> datetime:
+    """P5: Parse settled_at string — UTC-aware datetime (safe for naive strings)"""
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def parse_commence(raw: str) -> datetime:
     """Fix 1: Parse commence_time string — handles all formats robustly.
     Returns UTC-aware datetime. Never appends ':00+00:00' blindly."""
@@ -2659,85 +2665,77 @@ async def execute_both(opp: ArbOpportunity) -> str:
     orig_profit = opp.profit_pct
     live_profit = orig_profit  # default
     slippage_warn = ""
+    # P1: unified per-leg refetch helper — routes ตาม source (polymarket/kalshi/extra/std)
+    # fail-closed: คืน (price, found=False) ถ้าหาไม่เจอ — caller ต้อง abort
+    _bookmakers_norm_ex = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
+    _extra_norm_ex      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
+    async def _refetch_leg(leg, sport: str, label: str) -> tuple[Decimal, bool]:
+        _bm  = leg.bookmaker.lower()
+        _tok = leg.raw.get("token_id", "") if leg.raw else ""
+        # 1) Polymarket / Kalshi — CLOB / REST API
+        if _tok and ("polymarket" in _bm or "kalshi" in _bm):
+            try:
+                async with aiohttp.ClientSession() as _s:
+                    _book = (await fetch_kalshi_market_detail(_s, _tok)
+                             if "kalshi" in _bm
+                             else await fetch_poly_market_detail(_s, _tok))
+                _is_no = _tok.endswith("_no")
+                if _book and (_book.get("mid_price", 0) > 0 or _book.get("no_mid_price", 0) > 0):
+                    _mid = Decimal(str(_book["no_mid_price"] if _is_no else _book["mid_price"]))
+                    _price = apply_slippage(Decimal("1") / _mid, _bm)
+                    log.info(f"[SlippageGuard] {label} CLOB refetch: {float(_price):.3f}")
+                    return _price, True
+                log.warning(f"[SlippageGuard] {label} CLOB empty response")
+                return leg.odds, False
+            except Exception as _e:
+                log.warning(f"[SlippageGuard] {label} CLOB failed: {_e}")
+                return leg.odds, False
+        # 2) Sportsbook (standard or extra) — Odds API feed
+        _is_extra = norm_bm_key(leg.bookmaker) not in _bookmakers_norm_ex
+        _bm_key   = leg.raw.get("bm_key", "") if leg.raw else ""
+        _ck = f"{sport}{'__extra' if _is_extra else ''}"
+        now_ts = time.time()
+        _cts, _cev = _refetch_cache.get(_ck, (0, []))
+        try:
+            if now_ts - _cts < 15 and _cev:
+                _events = _cev
+            else:
+                async with aiohttp.ClientSession() as _s2:
+                    _events = (await _fetch_extra_books_sem(_s2, sport)
+                               if _is_extra else await _fetch_odds_sem(_s2, sport))
+                _refetch_cache[_ck] = (time.time(), _events)
+        except Exception as _ef:
+            log.warning(f"[SlippageGuard] {label} feed fetch failed: {_ef}")
+            return leg.odds, False
+        for _ev in _events:
+            _en = f"{_ev.get('home_team','')} vs {_ev.get('away_team','')}"
+            if not fuzzy_match(_en, opp.event, 0.7): continue
+            for _bm2 in _ev.get("bookmakers", []):
+                _bk = _bm2.get("key", "")
+                if not (_bk == _bm_key or leg.bookmaker.lower() in _bk.lower()): continue
+                for _mkt in _bm2.get("markets", []):
+                    if _mkt.get("key") != "h2h": continue
+                    for _out in _mkt.get("outcomes", []):
+                        if fuzzy_match(_out.get("name", ""), leg.outcome, 0.8):
+                            _price = apply_slippage(Decimal(str(_out.get("price", 1))), _bk)
+                            log.info(f"[SlippageGuard] {label} feed refetch: {float(_price):.3f}")
+                            return _price, True
+        log.warning(f"[SlippageGuard] {label} not found in feed (market suspended?)")
+        return leg.odds, False
+
     if is_3way:
-        # BugC/R4: refetch all 3 legs including Draw
-        live1, live2, _found1, _found2 = await refetch_live_odds(opp)
-        # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ (market suspended / mapping miss)
-        if not _found1 or not _found2:
-            _missing = []
-            if not _found1: _missing.append(opp.leg1.bookmaker)
-            if not _found2: _missing.append(opp.leg2.bookmaker)
+        # P1: per-leg refetch — ทุก leg รวม leg3(Draw) — fail-closed ทั้งหมด
+        live1, _f1 = await _refetch_leg(opp.leg1, opp.sport, "leg1")
+        live2, _f2 = await _refetch_leg(opp.leg2, opp.sport, "leg2")
+        live3, _f3 = await _refetch_leg(opp.leg3, opp.sport, "leg3(Draw)")
+        _missing = [lg for lg, fnd in [(opp.leg1.bookmaker,_f1),(opp.leg2.bookmaker,_f2),(opp.leg3.bookmaker,_f3)] if not fnd]
+        if _missing:
             log.warning(f"[SlippageGuard-3way] ABORT {opp.event} — live odds unavailable: {_missing}")
             raise ValueError(
                 f"🚫 *ABORT: Live odds unavailable*\n"
                 f"ดึงราคา live ไม่ได้: {', '.join(_missing)}\n"
                 f"_(market อาจถูก suspend หรือ mapping miss — รอ signal ใหม่)_"
             )
-        live3 = opp.leg3.odds  # default = cached
-        # F2/K1: per-leg refetch ตาม source
-        leg3_token = opp.leg3.raw.get("token_id", "") if opp.leg3.raw else ""
-        _leg3_bm   = opp.leg3.bookmaker.lower()
-        if leg3_token:
-            # Polymarket / Kalshi: ใช้ CLOB / REST API
-            try:
-                async with aiohttp.ClientSession() as _sess:
-                    _book = (await fetch_kalshi_market_detail(_sess, leg3_token)
-                             if "kalshi" in _leg3_bm
-                             else await fetch_poly_market_detail(_sess, leg3_token))
-                _is_no_leg3 = leg3_token.endswith("_no")
-                if _book and (_book.get("mid_price", 0) > 0 or _book.get("no_mid_price", 0) > 0):
-                    _mid = Decimal(str(_book["no_mid_price"] if _is_no_leg3 else _book["mid_price"]))
-                    live3 = apply_slippage(Decimal("1") / _mid, _leg3_bm)
-                    log.info(f"[SlippageGuard-3way] live Draw refetched (CLOB): {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
-            except Exception as _e:
-                log.debug(f"[SlippageGuard-3way] draw CLOB refetch failed: {_e} — using cached")
-        else:
-            # K1: Draw leg มาจาก sportsbook ปกติ — lookup จาก odds feed เหมือน leg1/leg2
-            try:
-                _leg3_extra = norm_bm_key(opp.leg3.bookmaker) not in \
-                    [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
-                _leg3_key = opp.leg3.raw.get("bm_key", "") if opp.leg3.raw else ""
-                async with aiohttp.ClientSession() as _sess3:
-                    if _leg3_extra:
-                        _leg3_events = await _fetch_extra_books_sem(_sess3, opp.sport)
-                    else:
-                        _leg3_events = await _fetch_odds_sem(_sess3, opp.sport)
-                for _ev3 in _leg3_events:
-                    _ename3 = f"{_ev3.get('home_team','')} vs {_ev3.get('away_team','')}"
-                    if not fuzzy_match(_ename3, opp.event, 0.7): continue
-                    for _bm3 in _ev3.get("bookmakers", []):
-                        _bk3 = _bm3.get("key", "")
-                        if not (_bk3 == _leg3_key or opp.leg3.bookmaker.lower() in _bk3.lower()): continue
-                        for _mkt3 in _bm3.get("markets", []):
-                            if _mkt3.get("key") != "h2h": continue
-                            for _out3 in _mkt3.get("outcomes", []):
-                                if fuzzy_match(_out3.get("name", ""), opp.leg3.outcome, 0.8):
-                                    live3 = apply_slippage(Decimal(str(_out3.get("price", 1))), _bk3)
-                                    log.info(f"[SlippageGuard-3way] live Draw refetched (sportsbook): {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
-                                    break
-            except Exception as _e3:
-                log.debug(f"[SlippageGuard-3way] draw sportsbook refetch failed: {_e3} — using cached")
-        # F2: refetch leg1/leg2 ถ้ามาจาก Polymarket/Kalshi ด้วย CLOB (ไม่ใช่ Odds API)
-        for _leg_attr, _live_ref in [("leg1", "live1"), ("leg2", "live2")]:
-            _leg = getattr(opp, _leg_attr)
-            _bm  = _leg.bookmaker.lower()
-            _tok = _leg.raw.get("token_id", "") if _leg.raw else ""
-            if _tok and ("polymarket" in _bm or "kalshi" in _bm):
-                try:
-                    async with aiohttp.ClientSession() as _sess2:
-                        # G1: แยก endpoint — Kalshi ใช้ REST API, Polymarket ใช้ CLOB
-                        _b2 = (await fetch_kalshi_market_detail(_sess2, _tok)
-                               if "kalshi" in _bm
-                               else await fetch_poly_market_detail(_sess2, _tok))
-                    _is_no_tok2 = _tok.endswith("_no")
-                    if _b2 and (_b2.get("mid_price", 0) > 0 or _b2.get("no_mid_price", 0) > 0):
-                        _mid2 = Decimal(str(_b2["no_mid_price"] if _is_no_tok2 else _b2["mid_price"]))
-                        _live_val = apply_slippage(Decimal("1") / _mid2, _bm)
-                        if _live_ref == "live1": live1 = _live_val
-                        else: live2 = _live_val
-                        log.info(f"[SlippageGuard-3way] {_leg_attr} alt-market refetched: {float(_live_val):.3f}")
-                except Exception as _e2:
-                    log.debug(f"[SlippageGuard-3way] {_leg_attr} alt refetch failed: {_e2}")
         live_profit3, _, _, _ = calc_arb_3way(live1, live3, live2)  # H, D, A
         drop_too_much_3 = (orig_profit > 0 and
             float(orig_profit - live_profit3) / float(orig_profit) > 0.50)
@@ -2760,38 +2758,17 @@ async def execute_both(opp: ArbOpportunity) -> str:
         if profit_drop_3 > 0.30:
             slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop_3:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit3):.2%})"
     else:
-        live1, live2, _found1, _found2 = await refetch_live_odds(opp)
-        # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ
-        if not _found1 or not _found2:
-            _missing = []
-            if not _found1: _missing.append(opp.leg1.bookmaker)
-            if not _found2: _missing.append(opp.leg2.bookmaker)
+        # P1: per-leg refetch — routes ตาม source (polymarket/kalshi/extra/std) — fail-closed
+        live1, _f1 = await _refetch_leg(opp.leg1, opp.sport, "leg1")
+        live2, _f2 = await _refetch_leg(opp.leg2, opp.sport, "leg2")
+        _missing = [lg for lg, fnd in [(opp.leg1.bookmaker,_f1),(opp.leg2.bookmaker,_f2)] if not fnd]
+        if _missing:
             log.warning(f"[SlippageGuard] ABORT {opp.event} — live odds unavailable: {_missing}")
             raise ValueError(
                 f"🚫 *ABORT: Live odds unavailable*\n"
                 f"ดึงราคา live ไม่ได้: {', '.join(_missing)}\n"
                 f"_(market อาจถูก suspend หรือ mapping miss — รอ signal ใหม่)_"
             )
-        # F2: 2-way per-leg refetch ถ้า leg มาจาก Polymarket/Kalshi
-        # K3: ใช้ semaphore wrapper สำหรับ aiohttp session ภายใน
-        for _leg_attr, _live_init in [(opp.leg1, live1), (opp.leg2, live2)]:
-            _leg = _leg_attr
-            _bm  = _leg.bookmaker.lower()
-            _tok = _leg.raw.get("token_id", "") if _leg.raw else ""
-            if _tok and ("polymarket" in _bm or "kalshi" in _bm):
-                try:
-                    async with aiohttp.ClientSession() as _s3:
-                        _b3 = (await fetch_kalshi_market_detail(_s3, _tok)
-                               if "kalshi" in _bm
-                               else await fetch_poly_market_detail(_s3, _tok))
-                    _is_no_tok3 = _tok.endswith("_no")
-                    if _b3 and (_b3.get("mid_price", 0) > 0 or _b3.get("no_mid_price", 0) > 0):
-                        _live_new = apply_slippage(Decimal("1") / Decimal(str(_b3["no_mid_price"] if _is_no_tok3 else _b3["mid_price"])), _bm)
-                        if _leg_attr is opp.leg1: live1 = _live_new
-                        else: live2 = _live_new
-                        log.info(f"[SlippageGuard-2way] alt-market refetched: {_leg_attr.bookmaker} {float(_live_new):.3f}")
-                except Exception as _e3:
-                    log.debug(f"[SlippageGuard-2way] alt refetch failed: {_e3}")
         live_profit, _, _ = calc_arb(live1, live2)
         drop_too_much = (orig_profit > 0 and
                         float(orig_profit - live_profit) / float(orig_profit) > 0.50)
@@ -2823,21 +2800,24 @@ async def execute_both(opp: ArbOpportunity) -> str:
     if s3_raw is not None and opp.leg3:
         s3 = (apply_max_stake(natural_round_leg(s3_raw)/USD_TO_THB, opp.leg3.bookmaker)*USD_TO_THB).quantize(Decimal("1"))
     # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
-    # O3: budget clamp — ถ้า jitter ทำให้ actual_total เกิน Kelly target > 5% ให้ลด leg ที่ใหญ่สุดลง
+    # O3/P4: budget clamp — loop ลด leg ใหญ่สุดซ้ำจน actual_total เข้า tolerance จริง
     _target_total = (opp.stake1 + opp.stake2 + (opp.stake3 or Decimal("0"))) * USD_TO_THB
-    _actual_total = s1 + s2 + (s3 or Decimal("0"))
     _tolerance = _target_total * Decimal("0.05")
-    if _actual_total > _target_total + _tolerance:
-        _excess = _actual_total - _target_total
-        _step = Decimal("500") if _target_total < Decimal("50000") else Decimal("1000")
-        _reduce = ((_excess // _step) + 1) * _step
+    _step_c = Decimal("500") if _target_total < Decimal("50000") else Decimal("1000")
+    _clamp_iters = 0
+    while True:
+        _actual_total = s1 + s2 + (s3 or Decimal("0"))
+        if _actual_total <= _target_total + _tolerance or _clamp_iters >= 10:
+            break
+        _clamp_iters += 1
         if s3 is not None and s3 >= s2 and s3 >= s1:
-            s3 = max(s3 - _reduce, Decimal("100")).quantize(Decimal("1"))
+            s3 = max(s3 - _step_c, Decimal("100")).quantize(Decimal("1"))
         elif s2 >= s1:
-            s2 = max(s2 - _reduce, Decimal("100")).quantize(Decimal("1"))
+            s2 = max(s2 - _step_c, Decimal("100")).quantize(Decimal("1"))
         else:
-            s1 = max(s1 - _reduce, Decimal("100")).quantize(Decimal("1"))
-        log.info(f"[BudgetClamp] total {float(_actual_total):.0f} → reduced by {float(_reduce):.0f} (target {float(_target_total):.0f})")
+            s1 = max(s1 - _step_c, Decimal("100")).quantize(Decimal("1"))
+    if _clamp_iters > 0:
+        log.info(f"[BudgetClamp] clamped {_clamp_iters}x: total {float(_actual_total):.0f} → {float(s1+s2+(s3 or Decimal('0'))):.0f} (target {float(_target_total):.0f})")
 
 
     if is_3way:
@@ -3412,7 +3392,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ct_th = (_ct + timedelta(hours=7)).strftime("%d/%m %H:%M")
             except Exception:
                 pass
-        is_vb = t.stake2_thb == 0 and t.leg2_team == "-"
+        is_vb = (not t.stake2_thb) and t.leg2_team == "-"  # P6: handle None from old schema
         is_3w = t.stake3_thb is not None and t.stake3_thb > 0
         if is_vb:
             stake_str = f"฿{t.stake1_thb:,} (ValueBet)"
@@ -3848,7 +3828,7 @@ def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     คำนวณกำไร/ขาดทุนจริง รองรับ 2-way, 3-way และ ValueBet (1-leg)
     """
     # C3: Value Bet guard — 1-leg trade (stake2=0, leg2_team="-")
-    is_valuebet = trade.stake2_thb == 0 and trade.leg2_team == "-"
+    is_valuebet = (not trade.stake2_thb) and trade.leg2_team == "-"  # P6: handle None from old schema
     if is_valuebet:
         if fuzzy_match(winner, trade.leg1_team or "", threshold=0.5):
             return int(trade.stake1_thb * trade.leg1_odds) - trade.stake1_thb
@@ -4426,11 +4406,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if auth == f"Bearer {DASHBOARD_TOKEN}":
             return True
-        # J7: ?token= query param (สำหรับ browser เข้าผ่าน URL)
-        from urllib.parse import urlparse, parse_qs
-        _qs = parse_qs(urlparse(self.path).query)
-        if _qs.get("token", [""])[0] == DASHBOARD_TOKEN:
-            return True
+            # P2: Bearer-only — ?token= ถูกปิดเพื่อกัน token ละหลายใน browser history / logs
         self.send_response(401)
         body = b'{"error":"unauthorized"}'
         self.send_header("Content-Type", "application/json")
@@ -4861,18 +4837,24 @@ def handle_shutdown(signum, frame):
         log.info("[Shutdown] saved to SQLite")
     except Exception as ex:
         log.error(f"[Shutdown] sqlite save failed: {ex}")
-    # 2) Turso เฉพาะถ้า init เสร็จ และ asyncio loop ไม่ได้วิ่งอยู่ (ป้องกัน deadlock)
+    # 2) Turso — P3: ยิง sync เสมอ ไม่เช็ค loop (ใช้ urllib sync ตรงๆ กัน state rollback)
     _url   = _turso_url or TURSO_URL.replace("libsql://", "https://").replace("wss://", "https://")
     _token = _turso_token or TURSO_TOKEN
-    _loop_running = _main_loop is not None and _main_loop.is_running()
-    if _turso_ok and _url and _token and not _loop_running:
+    if _turso_ok and _url and _token:
         try:
             stmts = [{"sql": "INSERT OR REPLACE INTO bot_state(key,value) VALUES(?,?)",
                       "args": [k, v]} for k, v in state_pairs]
-            _turso_http(stmts)
-            log.info("[Shutdown] saved to Turso. Bye!")
+            _body = json.dumps({"statements": [{"q": s["sql"], "params": s["args"]} for s in stmts]}).encode()
+            _req = urllib.request.Request(
+                f"{_url}/v2/pipeline",
+                data=json.dumps({"requests": [{"type":"execute","stmt":{"sql":s["sql"],"args":[{"type":"text","value":v} for v in s["args"]]}} for s in stmts] + [{"type":"close"}]}).encode(),
+                headers={"Authorization": f"Bearer {_token}", "Content-Type": "application/json"},
+                method="POST"
+            )
+            urllib.request.urlopen(_req, timeout=5)
+            log.info("[Shutdown] saved to Turso (sync). Bye!")
         except Exception as ex:
-            log.error(f"[Shutdown] turso save failed: {ex}")
+            log.error(f"[Shutdown] turso sync save failed: {ex}")
     os._exit(0)
 
 
