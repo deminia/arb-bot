@@ -427,13 +427,15 @@ async def turso_init():
     global _turso_url, _turso_token, _turso_ok
     url   = os.environ.get("TURSO_URL",   TURSO_URL).strip()
     token = os.environ.get("TURSO_TOKEN", TURSO_TOKEN).strip()
-    log.info(f"[DB] TURSO_URL={'set ('+url[:30]+'...)' if url else 'NOT SET'}")
+    log.info(f"[DB] TURSO_URL={'set ('+url[:40]+'...)' if url else 'NOT SET'}")
+    log.info(f"[DB] TURSO_TOKEN={'set ('+token[:8]+'...)' if token else 'NOT SET'}")
     if not url or not token:
         log.warning("[DB] Turso not configured — using SQLite /tmp fallback")
         db_init_local()
         return
     _turso_url   = url.replace("libsql://", "https://").replace("wss://", "https://")
     _turso_token = token
+    log.info(f"[DB] Turso endpoint → {_turso_url[:50]}")
     try:
         loop = asyncio.get_running_loop()
         def _init():
