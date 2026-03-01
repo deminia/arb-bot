@@ -10,9 +10,10 @@
 ║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
 ║  8.  Soccer 3-way Arb (1X2 calc)     16.  Signal TTL + WAL DB        ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  Patch B/C: asyncio.Lock scan, VB slippage guard, auth require_owner ║
-║  confirm_rate/win_rate split, 3-way live payout, Semaphore Odds API  ║
-║  postponed no-spam, draw label-token, migration at startup, C3-C14   ║
+║  Patch B/C/D: asyncio.Lock scan, VB/arb slippage guard, require_owner║
+║  confirm_rate/settled_win_rate split, 3-way live payout+guard, D1-D9 ║
+║  17. Auth guard all cmds    19. Bankroll auto-stop guard             ║
+║  18. Bearer-only dashboard  20. VB slippage refetch guard            ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -2546,14 +2547,22 @@ async def execute_both(opp: ArbOpportunity) -> str:
     # BugB: is_3way already set above — do NOT reassign (s3 cannot become None from natural_round)
 
     if is_3way:
-        # B10: ใช้ live odds (after slippage) สำหรับ payout display — ไม่ใช้ odds_raw ที่ยังไม่หัก commission
-        _leg1_disp = live1 if 'live1' in dir() else opp.leg1.odds
-        _leg2_disp = live2 if 'live2' in dir() else opp.leg2.odds
-        _leg3_disp = live3 if 'live3' in dir() else opp.leg3.odds
+        # B10/D3: ใช้ live odds (after slippage) สำหรับ payout display
+        _leg1_disp = live1 if 'live1' in locals() else opp.leg1.odds
+        _leg2_disp = live2 if 'live2' in locals() else opp.leg2.odds
+        _leg3_disp = live3 if 'live3' in locals() else opp.leg3.odds
         w1 = (s1 * _leg1_disp).quantize(Decimal("1"))
         w2 = (s2 * _leg2_disp).quantize(Decimal("1"))
         w3 = (s3 * _leg3_disp).quantize(Decimal("1"))
         tt = s1 + s2 + s3
+        # D3: post-rounding profitability guard for 3-way
+        rounded_profit_3 = (min(w1, w2, w3) - tt) / tt if tt > 0 else Decimal("0")
+        if rounded_profit_3 < Decimal("0"):
+            log.warning(f"[ProfitGuard-3way] ABORT {opp.event} — 3-way profit ติดลบหลัง rounding ({float(rounded_profit_3):.2%})")
+            raise ValueError(
+                f"🚫 *Abort: 3-way profit ติดลบหลัง rounding* ({float(rounded_profit_3):.2%})\n"
+                f"edge บางเกินไปสำหรับทุนนี้ — รอ signal ใหม่"
+            )
     else:
         # C5/C13: ใช้ live odds (after slippage) แทน odds_raw สำหรับ guard + payout display
         _od1 = live1 if 'live1' in locals() else opp.leg1.odds
@@ -2566,7 +2575,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
         if rounded_profit < Decimal("0"):
             # rebalance: หา s2 ที่ทำให้ w2 >= w1 (worst-case break-even)
             s2_rebalanced = (w1 / _od2).quantize(Decimal("1"), rounding=ROUND_DOWN) + 1
-            rebalanced_profit = (min(w1, (s2_rebalanced * opp.leg2.odds_raw).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
+            # D2: ใช้ _od2 ตลอด — ไม่ย้อนกลับไป odds_raw
+            rebalanced_profit = (min(w1, (s2_rebalanced * _od2).quantize(Decimal("1"))) - (s1 + s2_rebalanced)) / (s1 + s2_rebalanced)
             if rebalanced_profit >= Decimal("0"):
                 s2 = s2_rebalanced
                 log.info(f"[ProfitGuard] rebalanced s2: {int(s2_raw)} -> {int(s2)} | profit: {float(rounded_profit):.3%} -> {float(rebalanced_profit):.3%}")
@@ -2576,24 +2586,29 @@ async def execute_both(opp: ArbOpportunity) -> str:
                     f"Abort: arb profit ติดลบหลัง natural rounding ({float(rounded_profit):.2%})\n"
                     f"ทุนน้อยเกินไปสำหรับ edge นี้ — รอ signal ใหม่ที่ profit สูงกว่า"
                 )
-        w1 = (s1 * opp.leg1.odds_raw).quantize(Decimal("1"))
-        w2 = (s2 * opp.leg2.odds_raw).quantize(Decimal("1"))
+        # D2: ลบ w1/w2 รอบสอง (odds_raw) ออก — ใช้ w1/w2 จากรอบแรก (live odds) ต่อไป
+        # recalc หลัง rebalance ถ้า s2 เปลี่ยน
+        w1 = (s1 * _od1).quantize(Decimal("1"))
+        w2 = (s2 * _od2).quantize(Decimal("1"))
         tt = s1 + s2
         w3 = None
 
-    # บันทึก trade
+    # D4: บันทึก live odds ที่ใช้จริง (after slippage) แทน odds_raw
+    _save_od1 = float(_leg1_disp if is_3way else _od1) if is_3way or '_od1' in locals() else float(opp.leg1.odds)
+    _save_od2 = float(_leg2_disp if is_3way else _od2) if is_3way or '_od2' in locals() else float(opp.leg2.odds)
+    _save_od3 = float(_leg3_disp) if is_3way and '_leg3_disp' in locals() else (float(opp.leg3.odds_raw) if is_3way else None)
     tr = TradeRecord(
         signal_id=opp.signal_id, event=opp.event, sport=opp.sport,
         leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
         leg1_team=opp.leg1.outcome,
         leg2_team=opp.leg2.outcome,
-        leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
+        leg1_odds=_save_od1, leg2_odds=_save_od2,
         stake1_thb=int(s1), stake2_thb=int(s2),
-        profit_pct=float(opp.profit_pct), status="confirmed",
+        profit_pct=float(live_profit), status="confirmed",
         commence_time=opp.commence,
         leg3_bm=opp.leg3.bookmaker if is_3way else None,
         leg3_team=opp.leg3.outcome if is_3way else None,
-        leg3_odds=float(opp.leg3.odds_raw) if is_3way else None,
+        leg3_odds=_save_od3,
         stake3_thb=int(s3) if is_3way else None,
     )
     with _data_lock:
@@ -2601,12 +2616,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
     db_save_trade(tr)            # save to DB
     register_for_settlement(tr, opp.commence)  # auto settle
     register_closing_watch(opp)               # #39 CLV watch ตอนเจอ opp ใหม่
-    # Fix 3: lock opportunity_log update
-    with _data_lock:
-        for entry in opportunity_log:
-            if entry["id"] == opp.signal_id:
-                entry["status"] = "confirmed"
-    db_update_opp_status(opp.signal_id, "confirmed")  # save
+    # D1: opportunity_log update ทำใน button_handler หลัง execute สำเร็จ (ไม่ทำซ้ำที่นี่)
+    db_update_opp_status(opp.signal_id, "confirmed")  # save to DB
 
     sp = sport_to_path(opp.sport)
     def steps(leg, stake):
@@ -2796,14 +2807,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
-    # Fix 1: map action string to canonical status
-    new_status = "confirmed" if action == "confirm" else "rejected"
-    with _data_lock:
-        for entry in opportunity_log:
-            if entry["id"] == sid:
-                entry["status"] = new_status
-                break
-    if action == "reject":
+    if action == "reject":  # D1: set rejected immediately; confirmed only after execute_both succeeds
         with _data_lock:
             pending.pop(sid, None)  # B2: pop ตอน reject จริง
         _is_3w = opp.leg3 is not None and opp.stake3 is not None
@@ -2823,6 +2827,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with _data_lock:
             trade_records.append(tr_rej)
         db_save_trade(tr_rej)    # 💾
+        with _data_lock:  # D1: update opp_log to rejected
+            for _e in opportunity_log:
+                if _e["id"] == sid:
+                    _e["status"] = "rejected"; break
         db_update_opp_status(sid, "rejected")  # 💾
         try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         except Exception: pass  # C8
@@ -2833,6 +2841,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await execute_both(opp)
         with _data_lock:
             pending.pop(sid, None)  # B2: pop หลัง execute สำเร็จเท่านั้น
+            # D1: set confirmed ใน opp_log หลัง execute สำเร็จเท่านั้น
+            for _e in opportunity_log:
+                if _e["id"] == sid:
+                    _e["status"] = "confirmed"; break
         try: await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
         except Exception: pass  # C8
     except ValueError as abort_msg:
@@ -3333,6 +3345,7 @@ def register_closing_watch(opp: "ArbOpportunity"):
 # track trades ที่รอ settle: signal_id → (trade, commence_dt)
 _pending_settlement: dict[str, tuple] = {}   # signal_id → (TradeRecord, datetime)
 _settle_alerted: set[str] = set()            # B6: signal_ids ที่แจ้ง postponed ไปแล้ว
+_manual_review_alerted: set[str] = set()     # D5: signal_ids ที่แจ้ง MANUAL_REVIEW ไปแล้ว
 
 
 def register_for_settlement(trade: TradeRecord, commence: str):
@@ -3605,13 +3618,16 @@ async def settle_completed_trades():
 
                 if winner == "MANUAL_REVIEW":
                     log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
-                    for cid in ALL_CHAT_IDS:
-                        try:
-                            await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                text=f"⚠️ *Manual Review Required*\n`{md_escape(trade.event)}`\n"
-                                     f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(trade.sport)})\n"
-                                     f"กรุณาตรวจสอบผลเองใน Dashboard")
-                        except Exception: pass
+                    # D5: แจ้งครั้งเดียว — ไม่ spam ทุก 5 นาที
+                    if _app and signal_id not in _manual_review_alerted:
+                        _manual_review_alerted.add(signal_id)
+                        for cid in ALL_CHAT_IDS:
+                            try:
+                                await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
+                                    text=f"⚠️ *Manual Review Required*\n`{md_escape(trade.event)}`\n"
+                                         f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(trade.sport)})\n"
+                                         f"กรุณาตรวจสอบผลเองใน Dashboard")
+                            except Exception: pass
                     continue  # ไม่ append settled_ids — ค้างใน _pending_settlement จนคนกด settle เอง
 
                 # คำนวณ P&L จริง
@@ -3698,9 +3714,11 @@ def periodic_cleanup():
             del _refetch_cache[k]
         # trim _pending_vb — ลบ Value Bet signals ที่หมดอายุ (> SIGNAL_TTL)
         _vb_ttl = int(os.getenv("SIGNAL_TTL_SEC", "900"))
-        expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
-        for k in expired_vb:
-            del _pending_vb[k]
+        # D8: snapshot _pending_vb ใต้ _data_lock
+        with _data_lock:
+            expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
+            for k in expired_vb:
+                del _pending_vb[k]
 
 
 async def scanner_loop():
@@ -3852,8 +3870,9 @@ def calc_stats() -> dict:
         # ถ้า odds ลด = เว็บเชื่อว่าจะชนะมากขึ้น = "sharp signal"
         if m.pct_change < -0.03:
             bm_correct[m.bookmaker] += 1
-    bm_accuracy = {bm: bm_correct[bm]/bm_total[bm]
-                   for bm in bm_total if bm_total[bm] >= 3}
+    # D7: เปลี่ยนชื่อ metric ให้ตรงความหมาย — นี่คือ % ของ moves ที่ดู "sharp" ไม่ใช่ accuracy vs ผลจริง
+    bm_sharp_move_rate = {bm: bm_correct[bm]/bm_total[bm]
+                          for bm in bm_total if bm_total[bm] >= 3}
 
     # ── ROI per Sport ─────────────────────────────────────────────
     sport_profit = defaultdict(float)
@@ -3909,7 +3928,7 @@ def calc_stats() -> dict:
         "confirmed_trades":len(confirmed),
         "sharp_count":     sharp_count,
         "public_count":    public_count,
-        "bm_accuracy":     bm_accuracy,
+        "bm_sharp_move_rate": bm_sharp_move_rate,
         "roi_by_sport":    roi_by_sport,
         "clv": {
             "avg":      round(avg_clv,2) if avg_clv is not None else None,
@@ -4195,6 +4214,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "stake3_thb": t.stake3_thb,
                 }
             tr_list = [_tr_to_dict(t) for t in tr_snap]
+            # D6: snapshot _pending_vb ใต้ _data_lock กัน race condition
+            with _data_lock:
+                _vb_snap = list(_pending_vb.items())
 
             data = {
                 "auto_scan":       auto_scan,
@@ -4250,7 +4272,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "stake":     vb.rec_stake_thb,
                         "soft_odds": vb.soft_odds,
                     }
-                    for sid, (vb, _ts) in list(_pending_vb.items())
+                    for sid, (vb, _ts) in _vb_snap
                 ],
             }
             body = json.dumps(data, default=str).encode()
