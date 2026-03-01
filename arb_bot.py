@@ -650,7 +650,7 @@ async def db_load_all() -> tuple[list, list, list]:
             except Exception: pass  # column exists already
 
         trades_rows = await turso_query(
-            "SELECT * FROM trade_records ORDER BY created_at ASC LIMIT 500")  # S2: ASC = oldest-first, matches runtime list semantics
+            "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500")  # B1: DESC newest-first, reversed below → oldest-first in memory
         trades = []
         for r in trades_rows:
             n = len(r)
@@ -712,7 +712,7 @@ async def db_load_all() -> tuple[list, list, list]:
             })
 
         lm_rows = await turso_query(
-            "SELECT * FROM line_movements ORDER BY ts ASC LIMIT 200")  # S2: ASC
+            "SELECT * FROM line_movements ORDER BY ts DESC LIMIT 200")  # B1: DESC newest-first, reversed below
         lms = [LineMovement(
             event=r[1],sport=r[2],bookmaker=r[3],outcome=r[4],
             odds_before=Decimal(str(r[5])),odds_after=Decimal(str(r[6])),
@@ -720,7 +720,9 @@ async def db_load_all() -> tuple[list, list, list]:
             is_steam=bool(int(r[9] or 0)),is_rlm=bool(int(r[10] or 0)),ts=r[11])
                for r in lm_rows]
 
-        opps.reverse()  # loaded DESC (newest first) → reverse to oldest-first for runtime append semantics
+        trades.reverse()  # B1: loaded DESC → reverse to oldest-first
+        opps.reverse()    # loaded DESC → reverse to oldest-first
+        lms.reverse()     # B1: loaded DESC → reverse to oldest-first
         log.info(f"[DB] loaded: trades={len(trades)}, opps={len(opps)}, moves={len(lms)}")
         return trades, opps, lms
     except Exception as e:
@@ -3541,10 +3543,13 @@ async def do_scan() -> int:
     if _scan_lock is None:
         log.warning("[Scan] lock not initialized")
         return 0
+    # B2: non-blocking acquire — asyncio is single-threaded so locked()+acquire() is atomic
+    # (no other coroutine can run between these two lines without an explicit await)
     if _scan_lock.locked():
         log.debug("[Scan] already running — skip")
         return 0
-    async with _scan_lock:
+    await _scan_lock.acquire()
+    try:
      try:
         # C9: Bankroll guard — หยุด scan ถ้าทุนหมด
         _cur_bankroll = get_current_bankroll()
@@ -3638,6 +3643,8 @@ async def do_scan() -> int:
         _last_error = f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {e!r}"
         log.error(f"[Scan] error: {e}", exc_info=True)
         return 0
+    finally:
+        _scan_lock.release()  # B2: always release manually-acquired lock
 
 
 # track events ที่รอดึง closing line
@@ -4158,13 +4165,11 @@ def periodic_cleanup():
         expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
         for k in expired_vb:
             del _pending_vb[k]
-        # E7: เคลียร settled signal IDs ออกจาก alert sets (ป้องกัน memory leak)
-        # R7/Issue30: _settle_alerted / _manual_review_alerted เป็น asyncio-only sets
-        # ทั้ง writers (settle_completed_trades) และ cleanup นี้อยู่ใน event loop เดียวกัน
-        # → single-threaded asyncio ไม่มี race condition จริง — ไม่ต้องใช้ lock
-        _settled_in_cleanup = {s.signal_id for s in trade_records if s.actual_profit_thb is not None}
-        _settle_alerted      -= _settled_in_cleanup
-        _manual_review_alerted -= _settled_in_cleanup
+    # E7/Issue33: ย้ายออกนอก _data_lock — asyncio-only sets ไม่ต้องการ lock
+    # แต่ต้องอยู่นอก with block เพื่อ consistency และ maintainability
+    _settled_in_cleanup = {s.signal_id for s in trade_records if s.actual_profit_thb is not None}
+    _settle_alerted      -= _settled_in_cleanup
+    _manual_review_alerted -= _settled_in_cleanup
 
 
 async def scanner_loop():
@@ -4268,14 +4273,17 @@ except FileNotFoundError:
 
 
 _stats_cache: dict = {"data": None, "ts": 0}
+_stats_cache_lock = threading.Lock()  # B3: protect _stats_cache read/write across ThreadingHTTPServer threads
 
 def calc_stats_cached() -> dict:
     """calc_stats พร้อม cache 15 วินาที — ลดภาระ CPU ตอน dashboard refresh"""
-    if time.time() - _stats_cache["ts"] < 15 and _stats_cache["data"] is not None:
-        return _stats_cache["data"]
+    with _stats_cache_lock:
+        if time.time() - _stats_cache["ts"] < 15 and _stats_cache["data"] is not None:
+            return _stats_cache["data"]
     result = calc_stats()
-    _stats_cache["data"] = result
-    _stats_cache["ts"]   = time.time()
+    with _stats_cache_lock:
+        _stats_cache["data"] = result
+        _stats_cache["ts"]   = time.time()
     return result
 
 def calc_stats() -> dict:
@@ -4525,8 +4533,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if ok and key not in _non_persistent:
                     db_save_state(f"cfg_{key}", value)
                     # G6: clear stats cache เมื่อ config เปลี่ยน
-                    _stats_cache["data"] = None
-                    _stats_cache["ts"]   = 0
+                    with _stats_cache_lock:
+                        _stats_cache["data"] = None
+                        _stats_cache["ts"]   = 0
                 resp = json.dumps({"ok": ok, "msg": msg}).encode()
                 self.send_response(200 if ok else 400)
                 self.send_header("Content-Type","application/json")
@@ -4650,8 +4659,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse
         clean_path = urlparse(self.path).path
 
-        # R8: HTML page \u0e42\u0e2b\u0e25\u0e14\u0e44\u0e14\u0e49\u0e40\u0e2a\u0e21\u0e2d (login form \u0e2d\u0e22\u0e39\u0e48\u0e43\u0e19 HTML) \u2014 auth \u0e40\u0e09\u0e1e\u0e32\u0e30 /api/* \u0e40\u0e17\u0e48\u0e32\u0e19\u0e31\u0e49\u0e19
-        if clean_path.startswith("/api/"):
+        # R8: HTML page \u0e42\u0e2b\u0e25\u0e14\u0e44\u0e14\u0e49\u0e40\u0e2a\u0e21\u0e2d (login form \u0e2d\u0e22\u0e39\u0e48\u0e43\u0e19 HTML) \u2014 auth \u0e40\u0e09\u0e1e\u0e32\u0e30        # B4: if DASHBOARD_TOKEN set, protect HTML page too (full private dashboard)
+        # /api/* always requires auth; HTML page requires auth only when token is configured
+        if clean_path.startswith("/api/") or (DASHBOARD_TOKEN and clean_path in ("/", "")):
             if not self._check_auth(): return
 
         if clean_path == "/api/state":
@@ -4885,11 +4895,12 @@ async def post_init(app: Application):
             try:
                 key = f"{t.event}|{t.sport}"
                 if key not in _closing_line_watch:
+                    _already_past = datetime.now(timezone.utc) > commence_dt + timedelta(hours=3)
                     _closing_line_watch[key] = {
                         "event":       t.event,
                         "sport":       t.sport,
                         "commence_dt": commence_dt,
-                        "done":        False,
+                        "done":        _already_past,  # Issue34: skip fetch for stale matches
                     }
             except Exception:
                 pass
