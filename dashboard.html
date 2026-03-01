@@ -41,6 +41,18 @@ tr:hover td{background:#1c2128}
 </style>
 </head>
 <body>
+<!-- Auth overlay -->
+<div id="authOverlay" style="display:none;position:fixed;inset:0;background:#0d1117;z-index:9999;display:flex;align-items:center;justify-content:center">
+  <div style="background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;min-width:300px;text-align:center">
+    <div style="font-size:2rem;margin-bottom:12px">🔐</div>
+    <div style="color:#58a6ff;font-size:1.1rem;font-weight:700;margin-bottom:8px">Deminia Bot Dashboard</div>
+    <div style="color:#8b949e;font-size:.8rem;margin-bottom:20px">กรุณาใส่ Dashboard Token</div>
+    <input id="tokenInput" type="password" placeholder="Token..." autofocus
+      style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:10px;font-size:.9rem;margin-bottom:12px;box-sizing:border-box">
+    <button onclick="doLogin()" style="width:100%;background:#1f3d5c;color:#58a6ff;border:1px solid #58a6ff;padding:10px;border-radius:6px;cursor:pointer;font-size:.9rem">เข้าสู่ระบบ</button>
+    <div id="authErr" style="color:#f85149;font-size:.78rem;margin-top:10px;display:none">Token ไม่ถูกต้อง — ลองใหม่</div>
+  </div>
+</div>
 <h1>🤖 Deminia Bot V.1</h1>
 <div class="sub" id="subline">รีเฟรชทุก 20 วินาที — Deminia Bot V.1 — Production Ready</div>
 
@@ -480,17 +492,47 @@ function renderTab(tab, d) {
   }
 }
 
+// R8: token resolution — URL param → sessionStorage → login form
 const _qs = new URLSearchParams(location.search);
-const _tk = _qs.get('token') || '';
-function apiUrl(path) {
-  const sep = path.includes('?') ? '&' : '?';
-  return _tk ? path + sep + 'token=' + encodeURIComponent(_tk) : path;
-}
+let _tk = _qs.get('token') || sessionStorage.getItem('dash_token') || '';
+if (_qs.get('token')) sessionStorage.setItem('dash_token', _qs.get('token'));
+
+function apiUrl(path) { return path; }  // no ?token= in URL (Bearer-only)
 function apiHeaders() {
   const h = {'Content-Type':'application/json'};
   if (_tk) h['Authorization'] = 'Bearer ' + _tk;
   return h;
 }
+
+function doLogin() {
+  const t = document.getElementById('tokenInput').value.trim();
+  if (!t) return;
+  _tk = t;
+  sessionStorage.setItem('dash_token', t);
+  document.getElementById('authOverlay').style.display = 'none';
+  document.getElementById('authErr').style.display = 'none';
+  load();
+}
+document.getElementById('tokenInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+// Show login overlay only when server requires auth (first load check)
+async function checkAuth() {
+  if (!_tk) { showLoginOverlay(); return false; }
+  const r = await fetch('/api/state', {headers: apiHeaders()}).catch(()=>null);
+  if (r && r.status === 401) {
+    sessionStorage.removeItem('dash_token');
+    _tk = '';
+    showLoginOverlay();
+    return false;
+  }
+  return true;
+}
+function showLoginOverlay() {
+  document.getElementById('authOverlay').style.display = 'flex';
+}
+
 setInterval(() => { load(); }, 20000);
 
 async function action(key, value) {
@@ -583,15 +625,21 @@ document.getElementById('settleModal').addEventListener('click', function(e){
 async function load() {
   try {
     const [stateRes, statsRes] = await Promise.all([
-      fetch(apiUrl('/api/state'), {headers: apiHeaders()}),
-      fetch(apiUrl('/api/stats'), {headers: apiHeaders()})
+      fetch('/api/state', {headers: apiHeaders()}),
+      fetch('/api/stats',  {headers: apiHeaders()})
     ]);
+    if (stateRes.status === 401) {
+      sessionStorage.removeItem('dash_token');
+      _tk = '';
+      showLoginOverlay();
+      document.getElementById('authErr').style.display = 'block';
+      return;
+    }
     if (!stateRes.ok) { console.warn('state', stateRes.status); return; }
     const state = await stateRes.json();
     const stats = statsRes.ok ? await statsRes.json() : {};
     const data  = {...state, stats};
     data.trade_records = stats.trade_records || [];
-    // enrich health info in subtitle
     if (state.db_mode) {
       document.getElementById('subline').textContent =
         `รีเฟรชทุก 20s | DB: ${state.db_mode} | Credits: ${state.api_remaining} | สแกน: ${state.scan_count} รอบ`;
@@ -603,7 +651,8 @@ async function load() {
     console.error('load error', e);
   }
 }
-load();
+// Initial load: show login overlay if no token, otherwise load directly
+if (!_tk) { showLoginOverlay(); } else { load(); }
 </script>
 </body>
 </html>
