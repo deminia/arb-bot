@@ -117,7 +117,8 @@ _SPORTS_DEFAULT = (
     "mma_mixed_martial_arts"
 )
 SPORTS     = [s.strip() for s in _s("SPORTS",_SPORTS_DEFAULT).split(",") if s.strip()]
-BOOKMAKERS = _s("BOOKMAKERS","pinnacle,onexbet,dafabet")
+BOOKMAKERS      = _s("BOOKMAKERS","pinnacle,onexbet,dafabet")
+SIGNAL_TTL_SEC  = _i("SIGNAL_TTL_SEC", 900)   # F7: constant — อ่านครั้งเดียวตอน startup
 
 SPORT_EMOJI = {
     "basketball_nba":"🏀","basketball_euroleague":"🏀","basketball_ncaab":"🏀",
@@ -1620,9 +1621,7 @@ async def _fetch_odds_sem(session: aiohttp.ClientSession, sport: str) -> list[di
         return await async_fetch_odds(session, sport)
 
 async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
-    global _ODDS_API_SEM
-    if _ODDS_API_SEM is None:
-        _ODDS_API_SEM = asyncio.Semaphore(5)  # B8: max 5 concurrent Odds API requests
+    # F5: _ODDS_API_SEM สร้างใน post_init() แล้ว — lazy-init ออก
     async with aiohttp.ClientSession() as session:
         n = len(sports)
         results = await asyncio.gather(
@@ -2491,7 +2490,7 @@ async def execute_both(opp: ArbOpportunity) -> str:
         # BugC/R4: refetch all 3 legs including Draw
         live1, live2 = await refetch_live_odds(opp)
         live3 = opp.leg3.odds  # default = cached
-        # ถ้า leg3 มาจาก Polymarket/Kalshi ให้ยิง CLOB orderbook ดึง mid-price ใหม่
+        # F2: per-leg refetch ตาม source — Polymarket/Kalshi ยิง CLOB, sportsbook ใช้ live1/live2
         leg3_token = opp.leg3.raw.get("token_id", "") if opp.leg3.raw else ""
         if leg3_token:
             try:
@@ -2499,11 +2498,27 @@ async def execute_both(opp: ArbOpportunity) -> str:
                     _book = await fetch_poly_market_detail(_sess, leg3_token)
                 if _book and _book.get("mid_price", 0) > 0:
                     _mid = Decimal(str(_book["mid_price"]))
-                    _fee = Decimal(str(opp.leg3.raw.get("fee_pct", 0.02))) if opp.leg3.raw else Decimal("0.02")
                     live3 = apply_slippage(Decimal("1") / _mid, opp.leg3.bookmaker.lower())
                     log.info(f"[SlippageGuard-3way] live Draw refetched: {float(live3):.3f} (was {float(opp.leg3.odds):.3f})")
             except Exception as _e:
                 log.debug(f"[SlippageGuard-3way] draw refetch failed: {_e} — using cached")
+        # F2: refetch leg1/leg2 ถ้ามาจาก Polymarket/Kalshi ด้วย CLOB (ไม่ใช่ Odds API)
+        for _leg_attr, _live_ref in [("leg1", "live1"), ("leg2", "live2")]:
+            _leg = getattr(opp, _leg_attr)
+            _bm  = _leg.bookmaker.lower()
+            _tok = _leg.raw.get("token_id", "") if _leg.raw else ""
+            if _tok and ("polymarket" in _bm or "kalshi" in _bm):
+                try:
+                    async with aiohttp.ClientSession() as _sess2:
+                        _b2 = await fetch_poly_market_detail(_sess2, _tok)
+                    if _b2 and _b2.get("mid_price", 0) > 0:
+                        _mid2 = Decimal(str(_b2["mid_price"]))
+                        _live_val = apply_slippage(Decimal("1") / _mid2, _bm)
+                        if _live_ref == "live1": live1 = _live_val
+                        else: live2 = _live_val
+                        log.info(f"[SlippageGuard-3way] {_leg_attr} alt-market refetched: {float(_live_val):.3f}")
+                except Exception as _e2:
+                    log.debug(f"[SlippageGuard-3way] {_leg_attr} alt refetch failed: {_e2}")
         live_profit3, _, _, _ = calc_arb_3way(live1, live3, live2)  # H, D, A
         drop_too_much_3 = (orig_profit > 0 and
             float(orig_profit - live_profit3) / float(orig_profit) > 0.50)
@@ -2521,6 +2536,21 @@ async def execute_both(opp: ArbOpportunity) -> str:
             slippage_warn = f"\n⚠️ *Slippage Alert*: profit ลดลง {profit_drop_3:.0%} (คาด {float(opp.profit_pct):.2%} → จริง {float(live_profit3):.2%})"
     else:
         live1, live2 = await refetch_live_odds(opp)
+        # F2: 2-way per-leg refetch ถ้า leg มาจาก Polymarket/Kalshi
+        for _leg_attr, _live_init in [(opp.leg1, live1), (opp.leg2, live2)]:
+            _bm2  = _leg_attr.bookmaker.lower()
+            _tok2 = _leg_attr.raw.get("token_id", "") if _leg_attr.raw else ""
+            if _tok2 and ("polymarket" in _bm2 or "kalshi" in _bm2):
+                try:
+                    async with aiohttp.ClientSession() as _s3:
+                        _b3 = await fetch_poly_market_detail(_s3, _tok2)
+                    if _b3 and _b3.get("mid_price", 0) > 0:
+                        _live_new = apply_slippage(Decimal("1") / Decimal(str(_b3["mid_price"])), _bm2)
+                        if _leg_attr is opp.leg1: live1 = _live_new
+                        else: live2 = _live_new
+                        log.info(f"[SlippageGuard-2way] alt-market refetched: {_leg_attr.bookmaker} {float(_live_new):.3f}")
+                except Exception as _e3:
+                    log.debug(f"[SlippageGuard-2way] alt refetch failed: {_e3}")
         live_profit, _, _ = calc_arb(live1, live2)
         drop_too_much = (orig_profit > 0 and
                         float(orig_profit - live_profit) / float(orig_profit) > 0.50)
@@ -2707,7 +2737,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: action, sid = query.data.split(":",1)
     except Exception: return
 
-    SIGNAL_TTL = int(os.getenv("SIGNAL_TTL_SEC", "900"))  # default 15m
+    SIGNAL_TTL = SIGNAL_TTL_SEC  # F7: ใช้ constant แทน os.getenv
     orig = query.message.text
 
     # ── Value Bet confirm/reject ──────────────────────────────────
@@ -2752,8 +2782,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         executed_soft_odds = live_soft_odds
         executed_edge_pct  = live_edge
         # recalc stake ตาม live edge
-        _, executed_rec_stake = calc_valuebet_kelly(vb.true_odds, executed_soft_odds, vb.grade)
-        executed_stake_thb = int(executed_rec_stake) if executed_rec_stake else int(vb.rec_stake_thb)
+        # F1: return order คือ (stake, edge) — ไม่ใช่ (edge, stake)
+        executed_stake_dec, executed_edge_recalc = calc_valuebet_kelly(vb.true_odds, executed_soft_odds, vb.grade)
+        executed_stake_thb = int(executed_stake_dec) if executed_stake_dec else int(vb.rec_stake_thb)
         # vb_confirm — แจ้ง Telegram พร้อม step-by-step
         sp = sport_to_path(vb.sport)
         bm_lower = vb.bookmaker.lower()
@@ -2885,7 +2916,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with _data_lock:
             seen_signals.clear()  # reset TTL timers เมื่อเปิด scan ใหม่
             # B11: clear เฉพาะ expired VB signals — ไม่ลบที่ยังไม่หมดอายุ
-            _vb_ttl_now = int(os.getenv("SIGNAL_TTL_SEC", "900"))
+            _vb_ttl_now = SIGNAL_TTL_SEC  # F7
             _now_vb = time.time()
             _expired_vb = [k for k, (_, ts) in _pending_vb.items() if _now_vb - ts > _vb_ttl_now]
             for k in _expired_vb:
@@ -3258,6 +3289,7 @@ async def do_scan() -> int:
                 del seen_signals[k]
         scan_count    += 1
         last_scan_time = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
+        _last_error = ""  # F4: เคลียร์ error เก่าหลัง scan สำเร็จ
         save_snapshot()   # 💾 บันทึก state
         return sent
      except Exception as e:
@@ -3482,13 +3514,15 @@ def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
 
     total_staked = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
 
-    # บันทึกทุก leg (รวม leg3 ถ้ามี)
+    # F6: กรอง legs ที่ stake=0 ออก — ป้องกัน payout ผิดกรณีข้อมูลเสียหาย
     legs = [
-        {"team": trade.leg1_team or "", "odds": trade.leg1_odds, "stake": trade.stake1_thb},
-        {"team": trade.leg2_team or "", "odds": trade.leg2_odds, "stake": trade.stake2_thb},
+        leg for leg in [
+            {"team": trade.leg1_team or "", "odds": trade.leg1_odds, "stake": trade.stake1_thb},
+            {"team": trade.leg2_team or "", "odds": trade.leg2_odds, "stake": trade.stake2_thb},
+            ({"team": trade.leg3_team, "odds": trade.leg3_odds, "stake": trade.stake3_thb}
+             if trade.leg3_team and trade.leg3_odds and trade.stake3_thb else None),
+        ] if leg is not None and leg["stake"] > 0
     ]
-    if trade.leg3_team and trade.leg3_odds and trade.stake3_thb:
-        legs.append({"team": trade.leg3_team, "odds": trade.leg3_odds, "stake": trade.stake3_thb})
 
     # หา leg ที่ match winner
     matched = [leg for leg in legs if fuzzy_match(winner, leg["team"], threshold=0.5)]
@@ -3733,7 +3767,7 @@ def periodic_cleanup():
         for k in expired_rc:
             del _refetch_cache[k]
         # trim _pending_vb — ลบ Value Bet signals ที่หมดอายุ (> SIGNAL_TTL)
-        _vb_ttl = int(os.getenv("SIGNAL_TTL_SEC", "900"))
+        _vb_ttl = SIGNAL_TTL_SEC  # F7
         expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
         for k in expired_vb:
             del _pending_vb[k]
@@ -3754,7 +3788,7 @@ async def scanner_loop():
             except Exception as e: log.error(f"[Scanner] {e}")
         periodic_cleanup()
         # D1: pending TTL cleanup — ลบ signal เก่าเกิน TTL หรือเลยเวลาแข่งแล้ว
-        _ttl = int(os.getenv("SIGNAL_TTL_SEC", "900"))
+        _ttl = SIGNAL_TTL_SEC  # F7
         _now_ts = time.time()
         _now_dt = datetime.now(timezone.utc)
         expired = []
@@ -4340,9 +4374,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining, _main_loop, _scan_lock
+    global trade_records, opportunity_log, line_movements, scan_count, auto_scan, last_scan_time, api_remaining, _main_loop, _scan_lock, _ODDS_API_SEM
     # B1: สร้าง asyncio.Lock ใน event loop ที่ถูกต้อง
-    _scan_lock = asyncio.Lock()
+    _scan_lock    = asyncio.Lock()
+    # F5: สร้าง Semaphore ที่นี่เลย — ไม่ lazy-init ใน fetch_all_async (กัน race condition)
+    _ODDS_API_SEM = asyncio.Semaphore(5)
     # #33 บันทึก main event loop สำหรับ cross-thread db saves
     _main_loop = asyncio.get_running_loop()
 
