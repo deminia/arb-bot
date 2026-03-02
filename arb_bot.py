@@ -260,7 +260,8 @@ _main_loop: Optional[asyncio.AbstractEventLoop] = None  # ref to main loop for c
 _scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
 _scan_in_progress: bool = False  # B6: ป้องกัน scan overlap (legacy — replaced by _scan_lock)
 _scan_lock: Optional[asyncio.Lock] = None  # B1: asyncio-safe scan mutex
-_processing: set = set()  # B2: per-signal claim set — atomic confirm guard
+_processing: set = set()  # B2: per-signal claim set — atomic confirm/reject guard
+_settling:   set = set()  # R3: per-signal settle claim — mutual exclusion across cmd_settle / /api/settle / auto-settle
 _now_last_ts: float = 0  # A5: timestamp ที่กด /now ล่าสุด
 _bot_start_ts: float = time.time()  # D2: uptime
 _last_error: str = ""  # D2: last error message
@@ -3104,10 +3105,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         if action == "vb_reject":
+            # R2: claim _processing — mutual exclusion with vb_confirm
             with _data_lock:
-                _pending_vb.pop(sid, None)
-            try: await query.edit_message_text(orig+"\n\n❌ *Value Bet Skipped*", parse_mode="Markdown")
-            except Exception: pass
+                if sid in _processing:
+                    try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+                    except Exception: pass
+                    return
+                _processing.add(sid)
+            try:
+                with _data_lock:
+                    _pending_vb.pop(sid, None)
+                try: await query.edit_message_text(orig+"\n\n❌ *Value Bet Skipped*", parse_mode="Markdown")
+                except Exception: pass
+            finally:
+                with _data_lock:
+                    _processing.discard(sid)
             return
         # B2: VB slippage guard — refetch live odds ก่อน confirm
         try: await query.edit_message_text(orig+"\n\n⏳ *ตรวจราคาล่าสุด...*", parse_mode="Markdown")
@@ -3245,38 +3257,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
-    if action == "reject":  # D1: set rejected immediately
-        _is_3w = opp.leg3 is not None and opp.stake3 is not None
-        tr_rej = TradeRecord(
-            signal_id=sid, event=opp.event, sport=opp.sport,
-            leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
-            leg1_team=opp.leg1.outcome,
-            leg2_team=opp.leg2.outcome,
-            leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
-            stake1_thb=int(opp.stake1*USD_TO_THB), stake2_thb=int(opp.stake2*USD_TO_THB),
-            profit_pct=float(opp.profit_pct), status="rejected",
-            leg3_bm=opp.leg3.bookmaker if _is_3w else None,
-            leg3_team=opp.leg3.outcome if _is_3w else None,
-            leg3_odds=float(opp.leg3.odds_raw) if _is_3w else None,
-            stake3_thb=int(opp.stake3*USD_TO_THB) if _is_3w else None,
-        )
-        # D6: save FIRST — signal stays in pending until DB commits
-        await _async_save_trade(tr_rej)  # raises RuntimeError if DB write fails
-        # D6: DB committed — now safe to mutate state
+    if action == "reject":
+        # R1: claim _processing — mutual exclusion with confirm
         with _data_lock:
-            trade_records.append(tr_rej)  # only after confirmed DB write
-            pending.pop(sid, None)         # D6: pop AFTER save succeeds
-        # best-effort opp_log update — display concern only
-        with _data_lock:
-            for _e in opportunity_log:
-                if _e["id"] == sid:
-                    _e["status"] = "rejected"; break
+            if sid in _processing:
+                try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+                except Exception: pass
+                return
+            _processing.add(sid)
         try:
-            await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("rejected", sid))
-        except Exception as _oe:
-            log.warning(f"[Reject] opp_log update failed (non-critical): {_oe}")
-        try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
-        except Exception: pass  # C8
+            _is_3w = opp.leg3 is not None and opp.stake3 is not None
+            tr_rej = TradeRecord(
+                signal_id=sid, event=opp.event, sport=opp.sport,
+                leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
+                leg1_team=opp.leg1.outcome,
+                leg2_team=opp.leg2.outcome,
+                leg1_odds=float(opp.leg1.odds_raw), leg2_odds=float(opp.leg2.odds_raw),
+                stake1_thb=int(opp.stake1*USD_TO_THB), stake2_thb=int(opp.stake2*USD_TO_THB),
+                profit_pct=float(opp.profit_pct), status="rejected",
+                leg3_bm=opp.leg3.bookmaker if _is_3w else None,
+                leg3_team=opp.leg3.outcome if _is_3w else None,
+                leg3_odds=float(opp.leg3.odds_raw) if _is_3w else None,
+                stake3_thb=int(opp.stake3*USD_TO_THB) if _is_3w else None,
+            )
+            # D6: save FIRST — signal stays in pending until DB commits
+            await _async_save_trade(tr_rej)  # raises RuntimeError if DB write fails
+            # D6: DB committed — now safe to mutate state
+            with _data_lock:
+                trade_records.append(tr_rej)  # only after confirmed DB write
+                pending.pop(sid, None)         # D6: pop AFTER save succeeds
+            # best-effort opp_log update — display concern only
+            with _data_lock:
+                for _e in opportunity_log:
+                    if _e["id"] == sid:
+                        _e["status"] = "rejected"; break
+            try:
+                await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("rejected", sid))
+            except Exception as _oe:
+                log.warning(f"[Reject] opp_log update failed (non-critical): {_oe}")
+            try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
+            except Exception: pass  # C8
+        finally:
+            with _data_lock:
+                _processing.discard(sid)  # R1: always release claim
         return
 
     # action == "confirm"
@@ -3697,86 +3720,85 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚨 *DB write halted* \u2014 ระบบ safe\u002dmode ไม่รับ /settle", parse_mode="Markdown")
         return
 
-    # C2: peek+validate WITHOUT pop first — save must succeed before queue removal
+    # R3: claim _settling — mutual exclusion with /api/settle and auto-settle
     with _data_lock:
-        entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
-
-    if not entry:
-        await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
-        return
-
-    t, _cdt_settle = entry
-    # J2: guard status — only confirmed trades can be settled
-    if t.status != "confirmed":
-        await update.message.reply_text(
-            f"⚠️ Trade `{sid}` status=`{t.status}` — settle ได้เฉพาะ confirmed trades",
-            parse_mode="Markdown"
-        )
-        return
-    # C8: double-settle guard
-    if t.actual_profit_thb is not None or t.settled_at is not None:
-        await update.message.reply_text(
-            f"⚠️ Trade นี้ settle ไปแล้ว (P&L: ฿{t.actual_profit_thb:+,})",
-            parse_mode="Markdown"
-        )
-        return
-    tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
-
-    if result == "leg1":
-        payout = int(t.leg1_odds * t.stake1_thb)
-        actual = payout - tt
-    elif result == "leg2":
-        payout = int(t.leg2_odds * t.stake2_thb)
-        actual = payout - tt
-    elif result == "draw":
-        if t.leg3_team and t.leg3_team.lower() == "draw" and t.leg3_odds and t.stake3_thb:
-            payout = int(t.leg3_odds * t.stake3_thb)
-            actual = payout - tt
-        elif t.leg1_team and t.leg1_team.lower() == "draw":
-            payout = int(t.leg1_odds * t.stake1_thb)
-            actual = payout - tt
-        elif t.leg2_team and t.leg2_team.lower() == "draw":
-            payout = int(t.leg2_odds * t.stake2_thb)
-            actual = payout - tt
-        else:
-            actual = 0
-    else:  # void
-        actual = 0
-
-    t.actual_profit_thb = actual
-    t.settled_at = datetime.now(timezone.utc).isoformat()
-    t.status = "confirmed"
-    # C2: save FIRST — only pop queue after DB commit succeeds
+        if sid in _settling:
+            await update.message.reply_text(f"⏳ `{sid}` กำลัง settle อยู่แล้ว — รอสักครู่", parse_mode="Markdown")
+            return
+        _settling.add(sid)
     try:
-        await _async_save_trade(t)  # raises RuntimeError if DB write fails
-    except Exception as _save_err:
-        log.error(f"[Settle] DB save failed for {sid}: {_save_err}")
-        # rollback in-memory mutation
-        t.actual_profit_thb = None
-        t.settled_at = None
+        # C2: peek+validate AFTER claim — save must succeed before queue removal
+        with _data_lock:
+            entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
+        if not entry:
+            await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
+            return
+        t, _cdt_settle = entry
+        # J2: guard status — only confirmed trades can be settled
+        if t.status != "confirmed":
+            await update.message.reply_text(
+                f"⚠️ Trade `{sid}` status=`{t.status}` — settle ได้เฉพาะ confirmed trades",
+                parse_mode="Markdown"
+            )
+            return
+        # C8: double-settle guard — re-check AFTER claim
+        if t.actual_profit_thb is not None or t.settled_at is not None:
+            await update.message.reply_text(
+                f"⚠️ Trade นี้ settle ไปแล้ว (P&L: ฿{t.actual_profit_thb:+,})",
+                parse_mode="Markdown"
+            )
+            return
+        tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
+        if result == "leg1":
+            actual = int(t.leg1_odds * t.stake1_thb) - tt
+        elif result == "leg2":
+            actual = int(t.leg2_odds * t.stake2_thb) - tt
+        elif result == "draw":
+            if t.leg3_team and t.leg3_team.lower() == "draw" and t.leg3_odds and t.stake3_thb:
+                actual = int(t.leg3_odds * t.stake3_thb) - tt
+            elif t.leg1_team and t.leg1_team.lower() == "draw":
+                actual = int(t.leg1_odds * t.stake1_thb) - tt
+            elif t.leg2_team and t.leg2_team.lower() == "draw":
+                actual = int(t.leg2_odds * t.stake2_thb) - tt
+            else:
+                actual = 0
+        else:  # void
+            actual = 0
+        t.actual_profit_thb = actual
+        t.settled_at = datetime.now(timezone.utc).isoformat()
+        t.status = "confirmed"
+        # C2: save FIRST — only pop queue after DB commit succeeds
+        try:
+            await _async_save_trade(t)  # raises RuntimeError if DB write fails
+        except Exception as _save_err:
+            log.error(f"[Settle] DB save failed for {sid}: {_save_err}")
+            t.actual_profit_thb = None
+            t.settled_at = None
+            await update.message.reply_text(
+                f"🚨 *DB write failed* — settle ยังไม่ได้บันทึก (`{sid}`)",
+                parse_mode="Markdown"
+            )
+            return
+        # C2: DB committed — now pop atomically
+        with _data_lock:
+            _pending_settlement.pop(sid, None)
+            _manual_review_pending.pop(sid, None)
+        # C7: update trade_records in-memory เพื่อให้ /pnl เห็นผล settle ทันที
+        with _data_lock:
+            for idx, rec in enumerate(trade_records):
+                if rec.signal_id == t.signal_id:
+                    trade_records[idx] = t
+                    break
+        emoji = "✅" if actual >= 0 else "❌"
         await update.message.reply_text(
-            f"🚨 *DB write failed* — settle ยังไม่ได้บันทึก (`{sid}`)",
-            parse_mode="Markdown"
+            f"{emoji} *Manual Settle*\n`{t.event}`\n"
+            f"ผล: *{result.upper()}* | P&L: *฿{actual:+,}*\n"
+            f"(settled_at: {t.settled_at[:16]})",
+            parse_mode="Markdown",
         )
-        return
-    # C2: DB committed — now pop atomically
-    with _data_lock:
-        _pending_settlement.pop(sid, None)
-        _manual_review_pending.pop(sid, None)
-    # C7: update trade_records in-memory ด้วย เพื่อให้ /pnl เห็นผล settle ทันที
-    with _data_lock:
-        for idx, rec in enumerate(trade_records):
-            if rec.signal_id == t.signal_id:
-                trade_records[idx] = t
-                break
-
-    emoji = "✅" if actual >= 0 else "❌"
-    await update.message.reply_text(
-        f"{emoji} *Manual Settle*\n`{t.event}`\n"
-        f"ผล: *{result.upper()}* | P&L: *฿{actual:+,}*\n"
-        f"(settled_at: {t.settled_at[:16]})",
-        parse_mode="Markdown",
-    )
+    finally:
+        with _data_lock:
+            _settling.discard(sid)  # R3: always release settle claim
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -4375,50 +4397,60 @@ async def settle_completed_trades():
                             except Exception: pass
                     continue
 
-                # G8: double-settle guard — ป้องกัน race กับ /settle command
-                if trade.actual_profit_thb is not None or trade.settled_at is not None:
-                    log.info(f"[Settle] {trade.signal_id} already settled — skip auto-settle")
-                    settled_ids.append(signal_id)
-                    continue
-                # คำนวณ P&L จริง
-                actual_profit = calc_actual_pnl(trade, winner)
-                total_staked  = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
-                emoji_result  = "✅" if actual_profit >= 0 else "❌"
-                sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
-
-                # อัพเดท trade record + in-memory
-                trade.actual_profit_thb = actual_profit
-                trade.settled_at        = datetime.now(timezone.utc).isoformat()
-                await _async_save_trade(trade)  # B5: await critical write
+                # R3: claim _settling — mutual exclusion with cmd_settle and /api/settle
                 with _data_lock:
-                    for idx, rec in enumerate(trade_records):
-                        if rec.signal_id == trade.signal_id:
-                            trade_records[idx] = trade
-                            break
-                settled_ids.append(signal_id)
-                # E7: เคลียร signal ออกจาก alert sets หลัง settle เสร็จ
-                _settle_alerted.discard(signal_id)
-                _manual_review_alerted.discard(signal_id)
+                    if signal_id in _settling:
+                        log.info(f"[Settle] {signal_id} already being settled by another path — skip auto-settle")
+                        continue
+                    _settling.add(signal_id)
+                try:
+                    # G8: double-settle guard — re-check AFTER claim
+                    if trade.actual_profit_thb is not None or trade.settled_at is not None:
+                        log.info(f"[Settle] {signal_id} already settled — skip auto-settle")
+                        settled_ids.append(signal_id)
+                        continue
+                    # คำนวณ P&L จริง
+                    actual_profit = calc_actual_pnl(trade, winner)
+                    total_staked  = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
+                    emoji_result  = "✅" if actual_profit >= 0 else "❌"
+                    sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
 
-                log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
+                    # อัพเดท trade record + in-memory
+                    trade.actual_profit_thb = actual_profit
+                    trade.settled_at        = datetime.now(timezone.utc).isoformat()
+                    await _async_save_trade(trade)  # B5: await critical write
+                    with _data_lock:
+                        for idx, rec in enumerate(trade_records):
+                            if rec.signal_id == trade.signal_id:
+                                trade_records[idx] = trade
+                                break
+                    settled_ids.append(signal_id)
+                    # E7: เคลียร signal ออกจาก alert sets หลัง settle เสร็จ
+                    _settle_alerted.discard(signal_id)
+                    _manual_review_alerted.discard(signal_id)
 
-                # แจ้ง Telegram
-                msg = (
-                    f"{sport_emoji} *SETTLED* \u2014 {md_escape(trade.event)}\n"
-                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{md_escape(winner)}*\n"
-                    f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
-                    f"\U0001f4ca \u0e01\u0e33\u0e44\u0e23\u0e08\u0e23\u0e34\u0e07: {emoji_result} *\u0e3f{actual_profit:+,}*\n"
-                    f"\U0001f4c8 ROI     : *{actual_profit/total_staked*100:+.2f}%*\n"
-                    f"\U0001f194 `{signal_id}`"
-                )
-                if _app:
-                    for cid in ALL_CHAT_IDS:
-                        try:
-                            await _app.bot.send_message(
-                                chat_id=cid, text=msg, parse_mode="Markdown")
-                        except Exception as e:
-                            log.error(f"[Settle] notify {cid}: {e}")
+                    log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
+
+                    # แจ้ง Telegram
+                    msg = (
+                        f"{sport_emoji} *SETTLED* \u2014 {md_escape(trade.event)}\n"
+                        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                        f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{md_escape(winner)}*\n"
+                        f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
+                        f"\U0001f4ca \u0e01\u0e33\u0e44\u0e23\u0e08\u0e23\u0e34\u0e07: {emoji_result} *\u0e3f{actual_profit:+,}*\n"
+                        f"\U0001f4c8 ROI     : *{actual_profit/total_staked*100:+.2f}%*\n"
+                        f"\U0001f194 `{signal_id}`"
+                    )
+                    if _app:
+                        for cid in ALL_CHAT_IDS:
+                            try:
+                                await _app.bot.send_message(
+                                    chat_id=cid, text=msg, parse_mode="Markdown")
+                            except Exception as e:
+                                log.error(f"[Settle] notify {cid}: {e}")
+                finally:
+                    with _data_lock:
+                        _settling.discard(signal_id)  # R3: always release
 
             # ลบ trades ที่ settle แล้ว
             with _data_lock:
@@ -4892,6 +4924,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(err)
         elif _clean == "/api/settle":
             # v10-9: Manual Settlement จาก Dashboard
+            _api_sid = None
             try:
                 # B3: safe-mode guard
                 if _db_write_halted:
@@ -4902,7 +4935,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = body.get("result", "").strip().lower()  # leg1|leg2|draw|void
                 if not sid or result not in ("leg1","leg2","draw","void"):
                     raise ValueError("signal_id and result (leg1/leg2/draw/void) required")
-                # C2: peek+validate WITHOUT pop — save must succeed before queue removal
+                # R3: claim _settling — mutual exclusion with cmd_settle and auto-settle
+                with _data_lock:
+                    if sid in _settling:
+                        raise ValueError(f"signal_id '{sid}' is already being settled — retry shortly")
+                    _settling.add(sid)
+                _api_sid = sid  # track for finally release
+                # C2: peek+validate AFTER claim — save must succeed before queue removal
                 with _data_lock:
                     entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
                     if not entry:
@@ -4938,7 +4977,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     else:
                         raise RuntimeError("main loop unavailable")
                 except Exception as _save_err:
-                    # rollback in-memory mutation before re-raising
                     t.actual_profit_thb = None
                     t.settled_at = None
                     raise ValueError(f"DB write failed — settle not committed: {_save_err}") from _save_err
@@ -4965,6 +5003,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length",len(err))
                 self.end_headers()
                 self.wfile.write(err)
+            finally:
+                # R3: always release settle claim
+                if _api_sid:
+                    with _data_lock:
+                        _settling.discard(_api_sid)
         else:
             self.send_response(404)
             self.end_headers()
