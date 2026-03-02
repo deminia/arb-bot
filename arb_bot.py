@@ -656,16 +656,19 @@ async def db_load_all() -> tuple[list, list, list]:
             except Exception: pass  # column exists already
 
         trades_rows = await turso_query(
-            "SELECT * FROM trade_records ORDER BY created_at DESC LIMIT 500")  # B1: DESC newest-first, reversed below → oldest-first in memory
+            "SELECT signal_id,event,sport,leg1_bm,leg2_bm,leg1_team,leg2_team,"
+            "leg1_odds,leg2_odds,stake1_thb,stake2_thb,profit_pct,status,"
+            "clv_leg1,clv_leg2,actual_profit_thb,settled_at,created_at,"
+            "commence_time,leg3_bm,leg3_team,leg3_odds,stake3_thb,needs_manual_review"
+            " FROM trade_records ORDER BY created_at DESC LIMIT 500")  # C5: named cols — immune to migration order
         trades = []
         for r in trades_rows:
             n = len(r)
-            # col order: 0=signal_id,1=event,2=sport,3=leg1_bm,4=leg2_bm,
-            #            5=leg1_team,6=leg2_team,7=leg1_odds,8=leg2_odds,
-            #            9=stake1_thb,10=stake2_thb,11=profit_pct,12=status,
-            #            13=clv_leg1,14=clv_leg2,15=actual_profit_thb,
-            #            16=settled_at,17=created_at,18=commence_time
-            #            19=leg3_bm,20=leg3_team,21=leg3_odds,22=stake3_thb
+            # C5: positional map matches explicit SELECT list above — stable regardless of future migrations
+            # 0=signal_id,1=event,2=sport,3=leg1_bm,4=leg2_bm,5=leg1_team,6=leg2_team,
+            # 7=leg1_odds,8=leg2_odds,9=stake1_thb,10=stake2_thb,11=profit_pct,12=status,
+            # 13=clv_leg1,14=clv_leg2,15=actual_profit_thb,16=settled_at,17=created_at,
+            # 18=commence_time,19=leg3_bm,20=leg3_team,21=leg3_odds,22=stake3_thb,23=needs_manual_review
             if n >= 18:
                 trades.append(TradeRecord(
                     signal_id=r[0],event=r[1],sport=r[2],leg1_bm=r[3],leg2_bm=r[4],
@@ -682,7 +685,7 @@ async def db_load_all() -> tuple[list, list, list]:
                     leg3_team=r[20] if n >= 21 else None,
                     leg3_odds=float(r[21]) if n >= 22 and r[21] is not None else None,
                     stake3_thb=int(float(r[22])) if n >= 23 and r[22] is not None else None,
-                    needs_manual_review=bool(int(r[23])) if n >= 24 and r[23] is not None else False)  # M2
+                    needs_manual_review=bool(int(r[23])) if n >= 24 and r[23] is not None else False)  # C5
                 )
             else:
                 # DB เก่า — ไม่มี leg1_team/leg2_team
@@ -4110,6 +4113,10 @@ def parse_winner(event: dict, sport: str = "") -> Optional[str]:
     if "soccer" in sport_lower:
         try:
             sorted_scores = sorted(scores, key=lambda x: float(x.get("score", 0)), reverse=True)
+            # C4: guard against single-entry scores (incomplete data) — need exactly 2 teams to compare
+            if len(sorted_scores) < 2:
+                log.warning(f"[Settle] Soccer scores incomplete ({len(sorted_scores)} entry) — needs manual review")
+                return "MANUAL_REVIEW"
             if float(sorted_scores[0].get("score", 0)) == float(sorted_scores[-1].get("score", 0)):
                 log.info(f"[Settle] Soccer draw — {event.get('home_team','')} vs {event.get('away_team','')}")
                 return "DRAW"
