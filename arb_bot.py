@@ -3079,192 +3079,184 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Value Bet confirm/reject ──────────────────────────────────
     if action in ("vb_confirm", "vb_reject"):
+        # C2: claim _processing FIRST — before any read or refetch
+        # Re-read vb_entry AFTER claim under same lock so snapshot is post-claim.
         with _data_lock:
-            vb_entry = _pending_vb.get(sid)
-        if not vb_entry:
-            try: await query.edit_message_text(orig+"\n\n⚠️ Value Bet signal หมดอายุแล้ว")
-            except Exception: pass
-            return
-        vb, vb_ts = vb_entry
-        if time.time() - vb_ts > SIGNAL_TTL:
-            with _data_lock:
-                _pending_vb.pop(sid, None)
-            try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-vb_ts)//60)}m ago)", parse_mode="Markdown")
-            except Exception: pass
-            return
-        # J6: kick-off guard — ไม่ confirm VB หลังแม็ตช์เริ่ม
-        if vb.commence_time:
-            try:
-                _vb_cdt = parse_commence(vb.commence_time)
-                if datetime.now(timezone.utc) > _vb_cdt + timedelta(minutes=5):
-                    with _data_lock:
-                        _pending_vb.pop(sid, None)
-                    try: await query.edit_message_text(orig+"\n\n⏰ *แม็ตช์เริ่มแล้ว — signal หมดอายุ*", parse_mode="Markdown")
-                    except Exception: pass
-                    return
-            except Exception:
-                pass
-        if action == "vb_reject":
-            # R2: claim _processing — mutual exclusion with vb_confirm
-            with _data_lock:
-                if sid in _processing:
-                    try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
-                    except Exception: pass
-                    return
-                _processing.add(sid)
-            try:
+            if sid in _processing:
+                try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+                except Exception: pass
+                return
+            _processing.add(sid)  # C2: claim before any read or await
+            vb_entry = _pending_vb.get(sid)  # C2: read AFTER claim, under same lock
+        try:
+            if not vb_entry:
+                try: await query.edit_message_text(orig+"\n\n⚠️ Value Bet signal หมดอายุแล้ว")
+                except Exception: pass
+                return
+            vb, vb_ts = vb_entry
+            if time.time() - vb_ts > SIGNAL_TTL:
+                with _data_lock:
+                    _pending_vb.pop(sid, None)
+                try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-vb_ts)//60)}m ago)", parse_mode="Markdown")
+                except Exception: pass
+                return
+            # J6: kick-off guard — ไม่ confirm VB หลังแม็ตช์เริ่ม
+            if vb.commence_time:
+                try:
+                    _vb_cdt = parse_commence(vb.commence_time)
+                    if datetime.now(timezone.utc) > _vb_cdt + timedelta(minutes=5):
+                        with _data_lock:
+                            _pending_vb.pop(sid, None)
+                        try: await query.edit_message_text(orig+"\n\n⏰ *แม็ตช์เริ่มแล้ว — signal หมดอายุ*", parse_mode="Markdown")
+                        except Exception: pass
+                        return
+                except Exception:
+                    pass
+            if action == "vb_reject":
                 with _data_lock:
                     _pending_vb.pop(sid, None)
                 try: await query.edit_message_text(orig+"\n\n❌ *Value Bet Skipped*", parse_mode="Markdown")
                 except Exception: pass
-            finally:
-                with _data_lock:
-                    _processing.discard(sid)
-            return
-        # B2: VB slippage guard — refetch live odds ก่อน confirm
-        try: await query.edit_message_text(orig+"\n\n⏳ *ตรวจราคาล่าสุด...*", parse_mode="Markdown")
-        except Exception: pass
-        live_soft_odds, _vb_found = await refetch_valuebet_odds(vb)
-        _, live_edge = calc_valuebet_kelly(vb.true_odds, live_soft_odds, vb.grade)
-        _retry_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Retry",   callback_data=f"vb_confirm:{sid}"),
-            InlineKeyboardButton("❌ Skip",    callback_data=f"vb_reject:{sid}"),
-        ]])
-        # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ
-        if not _vb_found:
-            try:
-                await query.edit_message_text(
-                    orig + (
-                        f"\n\n🚫 *ABORT: Live odds unavailable*\n"
-                        f"ดึงราคา {vb.bookmaker} live ไม่ได้ (market อาจถูก suspend)\n"
-                        f"_(กด Retry ถ้าจะลองใหม่)_"
-                    ),
-                    parse_mode="Markdown", reply_markup=_retry_kb
-                )
+                return
+            # B2: VB slippage guard — refetch live odds ก่อน confirm (claim already held)
+            try: await query.edit_message_text(orig+"\n\n⏳ *ตรวจราคาล่าสุด...*", parse_mode="Markdown")
             except Exception: pass
-            return
-        if live_soft_odds < vb.soft_odds * 0.98 or live_edge <= 0:  # tolerance 2%
-            # K4: ไม่ pop — ยังเก็บ signal ไว้ให้ retry ได้ (one-shot abort ไม่ pop)
-            try:
-                await query.edit_message_text(
-                    orig + (
-                        f"\n\n🚫 *ABORT: Value เปลี่ยนแล้ว*\n"
-                        f"คาด `{vb.soft_odds:.3f}` → จริง `{live_soft_odds:.3f}`\n"
-                        f"edge ใหม่ = {live_edge:.2f}%\n"
-                        f"_(กด Retry ถ้าจะลองใหม่)_"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=_retry_kb,
-                )
-            except Exception: pass
-            return
-        # E2: ใช้ executed odds/edge ที่ผ่าน guard แล้ว — ไม่ย้อนไป vb.soft_odds
-        executed_soft_odds = live_soft_odds
-        executed_edge_pct  = live_edge
-        # recalc stake ตาม live edge
-        # F1: return order คือ (stake, edge) — ไม่ใช่ (edge, stake)
-        executed_stake_dec, executed_edge_recalc = calc_valuebet_kelly(vb.true_odds, executed_soft_odds, vb.grade)
-        _raw_stake = Decimal(str(int(executed_stake_dec))) if executed_stake_dec else Decimal(str(int(vb.rec_stake_thb)))
-        # G5: apply per-book cap (MAX_STAKE_* env) ก่อนส่ง Telegram
-        executed_stake_thb = int(apply_vb_book_cap(_raw_stake, vb.bookmaker))
-        # vb_confirm — แจ้ง Telegram พร้อม step-by-step
-        sp = sport_to_path(vb.sport)
-        bm_lower = vb.bookmaker.lower()
-        if "pinnacle" in bm_lower:
-            link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
-        elif "1xbet" in bm_lower or "onexbet" in bm_lower:
-            link = f"https://1xbet.com/en/line/{sp['1xbet']}"
-        elif "dafabet" in bm_lower:
-            link = f"https://www.dafabet.com/en/{sp['dafabet']}"
-        # J4: stake.com / cloudbet — เพิ่ม mapping แทน fallback Pinnacle
-        elif "stake" in bm_lower:
-            link = f"https://stake.com/sports/{sp.get('stake', sp.get('pinnacle', 'soccer'))}"
-        elif "cloudbet" in bm_lower:
-            link = f"https://www.cloudbet.com/en/sports/{sp.get('cloudbet', sp.get('pinnacle', 'soccer'))}"
-        else:
-            link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
-        confirm_msg = (
-            f"✅ *Value Bet CONFIRMED — เกรด {vb.grade}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏆 {md_escape(vb.event)}\n"
-            f"📡 {md_escape(vb.bookmaker)} — *{md_escape(vb.outcome)}*\n"
-            f"💰 Edge: *+{executed_edge_pct:.2f}%* | Stake: *฿{executed_stake_thb:,}* @ `{executed_soft_odds:.3f}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 *วิธีวาง:*\n"
-            f"  1. [เปิด {md_escape(vb.bookmaker)}]({link})\n"
-            f"  2. ค้นหา *{md_escape(vb.event)}*\n"
-            f"  3. เลือก *{md_escape(vb.outcome)}* @ `{executed_soft_odds:.3f}`\n"
-            f"  4. วาง *฿{executed_stake_thb:,}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"_(ยืนยันแล้ว — วางด้วยมือ)_"
-        )
-        # C3: atomic claim BEFORE first await — close VB race window
-        with _data_lock:
-            if sid in _processing:
-                try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+            live_soft_odds, _vb_found = await refetch_valuebet_odds(vb)
+            _, live_edge = calc_valuebet_kelly(vb.true_odds, live_soft_odds, vb.grade)
+            _retry_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Retry",   callback_data=f"vb_confirm:{sid}"),
+                InlineKeyboardButton("❌ Skip",    callback_data=f"vb_reject:{sid}"),
+            ]])
+            # O1: fail-closed — abort ถ้าหา live odds ไม่เจอ
+            if not _vb_found:
+                try:
+                    await query.edit_message_text(
+                        orig + (
+                            f"\n\n🚫 *ABORT: Live odds unavailable*\n"
+                            f"ดึงราคา {vb.bookmaker} live ไม่ได้ (market อาจถูก suspend)\n"
+                            f"_(กด Retry ถ้าจะลองใหม่)_"
+                        ),
+                        parse_mode="Markdown", reply_markup=_retry_kb
+                    )
                 except Exception: pass
                 return
-            _processing.add(sid)  # C3: claim here, before any await
-        try:
-          # D2: build TradeRecord and save FIRST — pop/edit/broadcast only after DB commits
-          tr_vb = TradeRecord(
-            signal_id=vb.signal_id, event=vb.event, sport=vb.sport,
-            leg1_bm=vb.bookmaker, leg2_bm="-",
-            leg1_team=vb.outcome, leg2_team="-",
-            leg1_odds=float(executed_soft_odds), leg2_odds=0.0,
-            stake1_thb=executed_stake_thb, stake2_thb=0,
-            profit_pct=float(executed_edge_pct / 100.0), status="confirmed",
-            commence_time=vb.commence_time,
-          )
-          await _async_save_trade(tr_vb)  # D2: raises RuntimeError if DB write fails — must succeed before any side-effect
-          # D2: DB committed — now safe to mutate state and notify user
-          with _data_lock:
-            trade_records.append(tr_vb)
-            _pending_vb.pop(sid, None)  # D2: pop AFTER save succeeds
-          if vb.commence_time:
-            register_for_settlement(tr_vb, vb.commence_time)
-            from types import SimpleNamespace as _NS
-            register_closing_watch(_NS(event=tr_vb.event, sport=tr_vb.sport, commence=tr_vb.commence_time))
-          # D2: notify user only after everything is committed
-          try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
-          except Exception: pass
-          for cid in ALL_CHAT_IDS:
-            try:
-                await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
-            except Exception as e:
-                log.error(f"[VB] confirm msg error: {e}")
+            if live_soft_odds < vb.soft_odds * 0.98 or live_edge <= 0:  # tolerance 2%
+                # K4: ไม่ pop — ยังเก็บ signal ไว้ให้ retry ได้ (one-shot abort ไม่ pop)
+                try:
+                    await query.edit_message_text(
+                        orig + (
+                            f"\n\n🚫 *ABORT: Value เปลี่ยนแล้ว*\n"
+                            f"คาด `{vb.soft_odds:.3f}` → จริง `{live_soft_odds:.3f}`\n"
+                            f"edge ใหม่ = {live_edge:.2f}%\n"
+                            f"_(กด Retry ถ้าจะลองใหม่)_"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=_retry_kb,
+                    )
+                except Exception: pass
+                return
+            # E2: ใช้ executed odds/edge ที่ผ่าน guard แล้ว — ไม่ย้อนไป vb.soft_odds
+            executed_soft_odds = live_soft_odds
+            executed_edge_pct  = live_edge
+            # recalc stake ตาม live edge
+            # F1: return order คือ (stake, edge) — ไม่ใช่ (edge, stake)
+            executed_stake_dec, executed_edge_recalc = calc_valuebet_kelly(vb.true_odds, executed_soft_odds, vb.grade)
+            _raw_stake = Decimal(str(int(executed_stake_dec))) if executed_stake_dec else Decimal(str(int(vb.rec_stake_thb)))
+            # G5: apply per-book cap (MAX_STAKE_* env) ก่อนส่ง Telegram
+            executed_stake_thb = int(apply_vb_book_cap(_raw_stake, vb.bookmaker))
+            # vb_confirm — แจ้ง Telegram พร้อม step-by-step
+            sp = sport_to_path(vb.sport)
+            bm_lower = vb.bookmaker.lower()
+            if "pinnacle" in bm_lower:
+                link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
+            elif "1xbet" in bm_lower or "onexbet" in bm_lower:
+                link = f"https://1xbet.com/en/line/{sp['1xbet']}"
+            elif "dafabet" in bm_lower:
+                link = f"https://www.dafabet.com/en/{sp['dafabet']}"
+            # J4: stake.com / cloudbet — เพิ่ม mapping แทน fallback Pinnacle
+            elif "stake" in bm_lower:
+                link = f"https://stake.com/sports/{sp.get('stake', sp.get('pinnacle', 'soccer'))}"
+            elif "cloudbet" in bm_lower:
+                link = f"https://www.cloudbet.com/en/sports/{sp.get('cloudbet', sp.get('pinnacle', 'soccer'))}"
+            else:
+                link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
+            confirm_msg = (
+                f"✅ *Value Bet CONFIRMED — เกรด {vb.grade}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 {md_escape(vb.event)}\n"
+                f"📡 {md_escape(vb.bookmaker)} — *{md_escape(vb.outcome)}*\n"
+                f"💰 Edge: *+{executed_edge_pct:.2f}%* | Stake: *฿{executed_stake_thb:,}* @ `{executed_soft_odds:.3f}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 *วิธีวาง:*\n"
+                f"  1. [เปิด {md_escape(vb.bookmaker)}]({link})\n"
+                f"  2. ค้นหา *{md_escape(vb.event)}*\n"
+                f"  3. เลือก *{md_escape(vb.outcome)}* @ `{executed_soft_odds:.3f}`\n"
+                f"  4. วาง *฿{executed_stake_thb:,}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"_(ยืนยันแล้ว — วางด้วยมือ)_"
+            )
+            # C2: _processing already claimed at top of vb branch — proceed to save
+            # D2: build TradeRecord and save FIRST — pop/edit/broadcast only after DB commits
+            tr_vb = TradeRecord(
+                signal_id=vb.signal_id, event=vb.event, sport=vb.sport,
+                leg1_bm=vb.bookmaker, leg2_bm="-",
+                leg1_team=vb.outcome, leg2_team="-",
+                leg1_odds=float(executed_soft_odds), leg2_odds=0.0,
+                stake1_thb=executed_stake_thb, stake2_thb=0,
+                profit_pct=float(executed_edge_pct / 100.0), status="confirmed",
+                commence_time=vb.commence_time,
+            )
+            await _async_save_trade(tr_vb)  # D2: raises RuntimeError if DB write fails
+            # D2: DB committed — now safe to mutate state and notify user
+            with _data_lock:
+                trade_records.append(tr_vb)
+                _pending_vb.pop(sid, None)  # D2: pop AFTER save succeeds
+            if vb.commence_time:
+                register_for_settlement(tr_vb, vb.commence_time)
+                from types import SimpleNamespace as _NS
+                register_closing_watch(_NS(event=tr_vb.event, sport=tr_vb.sport, commence=tr_vb.commence_time))
+            # D2: notify user only after everything is committed
+            try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
+            except Exception: pass
+            for cid in ALL_CHAT_IDS:
+                try:
+                    await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
+                except Exception as e:
+                    log.error(f"[VB] confirm msg error: {e}")
         finally:
-          with _data_lock:
-            _processing.discard(sid)
+            with _data_lock:
+                _processing.discard(sid)  # C2: always release claim
         return
 
     # ── Arb confirm/reject ────────────────────────────────────────
-    # B2: atomic claim check
+    # C1: claim FIRST (both confirm and reject), then read entry under same lock
+    # This closes the race where reject completes between read and claim.
     with _data_lock:
-        if action == "confirm" and sid in _processing:
+        if sid in _processing:
             try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
             except Exception: pass
             return
-        entry = pending.get(sid)
-    if not entry:
+        _processing.add(sid)  # C1: atomic claim before any read
+        entry = pending.get(sid)  # C1: read AFTER claim, under same lock
+    try:
+     if not entry:
+        with _data_lock: _processing.discard(sid)
         try: await query.edit_message_text(orig+"\n\n⚠️ หมดอายุ")
         except Exception: pass
         return
-    opp, sig_ts = entry
-    if time.time() - sig_ts > SIGNAL_TTL:
+     opp, sig_ts = entry
+     if time.time() - sig_ts > SIGNAL_TTL:
         with _data_lock:
             pending.pop(sid, None)
+        with _data_lock: _processing.discard(sid)
         try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
+    except Exception:
+        with _data_lock: _processing.discard(sid)
+        raise
     if action == "reject":
-        # R1: claim _processing — mutual exclusion with confirm
-        with _data_lock:
-            if sid in _processing:
-                try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
-                except Exception: pass
-                return
-            _processing.add(sid)
+        # C1: _processing already claimed above for both confirm and reject
         try:
             _is_3w = opp.leg3 is not None and opp.stake3 is not None
             tr_rej = TradeRecord(
@@ -3299,17 +3291,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception: pass  # C8
         finally:
             with _data_lock:
-                _processing.discard(sid)  # R1: always release claim
+                _processing.discard(sid)  # C1: always release claim
         return
 
-    # action == "confirm"
-    # B2r: claim BEFORE any await — close the race window completely
-    with _data_lock:
-        if sid in _processing:
-            try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
-            except Exception: pass
-            return
-        _processing.add(sid)  # B2r: atomic claim before first await
+    # action == "confirm" — _processing already claimed above
     try:
         try: await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
         except Exception: pass
@@ -3349,7 +3334,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
     finally:
         with _data_lock:
-            _processing.discard(sid)  # B2r: always release claim
+            _processing.discard(sid)  # C1: always release claim
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
