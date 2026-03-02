@@ -4329,6 +4329,7 @@ async def settle_completed_trades():
 
 def periodic_cleanup():
     """ทำความสะอาด memory — เรียกทุกรอบ scan เพื่อป้องกัน leak ใน 24/7"""
+    global _settle_alerted, _manual_review_alerted  # Fix: ต้องประกาศ global ก่อนใช้ -= (set difference)
     now = datetime.now(timezone.utc)
     with _data_lock:
         # trim trade_records ใน memory (DB ยังเก็บทั้งหมด)
