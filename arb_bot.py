@@ -3239,19 +3239,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _processing.add(sid)  # C1: atomic claim before any read
         entry = pending.get(sid)  # C1: read AFTER claim, under same lock
     try:
-     if not entry:
-        with _data_lock: _processing.discard(sid)
-        try: await query.edit_message_text(orig+"\n\n⚠️ หมดอายุ")
-        except Exception: pass
-        return
-     opp, sig_ts = entry
-     if time.time() - sig_ts > SIGNAL_TTL:
-        with _data_lock:
-            pending.pop(sid, None)
-        with _data_lock: _processing.discard(sid)
-        try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
-        except Exception: pass
-        return
+        if not entry:
+            with _data_lock: _processing.discard(sid)
+            try: await query.edit_message_text(orig+"\n\n⚠️ หมดอายุ")
+            except Exception: pass
+            return
+        opp, sig_ts = entry
+        if time.time() - sig_ts > SIGNAL_TTL:
+            with _data_lock:
+                pending.pop(sid, None)
+            with _data_lock: _processing.discard(sid)
+            try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
+            except Exception: pass
+            return
     except Exception:
         with _data_lock: _processing.discard(sid)
         raise
@@ -4218,6 +4218,24 @@ async def _commit_settlement(trade: "TradeRecord", actual_profit: int) -> "Trade
     return saved
 
 
+async def _commit_manual_review(trade: "TradeRecord", commence_dt: "datetime") -> "TradeRecord":
+    """M1: save-before-mutate for MANUAL_REVIEW escalation.
+    Creates a new TradeRecord via replace(), saves to DB first,
+    then atomically moves from _pending_settlement → _manual_review_pending.
+    Raises on DB failure — original trade object is NEVER mutated.
+    """
+    saved = replace(trade, needs_manual_review=True)
+    await _async_save_trade(saved)  # raises RuntimeError on failure — nothing mutated yet
+    with _data_lock:
+        for idx, rec in enumerate(trade_records):
+            if rec.signal_id == saved.signal_id:
+                trade_records[idx] = saved
+                break
+        _pending_settlement.pop(saved.signal_id, None)
+        _manual_review_pending[saved.signal_id] = (saved, commence_dt)
+    return saved
+
+
 async def settle_completed_trades():
     """
     Loop ตรวจสอบผลการแข่งขัน ทุก 5 นาที
@@ -4287,26 +4305,32 @@ async def settle_completed_trades():
                         break
 
                 if not matched_event:
-                    # H2: zombie deadman — if trade has no API match after 72h past commence, alert once and remove
+                    # H2/M2: zombie deadman — no API match after 72h → escalate to manual review (don't drop)
                     try:
                         _ct_zombie = parse_commence(trade.commence_time or "")
                         _zombie_elapsed = (datetime.now(timezone.utc) - _ct_zombie).total_seconds()
                         if _zombie_elapsed > 72 * 3600 and signal_id not in _manual_review_alerted:
+                            log.warning(f"[Settle] {trade.event} — no API match after 72h, escalating to manual review")
+                            # M2: move to _manual_review_pending instead of silently dropping
+                            try:
+                                await _commit_manual_review(trade, _cdt)
+                            except Exception as _z_err:
+                                log.error(f"[Settle] zombie _commit_manual_review failed for {signal_id}: {_z_err}")
+                                continue  # retry next cycle
                             _manual_review_alerted.add(signal_id)
-                            log.warning(f"[Settle] {trade.event} — no API match after 72h, marking MANUAL_REVIEW")
+                            settled_ids.append(signal_id)  # remove from auto-settle loop
                             if _app:
                                 asyncio.get_running_loop().create_task(
                                     _app.bot.send_message(
                                         chat_id=CHAT_ID,
                                         text=(
                                             f"⚠️ *Zombie Trade* `{md_escape(trade.event)}`\n"
-                                            f"ไม่พบ event ใน API หลัง 72h — settle ด้วยตนเอง:\n"
+                                            f"ไม่พบ event ใน API หลัง 72h — ย้ายไป Manual Review\n"
                                             + _settle_hint(trade)
                                         ),
                                         parse_mode="Markdown"
                                     )
                                 )
-                            settled_ids.append(signal_id)  # remove from pending loop
                     except Exception:
                         pass
                     continue
@@ -4315,7 +4339,29 @@ async def settle_completed_trades():
                     try:
                         ct = parse_commence(matched_event.get("commence_time",""))
                         _elapsed = (datetime.now(timezone.utc) - ct).total_seconds()
-                        if 6 * 3600 < _elapsed < 72 * 3600:  # Issue36: alert 6h–72h only; after 72h = postponed → manual
+                        if _elapsed >= 72 * 3600:  # M3: >72h and still not completed → escalate to manual review
+                            if signal_id not in _manual_review_alerted:
+                                log.warning(f"[Settle] {trade.event} — matched but not completed after 72h, escalating")
+                                try:
+                                    await _commit_manual_review(trade, _cdt)
+                                except Exception as _p_err:
+                                    log.error(f"[Settle] postponed _commit_manual_review failed for {signal_id}: {_p_err}")
+                                    continue
+                                _manual_review_alerted.add(signal_id)
+                                settled_ids.append(signal_id)
+                                if _app:
+                                    asyncio.get_running_loop().create_task(
+                                        _app.bot.send_message(
+                                            chat_id=CHAT_ID,
+                                            text=(
+                                                f"⏰ *Postponed (72h)* `{md_escape(trade.event)}`\n"
+                                                f"ยังไม่ completed หลัง 72h — ย้ายไป Manual Review\n"
+                                                + _settle_hint(trade)
+                                            ),
+                                            parse_mode="Markdown"
+                                        )
+                                    )
+                        elif 6 * 3600 < _elapsed < 72 * 3600:
                             log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
                             # B6: แจ้งครั้งเดียว — ไม่ spam ทุกรอบ
                             if _app and signal_id not in _settle_alerted:
@@ -4373,22 +4419,23 @@ async def settle_completed_trades():
 
                 if winner == "MANUAL_REVIEW":
                     log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
-                    # K3/M2: set flag + save to DB so it survives restart
-                    trade.needs_manual_review = True
-                    await _async_save_trade(trade)  # B5: await critical write
-                    with _data_lock:
-                        _manual_review_pending[signal_id] = _pending_settlement.pop(signal_id, (trade, _cdt))
-                    settled_ids.append(signal_id)  # mark as removed from pending loop
+                    # M1: use _commit_manual_review() — save-before-mutate, no split-brain on DB fail
+                    try:
+                        saved_mr = await _commit_manual_review(trade, _cdt)
+                    except Exception as _mr_err:
+                        log.error(f"[Settle] _commit_manual_review failed for {signal_id}: {_mr_err}")
+                        continue  # retry next cycle
+                    settled_ids.append(signal_id)  # mark as removed from auto-settle loop
                     # D5: แจ้งครั้งเดียว — ไม่ spam ทุก 5 นาที
                     if _app and signal_id not in _manual_review_alerted:
                         _manual_review_alerted.add(signal_id)
                         for cid in ALL_CHAT_IDS:
                             try:
                                 await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                    text=f"⚠️ *Manual Review Required*\n`{md_escape(trade.event)}`\n"
-                                         f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(trade.sport)})\n"
+                                    text=f"⚠️ *Manual Review Required*\n`{md_escape(saved_mr.event)}`\n"
+                                         f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(saved_mr.sport)})\n"
                                          f"กรุณาตรวจสอบผลเองใน Dashboard\n"
-                                         + _settle_hint(trade))
+                                         + _settle_hint(saved_mr))
                             except Exception: pass
                     continue
 
