@@ -30,7 +30,7 @@ HAS_TURSO = True  # จะ check จริงตอน turso_init
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -3749,36 +3749,25 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 actual = 0
         else:  # void
             actual = 0
-        t.actual_profit_thb = actual
-        t.settled_at = datetime.now(timezone.utc).isoformat()
-        t.status = "confirmed"
-        # C2: save FIRST — only pop queue after DB commit succeeds
+        # S3: use _commit_settlement() — save-before-mutate, no rollback needed
         try:
-            await _async_save_trade(t)  # raises RuntimeError if DB write fails
+            saved_t = await _commit_settlement(t, actual)
         except Exception as _save_err:
             log.error(f"[Settle] DB save failed for {sid}: {_save_err}")
-            t.actual_profit_thb = None
-            t.settled_at = None
             await update.message.reply_text(
                 f"🚨 *DB write failed* — settle ยังไม่ได้บันทึก (`{sid}`)",
                 parse_mode="Markdown"
             )
             return
-        # C2: DB committed — now pop atomically
+        # S3: DB committed — now pop queues atomically
         with _data_lock:
             _pending_settlement.pop(sid, None)
             _manual_review_pending.pop(sid, None)
-        # C7: update trade_records in-memory เพื่อให้ /pnl เห็นผล settle ทันที
-        with _data_lock:
-            for idx, rec in enumerate(trade_records):
-                if rec.signal_id == t.signal_id:
-                    trade_records[idx] = t
-                    break
         emoji = "✅" if actual >= 0 else "❌"
         await update.message.reply_text(
-            f"{emoji} *Manual Settle*\n`{t.event}`\n"
+            f"{emoji} *Manual Settle*\n`{saved_t.event}`\n"
             f"ผล: *{result.upper()}* | P&L: *฿{actual:+,}*\n"
-            f"(settled_at: {t.settled_at[:16]})",
+            f"(settled_at: {saved_t.settled_at[:16]})",
             parse_mode="Markdown",
         )
     finally:
@@ -4201,6 +4190,34 @@ def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     return int(payout - total_staked)
 
 
+async def _commit_settlement(trade: "TradeRecord", actual_profit: int) -> "TradeRecord":
+    """S1: save-before-mutate helper for all settle paths.
+    Creates a new TradeRecord via replace(), saves to DB first,
+    then atomically swaps into trade_records + pending queues.
+    Raises on DB failure — original trade object is NEVER mutated.
+    """
+    saved = replace(
+        trade,
+        actual_profit_thb=actual_profit,
+        settled_at=datetime.now(timezone.utc).isoformat(),
+        status="confirmed",
+        needs_manual_review=False,
+    )
+    await _async_save_trade(saved)  # raises RuntimeError on failure — nothing mutated yet
+    with _data_lock:
+        for idx, rec in enumerate(trade_records):
+            if rec.signal_id == saved.signal_id:
+                trade_records[idx] = saved
+                break
+        if saved.signal_id in _pending_settlement:
+            _old_dt = _pending_settlement[saved.signal_id][1]
+            _pending_settlement[saved.signal_id] = (saved, _old_dt)
+        if saved.signal_id in _manual_review_pending:
+            _old_dt = _manual_review_pending[saved.signal_id][1]
+            _manual_review_pending[saved.signal_id] = (saved, _old_dt)
+    return saved
+
+
 async def settle_completed_trades():
     """
     Loop ตรวจสอบผลการแข่งขัน ทุก 5 นาที
@@ -4344,18 +4361,11 @@ async def settle_completed_trades():
                         actual_draw = 0
                         draw_label = "P&L: *฿0* (refund)"
                         log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
-                    trade.actual_profit_thb = actual_draw
-                    trade.settled_at = datetime.now(timezone.utc).isoformat()
-                    await _async_save_trade(trade)  # B5: await critical write
-                    with _data_lock:
-                        for idx, rec in enumerate(trade_records):
-                            if rec.signal_id == trade.signal_id:
-                                trade_records[idx] = trade
-                                break
+                    saved_draw = await _commit_settlement(trade, actual_draw)  # S1: save-before-mutate
                     for cid in ALL_CHAT_IDS:
                         try:
                             await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                text=f"🤝 *DRAW — {draw_label}*\n`{trade.event}`\n"
+                                text=f"🤝 *DRAW — {draw_label}*\n`{saved_draw.event}`\n"
                                      f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเป่า")
                         except Exception: pass
                     settled_ids.append(signal_id)
@@ -4400,25 +4410,17 @@ async def settle_completed_trades():
                     emoji_result  = "✅" if actual_profit >= 0 else "❌"
                     sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
 
-                    # อัพเดท trade record + in-memory
-                    trade.actual_profit_thb = actual_profit
-                    trade.settled_at        = datetime.now(timezone.utc).isoformat()
-                    await _async_save_trade(trade)  # B5: await critical write
-                    with _data_lock:
-                        for idx, rec in enumerate(trade_records):
-                            if rec.signal_id == trade.signal_id:
-                                trade_records[idx] = trade
-                                break
+                    saved_trade = await _commit_settlement(trade, actual_profit)  # S1: save-before-mutate
                     settled_ids.append(signal_id)
                     # E7: เคลียร signal ออกจาก alert sets หลัง settle เสร็จ
                     _settle_alerted.discard(signal_id)
                     _manual_review_alerted.discard(signal_id)
 
-                    log.info(f"[Settle] {trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
+                    log.info(f"[Settle] {saved_trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
 
                     # แจ้ง Telegram
                     msg = (
-                        f"{sport_emoji} *SETTLED* \u2014 {md_escape(trade.event)}\n"
+                        f"{sport_emoji} *SETTLED* \u2014 {md_escape(saved_trade.event)}\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\U0001f3c6 \u0e1c\u0e39\u0e49\u0e0a\u0e19\u0e30 : *{md_escape(winner)}*\n"
                         f"\U0001f4b5 \u0e27\u0e32\u0e07\u0e44\u0e1b  : \u0e3f{total_staked:,}\n"
@@ -4526,7 +4528,10 @@ async def scanner_loop():
         expired = []
         with _data_lock:
             pending_snapshot = list(pending.items())
+            processing_snapshot = set(_processing)  # S2: snapshot to skip active confirms
         for _sid, (_opp, _ts) in pending_snapshot:
+            if _sid in processing_snapshot:  # S2: never evict a signal being confirmed
+                continue
             if _now_ts - _ts > _ttl:
                 expired.append(_sid)
                 continue
@@ -4952,29 +4957,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         actual = 0
                 else:  # void
                     actual = 0
-                t.actual_profit_thb = actual
-                t.settled_at = datetime.now(timezone.utc).isoformat()
-                t.status = "confirmed"
-                # C2: save FIRST — block HTTP thread until DB commits
+                # S3: use _commit_settlement() — save-before-mutate via run_coroutine_threadsafe
                 try:
                     if _main_loop and not _main_loop.is_closed():
-                        asyncio.run_coroutine_threadsafe(_async_save_trade(t), _main_loop).result(timeout=10)
+                        saved_t = asyncio.run_coroutine_threadsafe(
+                            _commit_settlement(t, actual), _main_loop
+                        ).result(timeout=10)
                     else:
                         raise RuntimeError("main loop unavailable")
                 except Exception as _save_err:
-                    t.actual_profit_thb = None
-                    t.settled_at = None
                     raise ValueError(f"DB write failed — settle not committed: {_save_err}") from _save_err
-                # C2: DB committed — now pop atomically
+                # S3: DB committed — now pop queues atomically
                 with _data_lock:
                     _pending_settlement.pop(sid, None)
                     _manual_review_pending.pop(sid, None)
-                # A3: update in-memory trade_records
-                with _data_lock:
-                    for idx, rec in enumerate(trade_records):
-                        if rec.signal_id == t.signal_id:
-                            trade_records[idx] = t
-                            break
                 resp = json.dumps({"ok": True, "msg": f"Settled {result.upper()} | P&L: {actual:+,}", "actual": actual}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type","application/json")
