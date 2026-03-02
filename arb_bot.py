@@ -3450,6 +3450,92 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """D6: /debug — ตรวจสอบว่า scan ทำงานได้จริงไหม — fetch 1 sport แล้วรายงาน"""
+    if not await require_owner(update): return
+    await update.message.reply_text("🔍 กำลังตรวจสอบ... รอสักครู่", parse_mode="Markdown")
+    lines = []
+    lines.append(f"*🔬 Debug Report*")
+    lines.append(f"━━━━━━━━━━━━━━━━━━")
+    lines.append(f"API Key  : `...{ODDS_API_KEY[-6:] if ODDS_API_KEY else 'NOT SET'}`")
+    lines.append(f"Credits  : `{api_remaining}`")
+    lines.append(f"Sports   : `{', '.join(SPORTS)}`")
+    lines.append(f"Books    : `{BOOKMAKERS}`")
+    lines.append(f"MinProfit: `{float(MIN_PROFIT_PCT):.2%}`")
+    lines.append(f"Interval : `{SCAN_INTERVAL}s`")
+    lines.append(f"AutoScan : `{auto_scan}`")
+    lines.append(f"Scans    : `{scan_count}`")
+    lines.append(f"")
+
+    # fetch 1 sport เพื่อทดสอบ API + bookmaker
+    test_sport = SPORTS[0] if SPORTS else "basketball_nba"
+    try:
+        import aiohttp as _aio
+        async with _aio.ClientSession() as _sess:
+            url = f"https://api.the-odds-api.com/v4/sports/{test_sport}/odds"
+            params = {
+                "apiKey": ODDS_API_KEY, "regions": "eu,uk,au",
+                "markets": "h2h", "oddsFormat": "decimal",
+                "bookmakers": BOOKMAKERS,
+            }
+            async with _sess.get(url, params=params, timeout=_aio.ClientTimeout(total=15)) as r:
+                rem = r.headers.get("x-requests-remaining", "?")
+                data = await r.json(content_type=None)
+                if r.status != 200:
+                    lines.append(f"❌ API Error `{r.status}`: `{data.get('message','?')}`")
+                elif isinstance(data, list):
+                    lines.append(f"✅ `{test_sport}`")
+                    lines.append(f"   Events   : *{len(data)}*")
+                    lines.append(f"   Credits after: `{rem}`")
+                    # collect bookmakers seen
+                    bm_seen: set = set()
+                    for ev in data:
+                        for bm in ev.get("bookmakers", []):
+                            bm_seen.add(bm["key"])
+                    lines.append(f"   BMs found: `{', '.join(sorted(bm_seen)) if bm_seen else 'NONE'}`")
+                    if not bm_seen:
+                        lines.append(f"   ⚠️ ไม่เจอ bookmakers เลย — ตรวจสอบ BOOKMAKERS env")
+                    # check arb quickly
+                    from decimal import Decimal as _D
+                    bm_list = [b.strip() for b in BOOKMAKERS.split(",")]
+                    arb_ct = 0
+                    for ev in data:
+                        bms = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
+                        found_bms = [b for b in bm_list if b in bms]
+                        if len(found_bms) < 2:
+                            continue
+                        for bm_a in found_bms:
+                            for bm_b in found_bms:
+                                if bm_a >= bm_b: continue
+                                for mk_a in bms[bm_a].get("markets", []):
+                                    for oc_a in mk_a.get("outcomes", []):
+                                        for mk_b in bms[bm_b].get("markets", []):
+                                            for oc_b in mk_b.get("outcomes", []):
+                                                if oc_a.get("name") != oc_b.get("name"):
+                                                    oa = _D(str(oc_a.get("price", 1)))
+                                                    ob = _D(str(oc_b.get("price", 1)))
+                                                    if oa > 1 and ob > 1:
+                                                        margin = _D("1")/oa + _D("1")/ob
+                                                        if margin < 1:
+                                                            arb_ct += 1
+                    lines.append(f"   Arb opps : *{arb_ct}* (threshold {float(MIN_PROFIT_PCT):.2%})")
+                    if arb_ct == 0 and len(data) > 0:
+                        lines.append(f"   ℹ️ มี events แต่ยังไม่มี arb — market efficient หรือ odds ใกล้กันเกินไป")
+                    if len(data) == 0:
+                        lines.append(f"   ⚠️ sport key `{test_sport}` อาจไม่ถูกต้องหรือไม่มีแมตช์ในขณะนี้")
+    except Exception as e:
+        lines.append(f"❌ fetch error: `{e}`")
+
+    # webhook warning
+    wh = os.getenv("WEBHOOK_URL", "")
+    if wh and "railway.app" in wh:
+        lines.append(f"")
+        lines.append(f"⚠️ WEBHOOK\\_URL=`{wh[:40]}...`")
+        lines.append(f"   ถ้า domain ผิด Telegram ส่ง update ไม่ถึงบอท")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """v10-11: /trades — แสดง trade list รายละเอียด 10 รายการล่าสุด"""
     if not await require_owner(update): return  # C3
@@ -5168,6 +5254,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("lines",  cmd_lines))
     app.add_handler(CommandHandler("trades", cmd_trades))   # v10-11
     app.add_handler(CommandHandler("settle", cmd_settle))   # v10-10
+    app.add_handler(CommandHandler("debug",  cmd_debug))    # D6
     _app = app
 
     # Railway/Render: ใช้ polling เสมอ (single-port compatible)
