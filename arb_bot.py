@@ -22,7 +22,7 @@
 """
 
 import asyncio, json, logging, os, random, re, signal, sqlite3, threading, time, uuid  # re already imported at top (Q6)
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 # v10-6: ใช้ Turso HTTP REST API ตรงๆ — ไม่พึ่ง libsql_client
 _TURSO_API = "http"  # always http mode
 _libsql_mod = None
@@ -4645,11 +4645,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return False
-        # C6: Bearer header
+        # C6: Bearer header หรือ ?token= query param
         auth = self.headers.get("Authorization", "")
         if auth == f"Bearer {DASHBOARD_TOKEN}":
             return True
-            # P2: Bearer-only — ?token= ถูกปิดเพื่อกัน token ละหลายใน browser history / logs
+        # J7: รองรับ ?token= ด้วย — สะดวกเปิดจาก browser โดยตรง
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if qs.get("token", [""])[0] == DASHBOARD_TOKEN:
+            return True
         self.send_response(401)
         body = b'{"error":"unauthorized"}'
         self.send_header("Content-Type", "application/json")
