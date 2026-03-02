@@ -2964,13 +2964,16 @@ async def execute_both(opp: ArbOpportunity) -> str:
         leg3_odds=_save_od3,
         stake3_thb=int(s3) if is_3way else None,
     )
-    # D1: save FIRST — append memory + side-effects only after DB commit succeeds
+    # D1/D4: save FIRST — critical write; then mutate memory + register; opp_log is display-only best-effort
     await _async_save_trade(tr)   # raises RuntimeError if DB write fails
-    await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("confirmed", opp.signal_id))
     with _data_lock:
         trade_records.append(tr)  # D1: only after confirmed DB write
     register_for_settlement(tr, opp.commence)  # auto settle
     register_closing_watch(opp)               # CLV watch
+    try:  # D4: best-effort — opp_log is display concern, not critical
+        await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("confirmed", opp.signal_id))
+    except Exception as _oe:
+        log.warning(f"[execute_both] opp_log update failed (non-critical): {_oe}")
 
     sp = sport_to_path(opp.sport)
     # E3: steps() รับ display_odds เพื่อโชว์ live odds แทน odds_raw
@@ -3253,14 +3256,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             leg3_odds=float(opp.leg3.odds_raw) if _is_3w else None,
             stake3_thb=int(opp.stake3*USD_TO_THB) if _is_3w else None,
         )
+        # D5: save BEFORE append to prevent RAM/DB split-brain on reject
+        await _async_save_trade(tr_rej)  # raises RuntimeError if DB write fails
         with _data_lock:
-            trade_records.append(tr_rej)
-        await _async_save_trade(tr_rej)  # B1: await critical write
-        with _data_lock:  # D1: update opp_log to rejected
+            trade_records.append(tr_rej)  # D5: only after confirmed DB write
+        # best-effort opp_log update — display concern only
+        with _data_lock:
             for _e in opportunity_log:
                 if _e["id"] == sid:
                     _e["status"] = "rejected"; break
-        await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("rejected", sid))  # B1: await
+        try:
+            await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("rejected", sid))
+        except Exception as _oe:
+            log.warning(f"[Reject] opp_log update failed (non-critical): {_oe}")
         try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         except Exception: pass  # C8
         return
