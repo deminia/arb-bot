@@ -576,8 +576,14 @@ def db_save_trade(t: "TradeRecord"):
     _schedule_coro(_async_save_trade(t))
 
 async def _async_save_trade(t: "TradeRecord"):
+    # D7: named columns — immune to schema drift / migration order changes
     await turso_exec(
-        "INSERT OR REPLACE INTO trade_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        """INSERT OR REPLACE INTO trade_records
+           (signal_id,event,sport,leg1_bm,leg2_bm,leg1_team,leg2_team,
+            leg1_odds,leg2_odds,stake1_thb,stake2_thb,profit_pct,status,
+            clv_leg1,clv_leg2,actual_profit_thb,settled_at,created_at,
+            commence_time,leg3_bm,leg3_team,leg3_odds,stake3_thb,needs_manual_review)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (t.signal_id,t.event,t.sport,t.leg1_bm,t.leg2_bm,
          t.leg1_team,t.leg2_team,
          t.leg1_odds,t.leg2_odds,t.stake1_thb,t.stake2_thb,
@@ -585,7 +591,7 @@ async def _async_save_trade(t: "TradeRecord"):
          t.actual_profit_thb,t.settled_at,t.created_at,
          t.commence_time,
          t.leg3_bm,t.leg3_team,t.leg3_odds,t.stake3_thb,
-         int(t.needs_manual_review))  # M2: col 23
+         int(t.needs_manual_review))
     )
 
 def db_save_opportunity(opp: dict):
@@ -3240,8 +3246,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
         return
     if action == "reject":  # D1: set rejected immediately
-        with _data_lock:
-            pending.pop(sid, None)
         _is_3w = opp.leg3 is not None and opp.stake3 is not None
         tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
@@ -3256,10 +3260,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             leg3_odds=float(opp.leg3.odds_raw) if _is_3w else None,
             stake3_thb=int(opp.stake3*USD_TO_THB) if _is_3w else None,
         )
-        # D5: save BEFORE append to prevent RAM/DB split-brain on reject
+        # D6: save FIRST — signal stays in pending until DB commits
         await _async_save_trade(tr_rej)  # raises RuntimeError if DB write fails
+        # D6: DB committed — now safe to mutate state
         with _data_lock:
-            trade_records.append(tr_rej)  # D5: only after confirmed DB write
+            trade_records.append(tr_rej)  # only after confirmed DB write
+            pending.pop(sid, None)         # D6: pop AFTER save succeeds
         # best-effort opp_log update — display concern only
         with _data_lock:
             for _e in opportunity_log:
