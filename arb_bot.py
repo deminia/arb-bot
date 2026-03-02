@@ -460,10 +460,9 @@ async def turso_init():
 async def turso_exec(sql: str, params: tuple = ()):
     """Execute write query (Turso HTTP หรือ SQLite fallback)"""
     global auto_scan, _db_write_halted, _turso_ok
-    # Fix 1: early bail if writes are halted
+    # C1: early bail if writes are halted — raise so callers know
     if _db_write_halted:
-        log.error("[DB] writes halted — skipping")
-        return
+        raise RuntimeError("[DB] writes halted — skipping (safe-mode)")
     if _turso_ok:
         for attempt in range(3):
             try:
@@ -483,7 +482,6 @@ async def turso_exec(sql: str, params: tuple = ()):
                     await asyncio.sleep(1.5 ** attempt)
                 else:
                     log.error(f"[DB] turso_exec failed 3x: {e!r} — halting writes")
-                    # Fix 2: Turso ล่ม 3 ครั้ง → หยุด auto_scan + return ทันที ไม่เขียน SQLite
                     auto_scan = False
                     if _app:
                         try:
@@ -497,8 +495,9 @@ async def turso_exec(sql: str, params: tuple = ()):
                         except Exception:
                             pass
                     _db_write_halted = True
-                    _turso_ok = False  # Fix 1: prevent re-entry into Turso block
-                    return  # ไม่ fallback ไป SQLite — ป้องกัน split-brain
+                    _turso_ok = False
+                    # C1: raise so every caller knows the write failed — ห้าม silent return
+                    raise RuntimeError(f"[DB] turso write failed 3x: {e!r}") from e
     # SQLite-only mode (ใช้เฉพาะตอน Turso init fail ตั้งแต่แรก หรือไม่ได้ตั้ง Turso)
     if not _turso_ok and not _db_write_halted:
         try:
@@ -3174,13 +3173,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"_(ยืนยันแล้ว — วางด้วยมือ)_"
         )
-        # B2: atomic claim — mark processing before any side-effect
+        # C3: atomic claim BEFORE first await — close VB race window
         with _data_lock:
             if sid in _processing:
                 try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
                 except Exception: pass
                 return
-            _processing.add(sid)
+            _processing.add(sid)  # C3: claim here, before any await
         try:
           # K4: pop เมื่อ confirm สำเร็จแล้ว
           with _data_lock:
@@ -3680,25 +3679,15 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚨 *DB write halted* \u2014 ระบบ safe\u002dmode ไม่รับ /settle", parse_mode="Markdown")
         return
 
-    # B4: atomic settle — peek+validate+pop inside single lock
+    # C2: peek+validate WITHOUT pop first — save must succeed before queue removal
     with _data_lock:
         entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
-        if not entry:
-            pass  # handled below
-        elif entry[0].status != "confirmed":
-            pass  # handled below
-        elif entry[0].actual_profit_thb is not None or entry[0].settled_at is not None:
-            pass  # handled below
-        else:
-            # validation passed — pop atomically inside same lock
-            _pending_settlement.pop(sid, None)
-            _manual_review_pending.pop(sid, None)
 
     if not entry:
         await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
         return
 
-    t, _ = entry
+    t, _cdt_settle = entry
     # J2: guard status — only confirmed trades can be settled
     if t.status != "confirmed":
         await update.message.reply_text(
@@ -3722,8 +3711,6 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payout = int(t.leg2_odds * t.stake2_thb)
         actual = payout - tt
     elif result == "draw":
-        # 3-way: leg3 = Draw leg (bookmaker=draw bm, outcome="Draw")
-        # fallback: leg1 or leg2 ถ้าชื่อ == "draw"
         if t.leg3_team and t.leg3_team.lower() == "draw" and t.leg3_odds and t.stake3_thb:
             payout = int(t.leg3_odds * t.stake3_thb)
             actual = payout - tt
@@ -3734,20 +3721,36 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payout = int(t.leg2_odds * t.stake2_thb)
             actual = payout - tt
         else:
-            actual = 0  # 2-way sport: refund
+            actual = 0
     else:  # void
         actual = 0
 
     t.actual_profit_thb = actual
     t.settled_at = datetime.now(timezone.utc).isoformat()
     t.status = "confirmed"
+    # C2: save FIRST — only pop queue after DB commit succeeds
+    try:
+        await _async_save_trade(t)  # raises RuntimeError if DB write fails
+    except Exception as _save_err:
+        log.error(f"[Settle] DB save failed for {sid}: {_save_err}")
+        # rollback in-memory mutation
+        t.actual_profit_thb = None
+        t.settled_at = None
+        await update.message.reply_text(
+            f"🚨 *DB write failed* — settle ยังไม่ได้บันทึก (`{sid}`)",
+            parse_mode="Markdown"
+        )
+        return
+    # C2: DB committed — now pop atomically
+    with _data_lock:
+        _pending_settlement.pop(sid, None)
+        _manual_review_pending.pop(sid, None)
     # C7: update trade_records in-memory ด้วย เพื่อให้ /pnl เห็นผล settle ทันที
     with _data_lock:
         for idx, rec in enumerate(trade_records):
             if rec.signal_id == t.signal_id:
                 trade_records[idx] = t
                 break
-    await _async_save_trade(t)  # B1: await critical write
 
     emoji = "✅" if actual >= 0 else "❌"
     await update.message.reply_text(
@@ -4877,26 +4880,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = body.get("result", "").strip().lower()  # leg1|leg2|draw|void
                 if not sid or result not in ("leg1","leg2","draw","void"):
                     raise ValueError("signal_id and result (leg1/leg2/draw/void) required")
-                # B4: atomic settle — peek+validate+pop inside single lock
+                # C2: peek+validate WITHOUT pop — save must succeed before queue removal
                 with _data_lock:
                     entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
                     if not entry:
                         raise ValueError(f"signal_id '{sid}' not found in pending settlement")
-                    t, _ = entry
+                    t, _cdt_api = entry
                     if t.status != "confirmed":
                         raise ValueError(f"Trade {sid} status='{t.status}' — only confirmed trades can be settled")
                     if t.actual_profit_thb is not None or t.settled_at is not None:
                         raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
-                    # B4: validation passed — pop atomically inside same lock
-                    _pending_settlement.pop(sid, None)
-                    _manual_review_pending.pop(sid, None)
                 tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
                 if result == "leg1":
                     actual = int(t.leg1_odds * t.stake1_thb) - tt
                 elif result == "leg2":
                     actual = int(t.leg2_odds * t.stake2_thb) - tt
                 elif result == "draw":
-                    # 3-way: leg3 = Draw; fallback leg1/leg2
                     if t.leg3_team and t.leg3_team.lower() == "draw" and t.leg3_odds and t.stake3_thb:
                         actual = int(t.leg3_odds * t.stake3_thb) - tt
                     elif t.leg1_team and t.leg1_team.lower() == "draw":
@@ -4910,11 +4909,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 t.actual_profit_thb = actual
                 t.settled_at = datetime.now(timezone.utc).isoformat()
                 t.status = "confirmed"
-                # B1: block until DB write completes — HTTP thread must wait for commit
-                if _main_loop and not _main_loop.is_closed():
-                    asyncio.run_coroutine_threadsafe(_async_save_trade(t), _main_loop).result(timeout=10)
-                else:
-                    db_save_trade(t)  # fallback fire-and-forget if loop unavailable
+                # C2: save FIRST — block HTTP thread until DB commits
+                try:
+                    if _main_loop and not _main_loop.is_closed():
+                        asyncio.run_coroutine_threadsafe(_async_save_trade(t), _main_loop).result(timeout=10)
+                    else:
+                        raise RuntimeError("main loop unavailable")
+                except Exception as _save_err:
+                    # rollback in-memory mutation before re-raising
+                    t.actual_profit_thb = None
+                    t.settled_at = None
+                    raise ValueError(f"DB write failed — settle not committed: {_save_err}") from _save_err
+                # C2: DB committed — now pop atomically
+                with _data_lock:
+                    _pending_settlement.pop(sid, None)
+                    _manual_review_pending.pop(sid, None)
                 # A3: update in-memory trade_records
                 with _data_lock:
                     for idx, rec in enumerate(trade_records):
