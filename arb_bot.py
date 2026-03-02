@@ -506,11 +506,12 @@ async def turso_exec(sql: str, params: tuple = ()):
                 con.commit()
         except sqlite3.OperationalError as e:
             if "duplicate column" in str(e) or "already exists" in str(e):
-                pass
-            else:
-                log.error(f"[DB] sqlite_exec: {e}")
+                return  # benign migration — not an error
+            log.error(f"[DB] sqlite_exec: {e}")
+            raise RuntimeError(f"[DB] sqlite write failed: {e}") from e  # D3: fail-loud
         except Exception as e:
             log.error(f"[DB] sqlite_exec: {e}")
+            raise RuntimeError(f"[DB] sqlite write failed: {e}") from e  # D3: fail-loud
 
 async def turso_query(sql: str, params: tuple = ()) -> list:
     """Execute read query (Turso HTTP หรือ SQLite fallback)"""
@@ -2963,13 +2964,13 @@ async def execute_both(opp: ArbOpportunity) -> str:
         leg3_odds=_save_od3,
         stake3_thb=int(s3) if is_3way else None,
     )
+    # D1: save FIRST — append memory + side-effects only after DB commit succeeds
+    await _async_save_trade(tr)   # raises RuntimeError if DB write fails
+    await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("confirmed", opp.signal_id))
     with _data_lock:
-        trade_records.append(tr)
-    await _async_save_trade(tr)   # B1: await critical write — ห้าม fire-and-forget
+        trade_records.append(tr)  # D1: only after confirmed DB write
     register_for_settlement(tr, opp.commence)  # auto settle
-    register_closing_watch(opp)               # #39 CLV watch ตอนเจอ opp ใหม่
-    # D1: opportunity_log update ทำใน button_handler หลัง execute สำเร็จ (ไม่ทำซ้ำที่นี่)
-    await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("confirmed", opp.signal_id))  # B1: await
+    register_closing_watch(opp)               # CLV watch
 
     sp = sport_to_path(opp.sport)
     # E3: steps() รับ display_odds เพื่อโชว์ live odds แทน odds_raw
@@ -3184,17 +3185,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             _processing.add(sid)  # C3: claim here, before any await
         try:
-          # K4: pop เมื่อ confirm สำเร็จแล้ว
-          with _data_lock:
-            _pending_vb.pop(sid, None)
-          try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
-          except Exception: pass
-          for cid in ALL_CHAT_IDS:
-            try:
-                await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
-            except Exception as e:
-                log.error(f"[VB] confirm msg error: {e}")
-          # E2: บันทึก TradeRecord ด้วย executed odds/edge (ไม่ใช้ vb.soft_odds เดิม)
+          # D2: build TradeRecord and save FIRST — pop/edit/broadcast only after DB commits
           tr_vb = TradeRecord(
             signal_id=vb.signal_id, event=vb.event, sport=vb.sport,
             leg1_bm=vb.bookmaker, leg2_bm="-",
@@ -3204,13 +3195,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             profit_pct=float(executed_edge_pct / 100.0), status="confirmed",
             commence_time=vb.commence_time,
           )
+          await _async_save_trade(tr_vb)  # D2: raises RuntimeError if DB write fails — must succeed before any side-effect
+          # D2: DB committed — now safe to mutate state and notify user
           with _data_lock:
             trade_records.append(tr_vb)
-          await _async_save_trade(tr_vb)  # B1: await critical write
+            _pending_vb.pop(sid, None)  # D2: pop AFTER save succeeds
           if vb.commence_time:
             register_for_settlement(tr_vb, vb.commence_time)
             from types import SimpleNamespace as _NS
             register_closing_watch(_NS(event=tr_vb.event, sport=tr_vb.sport, commence=tr_vb.commence_time))
+          # D2: notify user only after everything is committed
+          try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
+          except Exception: pass
+          for cid in ALL_CHAT_IDS:
+            try:
+                await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
+            except Exception as e:
+                log.error(f"[VB] confirm msg error: {e}")
         finally:
           with _data_lock:
             _processing.discard(sid)
