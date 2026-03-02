@@ -3233,9 +3233,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await query.edit_message_text(orig+f"\n\n⏰ *Signal expired* ({int((time.time()-sig_ts)//60)}m ago)", parse_mode="Markdown")
         except Exception: pass
         return
-    if action == "reject":  # D1: set rejected immediately; confirmed only after execute_both succeeds
+    if action == "reject":  # D1: set rejected immediately
         with _data_lock:
-            pending.pop(sid, None)  # B2: pop ตอน reject จริง
+            pending.pop(sid, None)
         _is_3w = opp.leg3 is not None and opp.stake3 is not None
         tr_rej = TradeRecord(
             signal_id=sid, event=opp.event, sport=opp.sport,
@@ -3261,24 +3261,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         except Exception: pass  # C8
         return
-    try: await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
-    except Exception: pass
-    # B2: mark as processing before execute — prevent double-confirm
+
+    # action == "confirm"
+    # B2r: claim BEFORE any await — close the race window completely
     with _data_lock:
-        _processing.add(sid)
+        if sid in _processing:
+            try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+            except Exception: pass
+            return
+        _processing.add(sid)  # B2r: atomic claim before first await
     try:
+        try: await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
+        except Exception: pass
         result = await execute_both(opp)
         with _data_lock:
-            pending.pop(sid, None)  # B2: pop หลัง execute สำเร็จเท่านั้น
-            # D1: set confirmed ใน opp_log หลัง execute สำเร็จเท่านั้น
+            pending.pop(sid, None)  # pop หลัง execute สำเร็จเท่านั้น
             for _e in opportunity_log:
                 if _e["id"] == sid:
                     _e["status"] = "confirmed"; break
         try: await query.edit_message_text(orig+"\n\n✅ *CONFIRMED*\n\n"+result, parse_mode="Markdown")
         except Exception: pass  # C8
     except ValueError as abort_msg:
-        # B2: ไม่ pop pending ถ้า execute abort — user ยังกดอีกครั้งได้
-        # K2: ส่ง reply_markup ปุ่ม Confirm กลับไปพร้อม abort message เพื่อให้กดได้
+        # K2: ส่ง reply_markup ปุ่ม Confirm กลับไปพร้อม abort message — user ยังกดอีกครั้งได้
         _abort_kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Confirm อีกครั้ง", callback_data=f"confirm:{sid}"),
             InlineKeyboardButton("❌ Reject",           callback_data=f"reject:{sid}"),
@@ -3290,9 +3294,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_abort_kb,
             )
         except Exception: pass
-    except Exception as e:  # C4: generic catch — network/parse/decimal errors
+    except Exception as e:  # C4: generic catch
         log.error(f"[Confirm] execute_both failed: {e}", exc_info=True)
-        # L3: ส่ง reply_markup กลับไปเหมือน abort path — ให้ user กด retry ได้
         _err_kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Retry",   callback_data=f"confirm:{sid}"),
             InlineKeyboardButton("❌ Reject",   callback_data=f"reject:{sid}"),
@@ -3306,7 +3309,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: pass
     finally:
         with _data_lock:
-            _processing.discard(sid)  # B2: always release claim
+            _processing.discard(sid)  # B2r: always release claim
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3762,6 +3765,10 @@ _sport_rotation_idx = 0  # v10-14: pointer สำหรับ rotation
 
 async def do_scan() -> int:
     global scan_count, last_scan_time, _sport_rotation_idx, _scan_in_progress, auto_scan, _last_error
+    # B3r: safe-mode guard — block scan when DB writes halted
+    if _db_write_halted:
+        log.warning("[Scan] _db_write_halted=True — scan blocked (safe-mode)")
+        return 0
     # B1: asyncio.Lock — กัน race จาก /now + dashboard + scanner_loop พร้อมกัน
     if _scan_lock is None:
         log.warning("[Scan] lock not initialized")
@@ -4307,7 +4314,7 @@ async def settle_completed_trades():
                         log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
                     trade.actual_profit_thb = actual_draw
                     trade.settled_at = datetime.now(timezone.utc).isoformat()
-                    db_save_trade(trade)
+                    await _async_save_trade(trade)  # B5: await critical write
                     with _data_lock:
                         for idx, rec in enumerate(trade_records):
                             if rec.signal_id == trade.signal_id:
@@ -4326,7 +4333,7 @@ async def settle_completed_trades():
                     log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
                     # K3/M2: set flag + save to DB so it survives restart
                     trade.needs_manual_review = True
-                    db_save_trade(trade)
+                    await _async_save_trade(trade)  # B5: await critical write
                     with _data_lock:
                         _manual_review_pending[signal_id] = _pending_settlement.pop(signal_id, (trade, _cdt))
                     settled_ids.append(signal_id)  # mark as removed from pending loop
@@ -4357,7 +4364,7 @@ async def settle_completed_trades():
                 # อัพเดท trade record + in-memory
                 trade.actual_profit_thb = actual_profit
                 trade.settled_at        = datetime.now(timezone.utc).isoformat()
-                db_save_trade(trade)
+                await _async_save_trade(trade)  # B5: await critical write
                 with _data_lock:
                     for idx, rec in enumerate(trade_records):
                         if rec.signal_id == trade.signal_id:
@@ -4771,6 +4778,9 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
             USE_KELLY = value.lower() in ("true","1","on")
             return True, f"USE_KELLY = {USE_KELLY}"
         elif key == "scan_now":
+            # B3r: block scan_now in safe-mode
+            if _db_write_halted:
+                return False, "🚨 DB write halted — scan blocked (safe-mode)"
             # trigger scan ทันที — ส่งผ่าน _main_loop เพราะ HTTP thread ไม่มี running loop
             if _main_loop and _main_loop.is_running():
                 asyncio.run_coroutine_threadsafe(do_scan(), _main_loop)
