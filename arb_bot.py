@@ -9,7 +9,7 @@
 ║  6.  Scanner asyncio.Event wakeup     14.  Dashboard Force Settle UI  ║
 ║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
 ║  8.  Soccer 3-way Arb (1X2 calc)     16.  Signal TTL + WAL DB        ║
-╠══════════════════════════════════════════════════════════════════════╣
+╠══════════════════════════════════════════════════════════════════════╣   
 ║  17. Auth guard all slash cmds   19. Bankroll auto-stop guard          ║
 ║  18. Bearer-only dashboard auth  20. VB slippage refetch guard         ║
 ║  21. opp_log confirmed-after-exec 22. 3-way post-round profit guard    ║
@@ -260,6 +260,7 @@ _main_loop: Optional[asyncio.AbstractEventLoop] = None  # ref to main loop for c
 _scan_wakeup: Optional[asyncio.Event] = None  # v10-1: ปลุก scanner_loop ทันทีเมื่อ config เปลี่ยน
 _scan_in_progress: bool = False  # B6: ป้องกัน scan overlap (legacy — replaced by _scan_lock)
 _scan_lock: Optional[asyncio.Lock] = None  # B1: asyncio-safe scan mutex
+_processing: set = set()  # B2: per-signal claim set — atomic confirm guard
 _now_last_ts: float = 0  # A5: timestamp ที่กด /now ล่าสุด
 _bot_start_ts: float = time.time()  # D2: uptime
 _last_error: str = ""  # D2: last error message
@@ -2962,11 +2963,11 @@ async def execute_both(opp: ArbOpportunity) -> str:
     )
     with _data_lock:
         trade_records.append(tr)
-    db_save_trade(tr)            # save to DB
+    await _async_save_trade(tr)   # B1: await critical write — ห้าม fire-and-forget
     register_for_settlement(tr, opp.commence)  # auto settle
     register_closing_watch(opp)               # #39 CLV watch ตอนเจอ opp ใหม่
     # D1: opportunity_log update ทำใน button_handler หลัง execute สำเร็จ (ไม่ทำซ้ำที่นี่)
-    db_update_opp_status(opp.signal_id, "confirmed")  # save to DB
+    await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("confirmed", opp.signal_id))  # B1: await
 
     sp = sport_to_path(opp.sport)
     # E3: steps() รับ display_odds เพื่อโชว์ live odds แทน odds_raw
@@ -3057,6 +3058,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     SIGNAL_TTL = SIGNAL_TTL_SEC  # F7: ใช้ constant แทน os.getenv
     orig = query.message.text
+
+    # B3: block all confirm/reject when DB writes are halted
+    if _db_write_halted and action in ("confirm", "reject", "vb_confirm", "vb_reject"):
+        await query.answer("🚨 DB write halted — ระบบ safe-mode ไม่รับ confirm/reject", show_alert=True)
+        return
 
     # ── Value Bet confirm/reject ──────────────────────────────────
     if action in ("vb_confirm", "vb_reject"):
@@ -3168,18 +3174,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"_(ยืนยันแล้ว — วางด้วยมือ)_"
         )
-        # K4: pop เมื่อ confirm สำเร็จแล้ว
+        # B2: atomic claim — mark processing before any side-effect
         with _data_lock:
+            if sid in _processing:
+                try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+                except Exception: pass
+                return
+            _processing.add(sid)
+        try:
+          # K4: pop เมื่อ confirm สำเร็จแล้ว
+          with _data_lock:
             _pending_vb.pop(sid, None)
-        try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
-        except Exception: pass
-        for cid in ALL_CHAT_IDS:
+          try: await query.edit_message_text(orig+f"\n\n✅ *Value Bet Confirmed* ฿{executed_stake_thb:,}", parse_mode="Markdown")
+          except Exception: pass
+          for cid in ALL_CHAT_IDS:
             try:
                 await _app.bot.send_message(chat_id=cid, text=confirm_msg, parse_mode="Markdown")
             except Exception as e:
                 log.error(f"[VB] confirm msg error: {e}")
-        # E2: บันทึก TradeRecord ด้วย executed odds/edge (ไม่ใช้ vb.soft_odds เดิม)
-        tr_vb = TradeRecord(
+          # E2: บันทึก TradeRecord ด้วย executed odds/edge (ไม่ใช้ vb.soft_odds เดิม)
+          tr_vb = TradeRecord(
             signal_id=vb.signal_id, event=vb.event, sport=vb.sport,
             leg1_bm=vb.bookmaker, leg2_bm="-",
             leg1_team=vb.outcome, leg2_team="-",
@@ -3187,19 +3201,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stake1_thb=executed_stake_thb, stake2_thb=0,
             profit_pct=float(executed_edge_pct / 100.0), status="confirmed",
             commence_time=vb.commence_time,
-        )
-        with _data_lock:
+          )
+          with _data_lock:
             trade_records.append(tr_vb)
-        db_save_trade(tr_vb)
-        if vb.commence_time:
+          await _async_save_trade(tr_vb)  # B1: await critical write
+          if vb.commence_time:
             register_for_settlement(tr_vb, vb.commence_time)
-            # E3: CLV watch for VB trades — adapt TradeRecord to ArbOpportunity interface
             from types import SimpleNamespace as _NS
             register_closing_watch(_NS(event=tr_vb.event, sport=tr_vb.sport, commence=tr_vb.commence_time))
+        finally:
+          with _data_lock:
+            _processing.discard(sid)
         return
 
     # ── Arb confirm/reject ────────────────────────────────────────
+    # B2: atomic claim check
     with _data_lock:
+        if action == "confirm" and sid in _processing:
+            try: await query.answer("⏳ กำลังดำเนินการอยู่ — รอสักครู่", show_alert=True)
+            except Exception: pass
+            return
         entry = pending.get(sid)
     if not entry:
         try: await query.edit_message_text(orig+"\n\n⚠️ หมดอายุ")
@@ -3231,17 +3252,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         with _data_lock:
             trade_records.append(tr_rej)
-        db_save_trade(tr_rej)    # 
+        await _async_save_trade(tr_rej)  # B1: await critical write
         with _data_lock:  # D1: update opp_log to rejected
             for _e in opportunity_log:
                 if _e["id"] == sid:
                     _e["status"] = "rejected"; break
-        db_update_opp_status(sid, "rejected")  # 
+        await turso_exec("UPDATE opportunity_log SET status=? WHERE id=?", ("rejected", sid))  # B1: await
         try: await query.edit_message_text(orig+"\n\n❌ *REJECTED*", parse_mode="Markdown")
         except Exception: pass  # C8
         return
     try: await query.edit_message_text(orig+"\n\n⏳ *กำลังตรวจราคาล่าสุด...*", parse_mode="Markdown")
     except Exception: pass
+    # B2: mark as processing before execute — prevent double-confirm
+    with _data_lock:
+        _processing.add(sid)
     try:
         result = await execute_both(opp)
         with _data_lock:
@@ -3280,6 +3304,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_err_kb,
             )
         except Exception: pass
+    finally:
+        with _data_lock:
+            _processing.discard(sid)  # B2: always release claim
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3429,6 +3456,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return  # C3
+    # B3: safe-mode guard
+    if _db_write_halted:
+        await update.message.reply_text("🚨 *DB write halted* \u2014 ระบบ safe\u002dmode ไม่รับ /now", parse_mode="Markdown")
+        return
     global _now_last_ts
     # C1: ใช้ _scan_lock.locked() แทน dead _scan_in_progress flag
     if _scan_lock and _scan_lock.locked():
@@ -3641,9 +3672,25 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("result ต้องเป็น: leg1 / leg2 / draw / void")
         return
 
-    # K1: get-validate-pop — peek first, validate, then pop on commit
+    # B3: safe-mode guard
+    if _db_write_halted:
+        await update.message.reply_text("🚨 *DB write halted* \u2014 ระบบ safe\u002dmode ไม่รับ /settle", parse_mode="Markdown")
+        return
+
+    # B4: atomic settle — peek+validate+pop inside single lock
     with _data_lock:
         entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
+        if not entry:
+            pass  # handled below
+        elif entry[0].status != "confirmed":
+            pass  # handled below
+        elif entry[0].actual_profit_thb is not None or entry[0].settled_at is not None:
+            pass  # handled below
+        else:
+            # validation passed — pop atomically inside same lock
+            _pending_settlement.pop(sid, None)
+            _manual_review_pending.pop(sid, None)
+
     if not entry:
         await update.message.reply_text(f"ไม่พบ signal_id `{sid}` ใน pending settlement", parse_mode="Markdown")
         return
@@ -3663,10 +3710,6 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    # K1: validation passed — now pop from whichever queue holds it
-    with _data_lock:
-        _pending_settlement.pop(sid, None)
-        _manual_review_pending.pop(sid, None)
     tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
 
     if result == "leg1":
@@ -3701,7 +3744,7 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rec.signal_id == t.signal_id:
                 trade_records[idx] = t
                 break
-    db_save_trade(t)
+    await _async_save_trade(t)  # B1: await critical write
 
     emoji = "✅" if actual >= 0 else "❌"
     await update.message.reply_text(
@@ -4815,26 +4858,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif _clean == "/api/settle":
             # v10-9: Manual Settlement จาก Dashboard
             try:
+                # B3: safe-mode guard
+                if _db_write_halted:
+                    raise ValueError("🚨 DB write halted — ระบบ safe-mode ไม่รับ settle")
                 length = int(self.headers.get("Content-Length", 0))
                 body   = json.loads(self.rfile.read(length))
                 sid    = body.get("signal_id", "").strip()
                 result = body.get("result", "").strip().lower()  # leg1|leg2|draw|void
                 if not sid or result not in ("leg1","leg2","draw","void"):
                     raise ValueError("signal_id and result (leg1/leg2/draw/void) required")
-                # K2: get-validate-pop — peek from pending or manual_review, validate, then pop
+                # B4: atomic settle — peek+validate+pop inside single lock
                 with _data_lock:
                     entry = _pending_settlement.get(sid) or _manual_review_pending.get(sid)
-                if not entry:
-                    raise ValueError(f"signal_id '{sid}' not found in pending settlement")
-                t, _ = entry
-                # J2: status guard
-                if t.status != "confirmed":
-                    raise ValueError(f"Trade {sid} status='{t.status}' — only confirmed trades can be settled")
-                # Fix 2: prevent re-settling an already-settled trade
-                if t.actual_profit_thb is not None or t.settled_at is not None:
-                    raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
-                # K2: validation passed — pop now
-                with _data_lock:
+                    if not entry:
+                        raise ValueError(f"signal_id '{sid}' not found in pending settlement")
+                    t, _ = entry
+                    if t.status != "confirmed":
+                        raise ValueError(f"Trade {sid} status='{t.status}' — only confirmed trades can be settled")
+                    if t.actual_profit_thb is not None or t.settled_at is not None:
+                        raise ValueError(f"signal_id '{sid}' already settled (P&L={t.actual_profit_thb:+,})")
+                    # B4: validation passed — pop atomically inside same lock
                     _pending_settlement.pop(sid, None)
                     _manual_review_pending.pop(sid, None)
                 tt = t.stake1_thb + t.stake2_thb + (t.stake3_thb or 0)
@@ -4857,7 +4900,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 t.actual_profit_thb = actual
                 t.settled_at = datetime.now(timezone.utc).isoformat()
                 t.status = "confirmed"
-                db_save_trade(t)
+                # B1: block until DB write completes — HTTP thread must wait for commit
+                if _main_loop and not _main_loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(_async_save_trade(t), _main_loop).result(timeout=10)
+                else:
+                    db_save_trade(t)  # fallback fire-and-forget if loop unavailable
                 # A3: update in-memory trade_records
                 with _data_lock:
                     for idx, rec in enumerate(trade_records):
