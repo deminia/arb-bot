@@ -321,7 +321,8 @@ CREATE TABLE IF NOT EXISTS trade_records (
     settled_at TEXT, created_at TEXT,
     commence_time TEXT DEFAULT '',
     leg3_bm TEXT DEFAULT NULL, leg3_team TEXT DEFAULT NULL,
-    leg3_odds REAL DEFAULT NULL, stake3_thb INTEGER DEFAULT NULL
+    leg3_odds REAL DEFAULT NULL, stake3_thb INTEGER DEFAULT NULL,
+    needs_manual_review INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS opportunity_log (
     id TEXT PRIMARY KEY, event TEXT, sport TEXT, profit_pct REAL,
@@ -4205,10 +4206,14 @@ async def _commit_settlement(trade: "TradeRecord", actual_profit: int) -> "Trade
     )
     await _async_save_trade(saved)  # raises RuntimeError on failure — nothing mutated yet
     with _data_lock:
-        for idx, rec in enumerate(trade_records):
+        _found = False
+        for idx, rec in enumerate(trade_records):  # R2: swap in-place
             if rec.signal_id == saved.signal_id:
                 trade_records[idx] = saved
+                _found = True
                 break
+        if not _found:  # R2: fallback append if trimmed from memory
+            trade_records.append(saved)
         if saved.signal_id in _pending_settlement:
             _old_dt = _pending_settlement[saved.signal_id][1]
             _pending_settlement[saved.signal_id] = (saved, _old_dt)
@@ -4227,10 +4232,14 @@ async def _commit_manual_review(trade: "TradeRecord", commence_dt: "datetime") -
     saved = replace(trade, needs_manual_review=True)
     await _async_save_trade(saved)  # raises RuntimeError on failure — nothing mutated yet
     with _data_lock:
-        for idx, rec in enumerate(trade_records):
+        _found = False
+        for idx, rec in enumerate(trade_records):  # R2: swap in-place
             if rec.signal_id == saved.signal_id:
                 trade_records[idx] = saved
+                _found = True
                 break
+        if not _found:  # R2: fallback append if trimmed from memory
+            trade_records.append(saved)
         _pending_settlement.pop(saved.signal_id, None)
         _manual_review_pending[saved.signal_id] = (saved, commence_dt)
     return saved
@@ -4283,166 +4292,10 @@ async def settle_completed_trades():
 
             settled_ids = []
             for signal_id, (trade, _cdt) in list(ready.items()):
-                # หา event ที่ตรงกัน
-                sport_scores = all_scores.get(trade.sport, [])
-                matched_event = None
-
-                for ev in sport_scores:
-                    home = ev.get("home_team", "")
-                    away = ev.get("away_team", "")
-                    ev_name = f"{home} vs {away}"
-                    # R6/Issue29: guard ก่อน split — event อาจไม่มี " vs " (Tennis/MMA)
-                    _ev_parts = trade.event.split(" vs ")
-                    if len(_ev_parts) < 2:
-                        # ไม่สามารถ auto-settle ได้ — format ไม่ตรง
-                        log.debug(f"[Settle] skip {trade.signal_id} — event has no ' vs ' separator: {trade.event!r}")
-                        break
-                    _home_part = _ev_parts[0].strip()
-                    _away_part = _ev_parts[-1].strip()
-                    if fuzzy_match(home, _home_part, 0.5) and \
-                       fuzzy_match(away, _away_part, 0.5):
-                        matched_event = ev
-                        break
-
-                if not matched_event:
-                    # H2/M2: zombie deadman — no API match after 72h → escalate to manual review (don't drop)
-                    try:
-                        _ct_zombie = parse_commence(trade.commence_time or "")
-                        _zombie_elapsed = (datetime.now(timezone.utc) - _ct_zombie).total_seconds()
-                        if _zombie_elapsed > 72 * 3600 and signal_id not in _manual_review_alerted:
-                            log.warning(f"[Settle] {trade.event} — no API match after 72h, escalating to manual review")
-                            # M2: move to _manual_review_pending instead of silently dropping
-                            try:
-                                await _commit_manual_review(trade, _cdt)
-                            except Exception as _z_err:
-                                log.error(f"[Settle] zombie _commit_manual_review failed for {signal_id}: {_z_err}")
-                                continue  # retry next cycle
-                            _manual_review_alerted.add(signal_id)
-                            settled_ids.append(signal_id)  # remove from auto-settle loop
-                            if _app:
-                                asyncio.get_running_loop().create_task(
-                                    _app.bot.send_message(
-                                        chat_id=CHAT_ID,
-                                        text=(
-                                            f"⚠️ *Zombie Trade* `{md_escape(trade.event)}`\n"
-                                            f"ไม่พบ event ใน API หลัง 72h — ย้ายไป Manual Review\n"
-                                            + _settle_hint(trade)
-                                        ),
-                                        parse_mode="Markdown"
-                                    )
-                                )
-                    except Exception:
-                        pass
-                    continue
-                if not matched_event.get("completed", False):
-                    # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
-                    try:
-                        ct = parse_commence(matched_event.get("commence_time",""))
-                        _elapsed = (datetime.now(timezone.utc) - ct).total_seconds()
-                        if _elapsed >= 72 * 3600:  # M3: >72h and still not completed → escalate to manual review
-                            if signal_id not in _manual_review_alerted:
-                                log.warning(f"[Settle] {trade.event} — matched but not completed after 72h, escalating")
-                                try:
-                                    await _commit_manual_review(trade, _cdt)
-                                except Exception as _p_err:
-                                    log.error(f"[Settle] postponed _commit_manual_review failed for {signal_id}: {_p_err}")
-                                    continue
-                                _manual_review_alerted.add(signal_id)
-                                settled_ids.append(signal_id)
-                                if _app:
-                                    asyncio.get_running_loop().create_task(
-                                        _app.bot.send_message(
-                                            chat_id=CHAT_ID,
-                                            text=(
-                                                f"⏰ *Postponed (72h)* `{md_escape(trade.event)}`\n"
-                                                f"ยังไม่ completed หลัง 72h — ย้ายไป Manual Review\n"
-                                                + _settle_hint(trade)
-                                            ),
-                                            parse_mode="Markdown"
-                                        )
-                                    )
-                        elif 6 * 3600 < _elapsed < 72 * 3600:
-                            log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
-                            # B6: แจ้งครั้งเดียว — ไม่ spam ทุกรอบ
-                            if _app and signal_id not in _settle_alerted:
-                                _settle_alerted.add(signal_id)
-                                asyncio.get_running_loop().create_task(
-                                    _app.bot.send_message(
-                                        chat_id=CHAT_ID,
-                                        text=(
-                                            f"⏰ *Postponed?* `{md_escape(trade.event)}`\n"
-                                            f"เลยเวลาแข่งกว่า 6h แต่ยังไม่ completed\n"
-                                            f"แนะนำ settle ด้วยตนเอง: "
-                                            + _settle_hint(trade)
-                                        ),
-                                        parse_mode="Markdown"
-                                    )
-                                )
-                    except Exception:
-                        pass
-                    continue
-
-                # แมตช์เสร็จแล้ว!
-                winner = parse_winner(matched_event, sport=trade.sport)
-                if not winner:
-                    continue
-
-                # #28 Handle special outcomes
-                if winner == "DRAW":
-                    # 3-way: leg3 = Draw; 2-way: refund
-                    tt_draw = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
-                    if trade.leg3_team and trade.leg3_team.lower() == "draw" and trade.leg3_odds and trade.stake3_thb:
-                        actual_draw = int(trade.leg3_odds * trade.stake3_thb) - tt_draw
-                        draw_label = f"P&L: *฿{actual_draw:+,}*"
-                        log.info(f"[Settle] {trade.event} — DRAW (leg3), profit={actual_draw:+,}")
-                    elif trade.leg1_team and trade.leg1_team.lower() == "draw":
-                        actual_draw = int(trade.leg1_odds * trade.stake1_thb) - tt_draw
-                        draw_label = f"P&L: *฿{actual_draw:+,}*"
-                        log.info(f"[Settle] {trade.event} — DRAW (leg1), profit={actual_draw:+,}")
-                    elif trade.leg2_team and trade.leg2_team.lower() == "draw":
-                        actual_draw = int(trade.leg2_odds * trade.stake2_thb) - tt_draw
-                        draw_label = f"P&L: *฿{actual_draw:+,}*"
-                        log.info(f"[Settle] {trade.event} — DRAW (leg2), profit={actual_draw:+,}")
-                    else:
-                        actual_draw = 0
-                        draw_label = "P&L: *฿0* (refund)"
-                        log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
-                    saved_draw = await _commit_settlement(trade, actual_draw)  # S1: save-before-mutate
-                    for cid in ALL_CHAT_IDS:
-                        try:
-                            await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                text=f"🤝 *DRAW — {draw_label}*\n`{saved_draw.event}`\n"
-                                     f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเป่า")
-                        except Exception: pass
-                    settled_ids.append(signal_id)
-                    continue
-
-                if winner == "MANUAL_REVIEW":
-                    log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
-                    # M1: use _commit_manual_review() — save-before-mutate, no split-brain on DB fail
-                    try:
-                        saved_mr = await _commit_manual_review(trade, _cdt)
-                    except Exception as _mr_err:
-                        log.error(f"[Settle] _commit_manual_review failed for {signal_id}: {_mr_err}")
-                        continue  # retry next cycle
-                    settled_ids.append(signal_id)  # mark as removed from auto-settle loop
-                    # D5: แจ้งครั้งเดียว — ไม่ spam ทุก 5 นาที
-                    if _app and signal_id not in _manual_review_alerted:
-                        _manual_review_alerted.add(signal_id)
-                        for cid in ALL_CHAT_IDS:
-                            try:
-                                await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                    text=f"⚠️ *Manual Review Required*\n`{md_escape(saved_mr.event)}`\n"
-                                         f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(saved_mr.sport)})\n"
-                                         f"กรุณาตรวจสอบผลเองใน Dashboard\n"
-                                         + _settle_hint(saved_mr))
-                            except Exception: pass
-                    continue
-
-                # R3: claim _settling — mutual exclusion with cmd_settle and /api/settle
+                # R1: claim _settling before ANY branch — mutual exclusion with /settle and /api/settle
                 with _data_lock:
                     if signal_id in _settling:
-                        log.info(f"[Settle] {signal_id} already being settled by another path — skip auto-settle")
+                        log.info(f"[Settle] {signal_id} already being settled by another path — skip")
                         continue
                     _settling.add(signal_id)
                 try:
@@ -4451,7 +4304,149 @@ async def settle_completed_trades():
                         log.info(f"[Settle] {signal_id} already settled — skip auto-settle")
                         settled_ids.append(signal_id)
                         continue
-                    # คำนวณ P&L จริง
+
+                    # หา event ที่ตรงกัน
+                    sport_scores = all_scores.get(trade.sport, [])
+                    matched_event = None
+                    for ev in sport_scores:
+                        home = ev.get("home_team", "")
+                        away = ev.get("away_team", "")
+                        # R6/Issue29: guard ก่อน split — event อาจไม่มี " vs " (Tennis/MMA)
+                        _ev_parts = trade.event.split(" vs ")
+                        if len(_ev_parts) < 2:
+                            log.debug(f"[Settle] skip {trade.signal_id} — event has no ' vs ' separator: {trade.event!r}")
+                            break
+                        _home_part = _ev_parts[0].strip()
+                        _away_part = _ev_parts[-1].strip()
+                        if fuzzy_match(home, _home_part, 0.5) and \
+                           fuzzy_match(away, _away_part, 0.5):
+                            matched_event = ev
+                            break
+
+                    if not matched_event:
+                        # H2/M2: zombie deadman — no API match after 72h → escalate to manual review
+                        try:
+                            _ct_zombie = parse_commence(trade.commence_time or "")
+                            _zombie_elapsed = (datetime.now(timezone.utc) - _ct_zombie).total_seconds()
+                            if _zombie_elapsed > 72 * 3600 and signal_id not in _manual_review_alerted:
+                                log.warning(f"[Settle] {trade.event} — no API match after 72h, escalating to manual review")
+                                await _commit_manual_review(trade, _cdt)
+                                _manual_review_alerted.add(signal_id)
+                                settled_ids.append(signal_id)
+                                if _app:
+                                    asyncio.get_running_loop().create_task(
+                                        _app.bot.send_message(
+                                            chat_id=CHAT_ID,
+                                            text=(
+                                                f"⚠️ *Zombie Trade* `{md_escape(trade.event)}`\n"
+                                                f"ไม่พบ event ใน API หลัง 72h — ย้ายไป Manual Review\n"
+                                                + _settle_hint(trade)
+                                            ),
+                                            parse_mode="Markdown"
+                                        )
+                                    )
+                        except Exception as _z_err:
+                            log.error(f"[Settle] zombie escalate failed for {signal_id}: {_z_err}")
+                        continue
+
+                    if not matched_event.get("completed", False):
+                        # ยังไม่เสร็จ — เช็คว่านานเกิน 6 ชั่วโมงไหม (อาจ postponed)
+                        try:
+                            ct = parse_commence(matched_event.get("commence_time", ""))
+                            _elapsed = (datetime.now(timezone.utc) - ct).total_seconds()
+                            if _elapsed >= 72 * 3600:  # M3: >72h not completed → escalate
+                                if signal_id not in _manual_review_alerted:
+                                    log.warning(f"[Settle] {trade.event} — matched but not completed after 72h, escalating")
+                                    await _commit_manual_review(trade, _cdt)
+                                    _manual_review_alerted.add(signal_id)
+                                    settled_ids.append(signal_id)
+                                    if _app:
+                                        asyncio.get_running_loop().create_task(
+                                            _app.bot.send_message(
+                                                chat_id=CHAT_ID,
+                                                text=(
+                                                    f"⏰ *Postponed (72h)* `{md_escape(trade.event)}`\n"
+                                                    f"ยังไม่ completed หลัง 72h — ย้ายไป Manual Review\n"
+                                                    + _settle_hint(trade)
+                                                ),
+                                                parse_mode="Markdown"
+                                            )
+                                        )
+                            elif 6 * 3600 < _elapsed < 72 * 3600:
+                                log.warning(f"[Settle] {trade.event} — เกิน 6h ยังไม่เสร็จ (postponed?)")
+                                # B6: แจ้งครั้งเดียว — ไม่ spam ทุกรอบ
+                                if _app and signal_id not in _settle_alerted:
+                                    _settle_alerted.add(signal_id)
+                                    asyncio.get_running_loop().create_task(
+                                        _app.bot.send_message(
+                                            chat_id=CHAT_ID,
+                                            text=(
+                                                f"⏰ *Postponed?* `{md_escape(trade.event)}`\n"
+                                                f"เลยเวลาแข่งกว่า 6h แต่ยังไม่ completed\n"
+                                                f"แนะนำ settle ด้วยตนเอง: "
+                                                + _settle_hint(trade)
+                                            ),
+                                            parse_mode="Markdown"
+                                        )
+                                    )
+                        except Exception as _pe:
+                            log.error(f"[Settle] postponed check failed for {signal_id}: {_pe}")
+                        continue
+
+                    # แมตช์เสร็จแล้ว!
+                    winner = parse_winner(matched_event, sport=trade.sport)
+                    if not winner:
+                        continue
+
+                    # #28 Handle special outcomes
+                    if winner == "DRAW":
+                        # 3-way: leg3 = Draw; 2-way: refund
+                        tt_draw = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
+                        if trade.leg3_team and trade.leg3_team.lower() == "draw" and trade.leg3_odds and trade.stake3_thb:
+                            actual_draw = int(trade.leg3_odds * trade.stake3_thb) - tt_draw
+                            draw_label = f"P&L: *฿{actual_draw:+,}*"
+                            log.info(f"[Settle] {trade.event} — DRAW (leg3), profit={actual_draw:+,}")
+                        elif trade.leg1_team and trade.leg1_team.lower() == "draw":
+                            actual_draw = int(trade.leg1_odds * trade.stake1_thb) - tt_draw
+                            draw_label = f"P&L: *฿{actual_draw:+,}*"
+                            log.info(f"[Settle] {trade.event} — DRAW (leg1), profit={actual_draw:+,}")
+                        elif trade.leg2_team and trade.leg2_team.lower() == "draw":
+                            actual_draw = int(trade.leg2_odds * trade.stake2_thb) - tt_draw
+                            draw_label = f"P&L: *฿{actual_draw:+,}*"
+                            log.info(f"[Settle] {trade.event} — DRAW (leg2), profit={actual_draw:+,}")
+                        else:
+                            actual_draw = 0
+                            draw_label = "P&L: *฿0* (refund)"
+                            log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
+                        saved_draw = await _commit_settlement(trade, actual_draw)  # S1: save-before-mutate
+                        for cid in ALL_CHAT_IDS:
+                            try:
+                                await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
+                                    text=f"🤝 *DRAW — {draw_label}*\n`{saved_draw.event}`\n"
+                                         f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเป่า")
+                            except Exception: pass
+                        settled_ids.append(signal_id)
+                        continue
+
+                    if winner == "MANUAL_REVIEW":
+                        log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
+                        # M1: use _commit_manual_review() — save-before-mutate, no split-brain on DB fail
+                        saved_mr = await _commit_manual_review(trade, _cdt)
+                        settled_ids.append(signal_id)
+                        # D5: แจ้งครั้งเดียว — ไม่ spam ทุก 5 นาที
+                        if _app and signal_id not in _manual_review_alerted:
+                            _manual_review_alerted.add(signal_id)
+                            for cid in ALL_CHAT_IDS:
+                                try:
+                                    await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
+                                        text=f"⚠️ *Manual Review Required*\n`{md_escape(saved_mr.event)}`\n"
+                                             f"ระบบ settle อัตโนมัติไม่รองรับ schema ของกีฬานี้ ({md_escape(saved_mr.sport)})\n"
+                                             f"กรุณาตรวจสอบผลเองใน Dashboard\n"
+                                             + _settle_hint(saved_mr))
+                                except Exception: pass
+                        continue
+
+                    # Normal win/loss settle
                     actual_profit = calc_actual_pnl(trade, winner)
                     total_staked  = trade.stake1_thb + trade.stake2_thb + (trade.stake3_thb or 0)
                     emoji_result  = "✅" if actual_profit >= 0 else "❌"
@@ -4484,7 +4479,7 @@ async def settle_completed_trades():
                                 log.error(f"[Settle] notify {cid}: {e}")
                 finally:
                     with _data_lock:
-                        _settling.discard(signal_id)  # R3: always release
+                        _settling.discard(signal_id)  # R1: always release
 
             # ลบ trades ที่ settle แล้ว
             with _data_lock:
