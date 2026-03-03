@@ -419,13 +419,13 @@ def norm_bm_key(name: str) -> str:
 
 
 def _turso_val_json(v):
-    """Turso /v2/pipeline: return native JSON type for integer/float, string for text/blob, None for null.
-    Some Turso versions reject string-encoded numerics for REAL/INTEGER columns."""
+    """Turso /v2/pipeline: 'value' field must ALWAYS be a string or null — never a native JSON number.
+    Turso parses the string according to the declared 'type' field."""
     if v is None:              return None
-    if isinstance(v, bool):    return int(v)         # True->1, False->0
-    if isinstance(v, int):     return v
-    if isinstance(v, Decimal): return float(v)
-    if isinstance(v, float):   return v
+    if isinstance(v, bool):    return str(int(v))    # True->'1', False->'0'
+    if isinstance(v, int):     return str(v)         # integer type → string-encoded
+    if isinstance(v, Decimal): return str(float(v))  # float type → string-encoded
+    if isinstance(v, float):   return str(v)         # float type → string-encoded
     if isinstance(v, bytes):   return v.hex()
     return str(v)
 
