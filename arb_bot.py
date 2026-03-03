@@ -4469,8 +4469,9 @@ async def settle_completed_trades():
                     saved_trade = await _commit_settlement(trade, actual_profit)  # S1: save-before-mutate
                     processed_ids.append(signal_id)
                     # E7: เคลียร signal ออกจาก alert sets หลัง settle เสร็จ
-                    _settle_alerted.discard(signal_id)
-                    _manual_review_alerted.discard(signal_id)
+                    with _data_lock:
+                        _settle_alerted.discard(signal_id)
+                        _manual_review_alerted.discard(signal_id)
 
                     log.info(f"[Settle] {saved_trade.event} | winner={winner} | profit=฿{actual_profit:+,}")
 
@@ -4495,7 +4496,9 @@ async def settle_completed_trades():
                     with _data_lock:
                         _settling.discard(signal_id)  # R1: always release
 
-            # ลบ trades ที่ settle แล้ว
+            # pop _pending_settlement สำหรับ trades ที่ผ่านแล้วในรอบนี้
+            # หมายเหตุ: manual-review path (_commit_manual_review) pop ออกจาก _pending_settlement
+            # ใน helper แล้ว — pop ซ้ำที่นี่ไม่พัง (pop ของที่ไม่มีแล้วแค่ no-op)
             with _data_lock:
                 for sid in processed_ids:
                     _pending_settlement.pop(sid, None)
