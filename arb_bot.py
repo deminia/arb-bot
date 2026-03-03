@@ -4855,6 +4855,7 @@ def apply_runtime_config(key: str, value: str) -> tuple[bool, str]:
     try:
         if key == "auto_scan":
             auto_scan = value.lower() in ("true","1","on")
+            db_save_state("auto_scan", str(auto_scan))  # persist across deploy
             if _scan_wakeup: _scan_wakeup.set()  # v10-1: ปลุก loop ทันที
             return True, f"auto_scan = {auto_scan}"
         elif key == "min_profit_pct":
@@ -5303,8 +5304,8 @@ async def post_init(app: Application):
         last_scan_time = db_load_state("last_scan_time", "ยังไม่ได้สแกน")
         api_remaining  = int(db_load_state("api_remaining", "500"))
         saved_scan     = db_load_state("auto_scan", "")
-    if saved_scan:
-        auto_scan = saved_scan.lower() == "true"
+    # default = True: first deploy (no key in DB) starts scanning automatically
+    auto_scan = (saved_scan.lower() == "true") if saved_scan else True
 
     # Q2: restore runtime config keys saved via dashboard /api/control
     _cfg_keys = ["min_profit_pct", "scan_interval", "max_odds", "min_odds",
