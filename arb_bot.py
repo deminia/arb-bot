@@ -5087,6 +5087,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _arb_confirmed = [t for t in confirmed if not (t.stake2_thb == 0 and t.leg2_team == "-")]
             _unsettled_arb = [t for t in _arb_confirmed if t.actual_profit_thb is None]
             est_profit = sum(t.profit_pct*(t.stake1_thb+t.stake2_thb+(t.stake3_thb or 0)) for t in _unsettled_arb)
+            avg_profit = (sum(t.profit_pct for t in _arb_confirmed)/len(_arb_confirmed)*100) if _arb_confirmed else None
             clv_values = []
             for t in confirmed:
                 c1, c2, c3 = calc_clv(t)
@@ -5200,6 +5201,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "confirmed":  len(confirmed),
                     "rejected":   len(rejected),
                     "est_profit": round(est_profit),
+                    "avg_profit": round(avg_profit,2) if avg_profit is not None else None,
                     "avg_clv":    round(avg_clv,2) if avg_clv is not None else None,
                 },
                 "pending_valuebets": [

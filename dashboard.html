@@ -447,7 +447,7 @@ function renderTab(tab, d) {
         <div class="sub2">เอาชนะตลาด = บวก</div></div>
       <div class="card"><div class="lbl">CLV บวก</div><div class="val green">${clv.positive??0} trades</div></div>
       <div class="card"><div class="lbl">CLV ลบ</div><div class="val red">${clv.negative??0} trades</div></div>
-      <div class="card"><div class="lbl">Best CLV</div><div class="val green">${clv.best!==undefined?'+'+clv.best.toFixed(2)+'%':'—'}</div></div>
+      <div class="card"><div class="lbl">Best CLV</div><div class="val green">${clv.best!==null&&clv.best!==undefined?'+'+clv.best.toFixed(2)+'%':'—'}</div></div>
     `;
   }
 
