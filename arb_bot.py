@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  DEMINIA BOT V.3 —  Production Ready                                  ║
+║  DEMINIA BOT V.4 —  Production Ready                                  ║
 ║  1.  Odds Staleness + Slippage Guard   9.  Profitability Guard        ║
 ║  2.  Max/Min Odds Filter              10.  CLV Benchmark + Settlement ║
 ║  3.  Alert Cooldown + Multi-chat      11.  Manual Settle (/settle)    ║
@@ -17,7 +17,7 @@
 ║  25. Arb/VB P&L separation       26. Manual review queue persist       ║
 ║  27. Smart settle hints          28. ALLOW_INSECURE_DASHBOARD guard    ║
 ║  29. get-validate-pop settle     30. _quota_ok() helper                ║
-║  31. needs_manual_review field   32. Dashboard V.3 login overlay       ║
+║  31. needs_manual_review field   32. Dashboard V.4 login overlay       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -3460,7 +3460,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         rot_str = f"Sports      : {len(SPORTS)} (all)\n"
     await update.message.reply_text(
-        f"📊 *Deminia Bot V.2*\n"
+        f"📊 *Deminia Bot V.4*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto scan   : {s} ({SCAN_INTERVAL}s)\n"
         f"สแกนไปแล้ว  : {scan_count} รอบ\n"
@@ -5379,7 +5379,7 @@ async def post_init(app: Application):
     await app.bot.send_message(
         chat_id=CHAT_ID, parse_mode="Markdown",
         text=(
-            "🤖 *Deminia Bot V.2 — Production Ready*\n"
+            "🤖 *Deminia Bot V.4 — Production Ready*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{restore_note}\n"
             f"Sports    : {' '.join([SPORT_EMOJI.get(s,'🏆') for s in SPORTS])}\n"
