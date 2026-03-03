@@ -4290,7 +4290,7 @@ async def settle_completed_trades():
                     all_scores[sport] = scores
                     await asyncio.sleep(1)  # ไม่ spam API
 
-            settled_ids = []
+            processed_ids = []  # trades removed from _pending_settlement this cycle (settled or escalated)
             for signal_id, (trade, _cdt) in list(ready.items()):
                 # R1: claim _settling before ANY branch — mutual exclusion with /settle and /api/settle
                 with _data_lock:
@@ -4302,7 +4302,7 @@ async def settle_completed_trades():
                     # G8: double-settle guard — re-check AFTER claim
                     if trade.actual_profit_thb is not None or trade.settled_at is not None:
                         log.info(f"[Settle] {signal_id} already settled — skip auto-settle")
-                        settled_ids.append(signal_id)
+                        processed_ids.append(signal_id)
                         continue
 
                     # หา event ที่ตรงกัน
@@ -4332,7 +4332,7 @@ async def settle_completed_trades():
                                 log.warning(f"[Settle] {trade.event} — no API match after 72h, escalating to manual review")
                                 await _commit_manual_review(trade, _cdt)
                                 _manual_review_alerted.add(signal_id)
-                                settled_ids.append(signal_id)
+                                processed_ids.append(signal_id)
                                 if _app:
                                     asyncio.get_running_loop().create_task(
                                         _app.bot.send_message(
@@ -4359,7 +4359,7 @@ async def settle_completed_trades():
                                     log.warning(f"[Settle] {trade.event} — matched but not completed after 72h, escalating")
                                     await _commit_manual_review(trade, _cdt)
                                     _manual_review_alerted.add(signal_id)
-                                    settled_ids.append(signal_id)
+                                    processed_ids.append(signal_id)
                                     if _app:
                                         asyncio.get_running_loop().create_task(
                                             _app.bot.send_message(
@@ -4418,21 +4418,26 @@ async def settle_completed_trades():
                             actual_draw = 0
                             draw_label = "P&L: *฿0* (refund)"
                             log.info(f"[Settle] {trade.event} — DRAW (no draw leg), profit=0")
+                        _has_draw_leg = bool(
+                            (trade.leg3_team and trade.leg3_team.lower() == "draw") or
+                            (trade.leg1_team and trade.leg1_team.lower() == "draw") or
+                            (trade.leg2_team and trade.leg2_team.lower() == "draw")
+                        )
+                        _draw_note = "เกมเสมอ — settle ตาม draw leg แล้ว" if _has_draw_leg else "เกมเสมอ — โปรดตรวจสอบการ refund จากเว็บ"
                         saved_draw = await _commit_settlement(trade, actual_draw)  # S1: save-before-mutate
                         for cid in ALL_CHAT_IDS:
                             try:
                                 await _app.bot.send_message(chat_id=cid, parse_mode="Markdown",
-                                    text=f"🤝 *DRAW — {draw_label}*\n`{saved_draw.event}`\n"
-                                         f"เกมเสมอ — กรุณาตรวจสอบว่าเว็บ refund เงินหรือเป่า")
+                                    text=f"🤝 *DRAW — {draw_label}*\n`{saved_draw.event}`\n{_draw_note}")
                             except Exception: pass
-                        settled_ids.append(signal_id)
+                        processed_ids.append(signal_id)
                         continue
 
                     if winner == "MANUAL_REVIEW":
                         log.warning(f"[Settle] {trade.event} — schema unknown, needs manual review")
                         # M1: use _commit_manual_review() — save-before-mutate, no split-brain on DB fail
                         saved_mr = await _commit_manual_review(trade, _cdt)
-                        settled_ids.append(signal_id)
+                        processed_ids.append(signal_id)
                         # D5: แจ้งครั้งเดียว — ไม่ spam ทุก 5 นาที
                         if _app and signal_id not in _manual_review_alerted:
                             _manual_review_alerted.add(signal_id)
@@ -4453,7 +4458,7 @@ async def settle_completed_trades():
                     sport_emoji   = SPORT_EMOJI.get(trade.sport, "🏆")
 
                     saved_trade = await _commit_settlement(trade, actual_profit)  # S1: save-before-mutate
-                    settled_ids.append(signal_id)
+                    processed_ids.append(signal_id)
                     # E7: เคลียร signal ออกจาก alert sets หลัง settle เสร็จ
                     _settle_alerted.discard(signal_id)
                     _manual_review_alerted.discard(signal_id)
@@ -4483,7 +4488,7 @@ async def settle_completed_trades():
 
             # ลบ trades ที่ settle แล้ว
             with _data_lock:
-                for sid in settled_ids:
+                for sid in processed_ids:
                     _pending_settlement.pop(sid, None)
 
         except Exception as e:
