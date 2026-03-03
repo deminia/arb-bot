@@ -3760,10 +3760,12 @@ async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        # S3: DB committed — now pop queues atomically
+        # S3: DB committed — now pop queues and clear alert flags atomically
         with _data_lock:
             _pending_settlement.pop(sid, None)
             _manual_review_pending.pop(sid, None)
+            _settle_alerted.discard(sid)          # S2: clear immediately on manual settle
+            _manual_review_alerted.discard(sid)   # S2: clear immediately on manual settle
         emoji = "✅" if actual >= 0 else "❌"
         await update.message.reply_text(
             f"{emoji} *Manual Settle*\n`{saved_t.event}`\n"
@@ -4291,19 +4293,26 @@ async def settle_completed_trades():
                     await asyncio.sleep(1)  # ไม่ spam API
 
             processed_ids = []  # trades removed from _pending_settlement this cycle (settled or escalated)
-            for signal_id, (trade, _cdt) in list(ready.items()):
-                # R1: claim _settling before ANY branch — mutual exclusion with /settle and /api/settle
+            for signal_id in list(ready):
+                # R1/S1: claim _settling + re-read live entry atomically — fix stale-snapshot race
                 with _data_lock:
                     if signal_id in _settling:
                         log.info(f"[Settle] {signal_id} already being settled by another path — skip")
                         continue
                     _settling.add(signal_id)
-                try:
-                    # G8: double-settle guard — re-check AFTER claim
+                    # S1: re-read from source-of-truth inside the same lock — snapshot may be stale
+                    _live = _pending_settlement.get(signal_id)
+                    if not _live:
+                        _settling.discard(signal_id)
+                        log.info(f"[Settle] {signal_id} no longer in _pending_settlement (settled by another path) — skip")
+                        continue
+                    trade, _cdt = _live
                     if trade.actual_profit_thb is not None or trade.settled_at is not None:
-                        log.info(f"[Settle] {signal_id} already settled — skip auto-settle")
+                        _settling.discard(signal_id)
+                        log.info(f"[Settle] {signal_id} already settled in live queue — skip")
                         processed_ids.append(signal_id)
                         continue
+                try:
 
                     # หา event ที่ตรงกัน
                     sport_scores = all_scores.get(trade.sport, [])
@@ -5014,10 +5023,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         raise RuntimeError("main loop unavailable")
                 except Exception as _save_err:
                     raise ValueError(f"DB write failed — settle not committed: {_save_err}") from _save_err
-                # S3: DB committed — now pop queues atomically
+                # S3: DB committed — now pop queues and clear alert flags atomically
                 with _data_lock:
                     _pending_settlement.pop(sid, None)
                     _manual_review_pending.pop(sid, None)
+                    _settle_alerted.discard(sid)          # S2: clear immediately on manual settle
+                    _manual_review_alerted.discard(sid)   # S2: clear immediately on manual settle
                 resp = json.dumps({"ok": True, "msg": f"Settled {result.upper()} | P&L: {actual:+,}", "actual": actual}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type","application/json")
