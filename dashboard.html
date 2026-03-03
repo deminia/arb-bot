@@ -457,7 +457,7 @@ function renderTab(tab, d) {
       <div class="card"><div class="lbl">Confirmed</div><div class="val green">${p.confirmed??0}</div></div>
       <div class="card"><div class="lbl">Rejected</div><div class="val red">${p.rejected??0}</div></div>
       <div class="card"><div class="lbl">Est. Profit</div><div class="val green">฿${(p.est_profit??0).toLocaleString()}</div></div>
-      <div class="card"><div class="lbl">Avg Profit%</div><div class="val blue">${p.avg_profit?p.avg_profit.toFixed(2)+'%':'—'}</div></div>
+      <div class="card"><div class="lbl">Avg Profit%</div><div class="val blue">${p.avg_profit !== null && p.avg_profit !== undefined ? p.avg_profit.toFixed(2)+'%' : '—'}</div></div>
       <div class="card"><div class="lbl">CLV avg</div><div class="val ${(p.avg_clv??0)>=0?'green':'red'}">${p.avg_clv!==null&&p.avg_clv!==undefined?p.avg_clv.toFixed(2)+'%':'—'}</div></div>
     `;
     const tRows = trades.slice(-30).reverse().map(t=>{

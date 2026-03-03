@@ -4826,7 +4826,7 @@ def calc_stats() -> dict:
             "confirmed":  len(confirmed),
             "rejected":   len(rejected),
             "est_profit": round(est_profit),
-            "avg_profit": round(avg_profit,2) if avg_profit else None,
+            "avg_profit": round(avg_profit,2) if avg_profit is not None else None,
             "avg_clv":    round(avg_clv,2) if avg_clv is not None else None,
         },
         "trade_records": trade_list,
