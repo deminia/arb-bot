@@ -3662,6 +3662,71 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/trade <bookmaker> <outcome> <odds> <stake_thb> [event]
+    Manual trade entry — บันทึก value bet จาก Line Movement signal เข้า dashboard + P&L
+    ตัวอย่าง: /trade 1xbet "Phoenix Suns" 1.31 5000 "Sacramento Kings vs Phoenix Suns"
+    ถ้าไม่ใส่ event → ใช้ outcome เป็น event name
+    """
+    if not await require_owner(update): return
+    args = context.args or []
+    if len(args) < 4:
+        await update.message.reply_text(
+            "📝 *Manual Trade Entry*\n"
+            "รูปแบบ: `/trade <bookmaker> <outcome> <odds> <stake_thb> [event]`\n"
+            "ตัวอย่าง:\n"
+            "`/trade 1xbet PhoenixSuns 1.31 5000`\n"
+            "`/trade 1xbet PhoenixSuns 1.31 5000 SacramentoKings_vs_PhoenixSuns`\n\n"
+            "💡 ถ้าชื่อมีช่องว่าง ใช้ _ แทน (ระบบจะแปลงให้อัตโนมัติ)",
+            parse_mode="Markdown"
+        )
+        return
+    bm        = args[0].replace("_", " ")
+    outcome   = args[1].replace("_", " ")
+    try:
+        odds  = float(args[2])
+        stake = int(args[3])
+    except ValueError:
+        await update.message.reply_text("❌ odds ต้องเป็นตัวเลขทศนิยม, stake ต้องเป็นจำนวนเต็ม (THB)", parse_mode="Markdown")
+        return
+    event = " ".join(args[4:]).replace("_", " ") if len(args) > 4 else outcome
+
+    if odds <= 1.0:
+        await update.message.reply_text("❌ odds ต้องมากกว่า 1.00", parse_mode="Markdown")
+        return
+    if stake <= 0:
+        await update.message.reply_text("❌ stake ต้องมากกว่า 0", parse_mode="Markdown")
+        return
+
+    sid = uuid.uuid4().hex[:8]
+    now = datetime.now(timezone.utc).isoformat()
+    # บันทึกเป็น single-leg trade: leg1 = bet จริง, leg2 = placeholder (manual)
+    trade = TradeRecord(
+        signal_id=sid, event=event, sport="manual",
+        leg1_bm=bm,      leg1_team=outcome, leg1_odds=odds,  stake1_thb=stake,
+        leg2_bm="manual", leg2_team="manual", leg2_odds=1.0, stake2_thb=0,
+        profit_pct=0.0, status="confirmed", created_at=now,
+    )
+    try:
+        await _async_save_trade(trade)
+    except Exception as e:
+        await update.message.reply_text(f"🚨 *DB write failed*: `{e}`", parse_mode="Markdown")
+        return
+    with _data_lock:
+        trade_records.append(trade)
+        _pending_settlement[sid] = (trade, now)
+    await update.message.reply_text(
+        f"✅ *Trade บันทึกแล้ว*\n"
+        f"ID: `{sid}`\n"
+        f"Event : `{md_escape(event)}`\n"
+        f"วาง   : *{md_escape(bm)}* — {md_escape(outcome)} @ *{odds}*\n"
+        f"Stake : *฿{stake:,}*\n\n"
+        f"ใช้ `/settle {sid} leg1` เพื่อ settle ตอนผลออก\n"
+        f"หรือ `/settle {sid} void` ถ้าโมฆะ",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """v10-10: /settle <signal_id> <leg1|leg2|draw|void>
     Manual settle สำหรับ MANUAL_REVIEW หรือ DRAW
@@ -5459,6 +5524,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
     app.add_handler(CommandHandler("lines",  cmd_lines))
     app.add_handler(CommandHandler("trades", cmd_trades))   # v10-11
+    app.add_handler(CommandHandler("trade",  cmd_trade))    # manual entry
     app.add_handler(CommandHandler("settle", cmd_settle))   # v10-10
     app.add_handler(CommandHandler("debug",  cmd_debug))    # D6
     _app = app
