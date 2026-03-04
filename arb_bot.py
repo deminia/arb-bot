@@ -286,6 +286,7 @@ class ValueBetSignal:
 
 pending:           dict[str, tuple]           = {}  # sid -> (ArbOpportunity, created_at_ts)
 _pending_vb:       dict[str, tuple]           = {}  # sid -> (ValueBetSignal, created_at_ts)
+_pending_lm:       dict[str, tuple]           = {}  # sid -> (LineMovement, ctx, created_at_ts)
 seen_signals:      dict[str, float]          = {}  # key -> timestamp (TTL 4h)
 auto_scan:         bool                      = AUTO_SCAN_START
 scan_count:        int                       = 0
@@ -1041,6 +1042,10 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
             msg += f"  {reason}\n"
 
         # คำแนะนำสำหรับ Grade A/B
+        # สร้าง lm_sid ไว้เสมอ สำหรับปุ่ม Log Trade
+        lm_sid = uuid.uuid4().hex[:8]
+        with _data_lock:
+            _pending_lm[lm_sid] = (lm, ctx, time.time())
         vb_sid = None
         keyboard = None
         if grade in ("A", "B") and (lm.is_rlm or lm.is_steam):
@@ -1098,6 +1103,7 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
                 ]])
             else:
                 msg += f"\n⚠️ *ระบบคำนวณแล้ว: No Value / Edge ต่ำ* (edge={edge_pct:.2f}%) — ควรรอดูท่าที\n"
+                # ยังไม่มี keyboard — จะเพิ่ม Log Trade ด้านล่าง
 
             # Direct betting links + odds ทุกเว็บ
             all_odds_ctx: dict | None = ctx.get("all_odds")
@@ -1108,6 +1114,14 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
         # H2H Focus note
         if lm.sport in H2H_FOCUS_SPORTS:
             msg += f"\n🎯 _กีฬานี้ Sharp money เน้นตลาด H2H — สัญญาณน่าเชื่อถือ_"
+
+        # เพิ่มปุ่ม Log Trade ทุก signal — ให้ owner กด 1 ครั้งเพื่อบันทึก trade
+        log_btn = InlineKeyboardButton("📝 Log Trade", callback_data=f"lm_log:{lm_sid}")
+        if keyboard:
+            # มีปุ่ม VB อยู่แล้ว — เพิ่ม Log Trade เป็น row ใหม่
+            keyboard = InlineKeyboardMarkup(keyboard.inline_keyboard + [[log_btn]])
+        else:
+            keyboard = InlineKeyboardMarkup([[log_btn]])
 
         for cid in ALL_CHAT_IDS:
             try:
@@ -3229,6 +3243,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _processing.discard(sid)  # C2: always release claim
         return
 
+    # ── Line Movement Log Trade ───────────────────────────────────
+    if action == "lm_log":
+        with _data_lock:
+            lm_entry = _pending_lm.get(sid)
+        if not lm_entry:
+            try: await query.answer("⚠️ Signal หมดอายุแล้ว", show_alert=True)
+            except Exception: pass
+            return
+        lm_obj, lm_ctx, lm_ts = lm_entry
+        if time.time() - lm_ts > SIGNAL_TTL:
+            with _data_lock:
+                _pending_lm.pop(sid, None)
+            try: await query.answer("⏰ Signal expired", show_alert=True)
+            except Exception: pass
+            return
+        # บันทึก TradeRecord จาก LM signal
+        tr_sid = uuid.uuid4().hex[:8]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        commence = lm_ctx.get("commence_time", "")
+        tr_lm = TradeRecord(
+            signal_id=tr_sid, event=lm_obj.event, sport=lm_obj.sport,
+            leg1_bm=lm_obj.bookmaker, leg1_team=lm_obj.outcome,
+            leg1_odds=float(lm_obj.odds_after), stake1_thb=int(TOTAL_STAKE_THB),
+            leg2_bm="manual", leg2_team="manual", leg2_odds=1.0, stake2_thb=0,
+            profit_pct=0.0, status="confirmed",
+            created_at=now_iso, commence_time=commence,
+        )
+        try:
+            await _async_save_trade(tr_lm)
+        except Exception as e:
+            try: await query.answer(f"🚨 DB error: {e}", show_alert=True)
+            except Exception: pass
+            return
+        with _data_lock:
+            trade_records.append(tr_lm)
+            _pending_lm.pop(sid, None)
+            _pending_settlement[tr_sid] = (tr_lm, now_iso)
+        if commence:
+            register_for_settlement(tr_lm, commence)
+        try:
+            await query.edit_message_text(
+                orig + f"\n\n📝 *Trade บันทึกแล้ว* — ID: `{tr_sid}`\n"
+                f"วาง *{md_escape(lm_obj.bookmaker)}* — {md_escape(lm_obj.outcome)} @ *{float(lm_obj.odds_after):.3f}*\n"
+                f"Stake: ฿{int(TOTAL_STAKE_THB):,}\n\n"
+                f"ใช้ `/settle {tr_sid} leg1` ตอนผลออก",
+                parse_mode="Markdown"
+            )
+        except Exception: pass
+        return
+
     # ── Arb confirm/reject ────────────────────────────────────────
     # C1: claim FIRST (both confirm and reject), then read entry under same lock
     # This closes the race where reject completes between read and claim.
@@ -4619,6 +4683,10 @@ def periodic_cleanup():
         expired_vb = [k for k, (_, ts) in _pending_vb.items() if now_ts - ts > _vb_ttl]
         for k in expired_vb:
             del _pending_vb[k]
+        # trim _pending_lm — ลบ LM log signals ที่หมดอายุ
+        expired_lm = [k for k, (_, _ctx, ts) in _pending_lm.items() if now_ts - ts > _vb_ttl]
+        for k in expired_lm:
+            del _pending_lm[k]
     # Issue35/41: snapshot + clear alert sets inside lock — consistent view, no conceptual race
     with _data_lock:
         _trade_snap = list(trade_records)
