@@ -1087,7 +1087,7 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
                     f"  ได้คืน *฿{payout:,}* (กำไร +฿{profit:,})\n"
                 )
                 # สร้าง ValueBetSignal รอ Confirm
-                vb_sid = str(uuid.uuid4())[:8]
+                vb_sid = uuid.uuid4().hex[:8]
                 vb = ValueBetSignal(
                     signal_id=vb_sid, event=lm.event, sport=lm.sport,
                     bookmaker=lm.bookmaker, outcome=lm.outcome,
@@ -1612,7 +1612,9 @@ async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
     if not USE_KALSHI:
         return []
     try:
-        sport_categories = ["sports", "basketball", "football", "soccer", "baseball", "mma"]
+        # BUG7: dedupe categories first — "sports" superset overlaps basketball/football/soccer
+        # fetch only the specific sub-categories to avoid wasting 6 credits per scan
+        sport_categories = ["basketball", "football", "soccer", "baseball", "mma"]
         all_markets: list[dict] = []
         for cat in sport_categories:
             _st, _data = await _http_get_with_retry(
@@ -2605,72 +2607,7 @@ def parse_commence(raw: str) -> datetime:
 # ══════════════════════════════════════════════════════════════════
 _refetch_cache: dict[str, tuple[float, list]] = {}  # C10: sport -> (ts, events)
 
-async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal, bool, bool]:
-    """DEPRECATED — dead code, superseded by inline _refetch_leg() in execute_both().
-    Kept for reference only; do not call.
-    """
-    raise NotImplementedError("refetch_live_odds is deprecated — use execute_both() _refetch_leg instead")
-    _bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
-    _extra_norm      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
-    def _is_extra(bm: str) -> bool:
-        k = norm_bm_key(bm)
-        return k not in _bookmakers_norm and k in _extra_norm
-
-    leg1_extra = _is_extra(opp.leg1.bookmaker)
-    leg2_extra = _is_extra(opp.leg2.bookmaker)
-    need_standard = not leg1_extra or not leg2_extra  # อย่างน้อย 1 leg เป็น standard
-    need_extra    = leg1_extra or leg2_extra           # อย่างน้อย 1 leg เป็น extra
-
-    try:
-        now_ts = time.time()
-        # C10: cache แยกตาม feed (15s TTL)
-        std_events   = []
-        extra_events = []
-        # L1: ใช้ semaphore wrappers — ไม่ยิง direct
-        async with aiohttp.ClientSession() as session:
-            if need_standard:
-                _ck = opp.sport
-                _cts, _cev = _refetch_cache.get(_ck, (0, []))
-                if now_ts - _cts < 15 and _cev:
-                    std_events = _cev
-                else:
-                    std_events = await _fetch_odds_sem(session, opp.sport)
-                    _refetch_cache[_ck] = (now_ts, std_events)
-            if need_extra and _extra_norm:
-                _ck2 = f"{opp.sport}__extra"
-                _cts2, _cev2 = _refetch_cache.get(_ck2, (0, []))
-                if now_ts - _cts2 < 15 and _cev2:
-                    extra_events = _cev2
-                else:
-                    extra_events = await _fetch_extra_books_sem(session, opp.sport)
-                    _refetch_cache[_ck2] = (now_ts, extra_events)
-
-        if leg1_extra != leg2_extra:
-            log.debug(f"[SlippageGuard] mixed-source refetch: leg1={'extra' if leg1_extra else 'std'} leg2={'extra' if leg2_extra else 'std'}")
-
-        def _lookup_leg(leg, is_extra_leg, std_ev, extra_ev) -> tuple[Decimal, bool]:
-            """หา live odds ของ leg จาก feed ที่ถูก — คืน (price, found)"""
-            source_events = extra_ev if is_extra_leg else std_ev
-            leg_key = leg.raw.get("bm_key", "") if leg.raw else ""
-            for event in source_events:
-                ename = f"{event.get('home_team','')} vs {event.get('away_team','')}"
-                if not fuzzy_match(ename, opp.event, 0.7): continue
-                for bm in event.get("bookmakers", []):
-                    bk = bm.get("key","")
-                    if not (bk == leg_key or leg.bookmaker.lower() in bk.lower()): continue
-                    for mkt in bm.get("markets", []):
-                        if mkt.get("key") != "h2h": continue
-                        for out in mkt.get("outcomes", []):
-                            if fuzzy_match(out.get("name",""), leg.outcome, 0.8):
-                                return apply_slippage(Decimal(str(out.get("price", 1))), bk), True
-            return leg.odds, False  # O1: not found — caller must abort
-
-        live1, found1 = _lookup_leg(opp.leg1, leg1_extra, std_events, extra_events)
-        live2, found2 = _lookup_leg(opp.leg2, leg2_extra, std_events, extra_events)
-        return live1, live2, found1, found2
-    except Exception as e:
-        log.warning(f"[SlippageGuard] re-fetch failed: {e}")
-    return opp.leg1.odds, opp.leg2.odds, False, False
+# refetch_live_odds() removed — was dead code (BUG8); superseded by _refetch_leg() inside execute_both()
 
 
 async def refetch_valuebet_odds(vb: "ValueBetSignal") -> tuple[float, bool]:
@@ -2729,6 +2666,10 @@ async def refetch_valuebet_odds(vb: "ValueBetSignal") -> tuple[float, bool]:
 # ══════════════════════════════════════════════════════════════════
 async def execute_both(opp: ArbOpportunity) -> str:
     is_3way = opp.leg3 is not None and opp.stake3 is not None
+    _UNSET = object()  # explicit sentinel — replaces fragile locals() checks
+    live1 = live2 = live3 = _UNSET
+    _od1  = _od2  = _UNSET
+    _leg1_disp = _leg2_disp = _leg3_disp = _UNSET
 
     # 🛡️ Slippage Guard — 2-way only (ไม่ใช้ calc_arb 2-way ตัดสิน 3-way)
     orig_profit = opp.profit_pct
@@ -2908,9 +2849,9 @@ async def execute_both(opp: ArbOpportunity) -> str:
 
     if is_3way:
         # B10/D3: ใช้ live odds (after slippage) สำหรับ payout display
-        _leg1_disp = live1 if 'live1' in locals() else opp.leg1.odds
-        _leg2_disp = live2 if 'live2' in locals() else opp.leg2.odds
-        _leg3_disp = live3 if 'live3' in locals() else opp.leg3.odds
+        _leg1_disp = live1 if live1 is not _UNSET else opp.leg1.odds
+        _leg2_disp = live2 if live2 is not _UNSET else opp.leg2.odds
+        _leg3_disp = live3 if live3 is not _UNSET else opp.leg3.odds
         w1 = (s1 * _leg1_disp).quantize(Decimal("1"))
         w2 = (s2 * _leg2_disp).quantize(Decimal("1"))
         w3 = (s3 * _leg3_disp).quantize(Decimal("1"))
@@ -2926,8 +2867,8 @@ async def execute_both(opp: ArbOpportunity) -> str:
             )
     else:
         # C5/C13: ใช้ live odds (after slippage) แทน odds_raw สำหรับ guard + payout display
-        _od1 = live1 if 'live1' in locals() else opp.leg1.odds
-        _od2 = live2 if 'live2' in locals() else opp.leg2.odds
+        _od1 = live1 if live1 is not _UNSET else opp.leg1.odds
+        _od2 = live2 if live2 is not _UNSET else opp.leg2.odds
         # v10-3: Profitability Guard — rebalance s2 ถ้า rounding ทำให้ arb หาย
         w1 = (s1 * _od1).quantize(Decimal("1"))
         w2 = (s2 * _od2).quantize(Decimal("1"))
@@ -2966,10 +2907,10 @@ async def execute_both(opp: ArbOpportunity) -> str:
         w3 = None
 
     # D4: บันทึก live odds ที่ใช้จริง (after slippage) แทน odds_raw
-    _save_od1 = float(_leg1_disp if is_3way else _od1) if is_3way or '_od1' in locals() else float(opp.leg1.odds)
-    _save_od2 = float(_leg2_disp if is_3way else _od2) if is_3way or '_od2' in locals() else float(opp.leg2.odds)
+    _save_od1 = float(_leg1_disp if is_3way else _od1) if is_3way or _od1 is not _UNSET else float(opp.leg1.odds)
+    _save_od2 = float(_leg2_disp if is_3way else _od2) if is_3way or _od2 is not _UNSET else float(opp.leg2.odds)
     # E8: fallback ใช้ opp.leg3.odds (after slippage) แทน odds_raw
-    _save_od3 = float(_leg3_disp) if is_3way and '_leg3_disp' in locals() else (float(opp.leg3.odds) if is_3way else None)
+    _save_od3 = float(_leg3_disp) if is_3way and _leg3_disp is not _UNSET else (float(opp.leg3.odds) if is_3way else None)
     tr = TradeRecord(
         signal_id=opp.signal_id, event=opp.event, sport=opp.sport,
         leg1_bm=opp.leg1.bookmaker, leg2_bm=opp.leg2.bookmaker,
@@ -4150,7 +4091,9 @@ _manual_review_pending: dict[str, tuple] = {}  # K3: trades ที่ parse_winn
 
 
 def _quota_ok(min_remaining: int = 5) -> bool:
-    """L3/Issue49: centralized quota check — asyncio single-thread so no lock needed"""
+    """L3/Issue49: centralized quota check.
+    api_remaining is a plain int — Python GIL makes int read atomic; safe to call
+    from both asyncio loop and dashboard thread without a lock."""
     return api_remaining > min_remaining
 
 
@@ -4278,8 +4221,9 @@ def calc_actual_pnl(trade: TradeRecord, winner: str) -> int:
     """
     คำนวณกำไร/ขาดทุนจริง รองรับ 2-way, 3-way และ ValueBet (1-leg)
     """
-    # C3: Value Bet guard — 1-leg trade (stake2=0, leg2_team="-")
-    is_valuebet = (not trade.stake2_thb) and trade.leg2_team == "-"  # P6: handle None from old schema
+    # C3: Value Bet guard — 1-leg trade (stake2=0 or None, leg2_team="-")
+    # P6: (not stake2_thb) is intentional — handles both 0 (new) and None (old schema)
+    is_valuebet = (not trade.stake2_thb) and trade.leg2_team == "-"
     if is_valuebet:
         if fuzzy_match(winner, trade.leg1_team or "", threshold=0.5):
             return int(trade.stake1_thb * trade.leg1_odds) - trade.stake1_thb
@@ -4341,8 +4285,9 @@ async def _commit_settlement(trade: "TradeRecord", actual_profit: int) -> "Trade
                 trade_records[idx] = saved
                 _found = True
                 break
-        if not _found:  # R2: fallback append if trimmed from memory
-            trade_records.append(saved)
+        if not _found:  # R2: fallback append — only if signal truly absent (avoid dup on trim race)
+            if not any(r.signal_id == saved.signal_id for r in trade_records):
+                trade_records.append(saved)
         if saved.signal_id in _pending_settlement:
             _old_dt = _pending_settlement[saved.signal_id][1]
             _pending_settlement[saved.signal_id] = (saved, _old_dt)
@@ -4367,8 +4312,9 @@ async def _commit_manual_review(trade: "TradeRecord", commence_dt: "datetime") -
                 trade_records[idx] = saved
                 _found = True
                 break
-        if not _found:  # R2: fallback append if trimmed from memory
-            trade_records.append(saved)
+        if not _found:  # R2: fallback append — only if signal truly absent (avoid dup on trim race)
+            if not any(r.signal_id == saved.signal_id for r in trade_records):
+                trade_records.append(saved)
         _pending_settlement.pop(saved.signal_id, None)
         _manual_review_pending[saved.signal_id] = (saved, commence_dt)
     return saved
