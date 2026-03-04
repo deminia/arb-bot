@@ -18,13 +18,13 @@
 ║  27. Smart settle hints          28. ALLOW_INSECURE_DASHBOARD guard    ║
 ║  29. get-validate-pop settle     30. _quota_ok() helper                ║
 ║  31. needs_manual_review field   32. Dashboard V.4 login overlay       ║
+║  33. Log Trade btn on LM alerts  34. /trade manual entry command       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import asyncio, json, logging, os, random, re, signal, sqlite3, threading, time, uuid  # re already imported at top (Q6)
 import urllib.request, urllib.error, urllib.parse
 # v10-6: ใช้ Turso HTTP REST API ตรงๆ — ไม่พึ่ง libsql_client
-_TURSO_API = "http"  # always http mode
 _libsql_mod = None
 HAS_TURSO = True  # จะ check จริงตอน turso_init
 from collections import defaultdict
@@ -354,7 +354,7 @@ def _turso_http(statements: list) -> list:
     body = json.dumps({"requests": [
         {"type": "execute", "stmt": {
             "sql": s["sql"],
-            "args": [{"type": _turso_val_type(v), "value": _turso_val(v)} for v in s.get("args", [])]
+            "args": [{"type": _turso_val_type(v), "value": _turso_val_json(v)} for v in s.get("args", [])]
         }} for s in statements
     ] + [{"type": "close"}]}).encode()
     req = urllib.request.Request(
@@ -2291,8 +2291,8 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
             if is_soccer:
                 # ══ Soccer 3-way branch: ตรวจเฉพาะ Home/Draw/Away ครบครัน ══
                 # เพิ่ม 2-way arb สำหรับ soccer ด้วย — ถ้า Draw ไม่ครบ
-                home_key = next((k for k in best if k.lower() not in ("draw",) and fuzzy_match(k, home, 0.4)), None)
-                away_key = next((k for k in best if k.lower() not in ("draw",) and fuzzy_match(k, away, 0.4)), None)
+                home_key = next((k for k in best if k.lower() not in ("draw",) and fuzzy_match(k, home, 0.6)), None)
+                away_key = next((k for k in best if k.lower() not in ("draw", home_key) and fuzzy_match(k, away, 0.6)), None)
                 draw_key = "Draw" if "Draw" in best else None
 
                 if home_key and away_key and draw_key:
@@ -2606,12 +2606,10 @@ def parse_commence(raw: str) -> datetime:
 _refetch_cache: dict[str, tuple[float, list]] = {}  # C10: sport -> (ts, events)
 
 async def refetch_live_odds(opp: ArbOpportunity) -> tuple[Decimal, Decimal, bool, bool]:
+    """DEPRECATED — dead code, superseded by inline _refetch_leg() in execute_both().
+    Kept for reference only; do not call.
     """
-    Re-fetch ราคาล่าสุดจาก API ก่อนยืนยันการเดิมพัน
-    J1: mixed-source arb — fetch ทั้ง standard + extra feeds ถ้า legs มาจากต่าง source
-    O1: fail-closed — Returns: (live1, live2, found1, found2)
-    ถ้า found=False แสดงว่า market suspended / mapping miss — caller ต้อง abort
-    """
+    raise NotImplementedError("refetch_live_odds is deprecated — use execute_both() _refetch_leg instead")
     _bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
     _extra_norm      = [norm_bm_key(b) for b in _s("EXTRA_BOOKMAKERS","").split(",") if b.strip()]
     def _is_extra(bm: str) -> bool:
@@ -3434,7 +3432,7 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rejected  = [t for t in trade_records if t.status=="rejected"]
 
     # I1/I3: separate arb vs VB; est_profit = unsettled arb only (VB edge != guaranteed profit)
-    def _is_vb(t): return t.stake2_thb == 0 and t.leg2_team == "-"
+    def _is_vb(t): return (not t.stake2_thb) and t.leg2_team == "-"
     arb_confirmed = [t for t in confirmed if not _is_vb(t)]
     vb_confirmed  = [t for t in confirmed if _is_vb(t)]
     settled       = [t for t in confirmed if t.actual_profit_thb is not None]
@@ -3699,7 +3697,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = []
     for i, t in enumerate(recent, 1):
-        settled = f"✅ ฿{t.actual_profit_thb:+,}" if t.actual_profit_thb is not None else "⏳ รอผล"
+        settle_str = f"✅ ฿{t.actual_profit_thb:+,}" if t.actual_profit_thb is not None else "⏳ รอผล"
         ct_th = ""
         if t.commence_time:
             try:
@@ -3718,7 +3716,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"{i}. {md_escape(t.event[:28])}\n"
             f"   {SPORT_EMOJI.get(t.sport,'🏆')} {md_escape(t.leg1_bm)} vs {md_escape(t.leg2_bm)} | profit {t.profit_pct:.1%}\n"
-            f"   {stake_str} | {ct_th} | {settled}"
+            f"   {stake_str} | {ct_th} | {settle_str}"
         )
     await update.message.reply_text(
         f"📋 *Confirmed Trades ({len(recent)} ล่าสุด)*\n━━━━━━━━━━━━━━━━━━\n" + "\n\n".join(lines),
