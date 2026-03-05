@@ -432,7 +432,7 @@ def _turso_val_json(v):
     return str(v)
 
 async def turso_init():
-    global _turso_url, _turso_token, _turso_ok
+    global _turso_url, _turso_token, _turso_ok, _db_write_halted, auto_scan
     url   = os.environ.get("TURSO_URL",   TURSO_URL).strip()
     token = os.environ.get("TURSO_TOKEN", TURSO_TOKEN).strip()
     log.info(f"[DB] TURSO_URL={'set ('+url[:40]+'...)' if url else 'NOT SET'}")
@@ -454,6 +454,9 @@ async def turso_init():
             return count
         count = await loop.run_in_executor(None, _init)
         _turso_ok = True
+        _db_write_halted = False  # clear any stale halt from previous runtime
+        auto_scan = True           # re-enable scan after successful (re)connect
+        db_save_state("auto_scan", "True")  # overwrite halted-False in DB
         log.info(f"[DB] Turso HTTP connected ✅ | trade_records={count}")
     except Exception as e:
         log.error(f"[DB] Turso init failed: {e!r} — fallback to SQLite")
@@ -5386,6 +5389,8 @@ async def post_init(app: Application):
         api_remaining  = int(db_load_state("api_remaining", "500"))
         saved_scan     = db_load_state("auto_scan", "")
     # default = True: first deploy (no key in DB) starts scanning automatically
+    # If saved value is "False" it may have been written by a DB halt — turso_init()
+    # will override it back to True once the connection is confirmed healthy.
     auto_scan = (saved_scan.lower() == "true") if saved_scan else True
 
     # Q2: restore runtime config keys saved via dashboard /api/control
