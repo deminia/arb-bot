@@ -2336,7 +2336,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                     profit3 = (_w3_min - _tt3) / _tt3 if _tt3 > 0 else Decimal("0")
                                 if profit3 >= MIN_PROFIT_PCT:
                                     opp = ArbOpportunity(
-                                        signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                        signal_id=uuid.uuid4().hex[:8], sport=sport_key,
                                         event=event_name, commence=commence,
                                         leg1=bh, leg2=ba, leg3=bd,
                                         profit_pct=profit3, stake1=sh, stake2=sa, stake3=sd,
@@ -2377,7 +2377,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                                             profit, s_h, s_a = calc_arb_fixed(bh.odds, ba.odds, new_total)
                                     if profit >= MIN_PROFIT_PCT:
                                         opp = ArbOpportunity(
-                                            signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                            signal_id=uuid.uuid4().hex[:8], sport=sport_key,
                                             event=event_name, commence=commence,
                                             leg1=bh, leg2=ba,
                                             profit_pct=profit, stake1=s_h, stake2=s_a,
@@ -2422,7 +2422,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                             else:
                                 s_a, s_b = s_a_capped, s_b_capped
                             opp = ArbOpportunity(
-                                signal_id=str(uuid.uuid4())[:8], sport=sport_key,
+                                signal_id=uuid.uuid4().hex[:8], sport=sport_key,
                                 event=event_name, commence=commence,
                                 leg1=best[a], leg2=best[b],
                                 profit_pct=profit, stake1=s_a, stake2=s_b,
@@ -3205,7 +3205,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             signal_id=tr_sid, event=lm_obj.event, sport=lm_obj.sport,
             leg1_bm=lm_obj.bookmaker, leg1_team=lm_obj.outcome,
             leg1_odds=float(lm_obj.odds_after), stake1_thb=int(TOTAL_STAKE_THB),
-            leg2_bm="manual", leg2_team="manual", leg2_odds=1.0, stake2_thb=0,
+            leg2_bm="-", leg2_team="-", leg2_odds=1.0, stake2_thb=0,
             profit_pct=0.0, status="confirmed",
             created_at=now_iso, commence_time=commence,
         )
@@ -3218,9 +3218,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with _data_lock:
             trade_records.append(tr_lm)
             _pending_lm.pop(sid, None)
-            _pending_settlement[tr_sid] = (tr_lm, now_iso)
         if commence:
             register_for_settlement(tr_lm, commence)
+        else:
+            now_dt = datetime.now(timezone.utc)
+            with _data_lock:
+                _pending_settlement[tr_sid] = (tr_lm, now_dt)
         try:
             await query.edit_message_text(
                 orig + f"\n\n📝 *Trade บันทึกแล้ว* — ID: `{tr_sid}`\n"
@@ -3707,7 +3710,7 @@ async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trade = TradeRecord(
         signal_id=sid, event=event, sport="manual",
         leg1_bm=bm,      leg1_team=outcome, leg1_odds=odds,  stake1_thb=stake,
-        leg2_bm="manual", leg2_team="manual", leg2_odds=1.0, stake2_thb=0,
+        leg2_bm="-", leg2_team="-", leg2_odds=1.0, stake2_thb=0,
         profit_pct=0.0, status="confirmed", created_at=now,
     )
     try:
@@ -3715,9 +3718,10 @@ async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"🚨 *DB write failed*: `{e}`", parse_mode="Markdown")
         return
+    now_dt = datetime.now(timezone.utc)
     with _data_lock:
         trade_records.append(trade)
-        _pending_settlement[sid] = (trade, now)
+        _pending_settlement[sid] = (trade, now_dt)
     await update.message.reply_text(
         f"✅ *Trade บันทึกแล้ว*\n"
         f"ID: `{sid}`\n"
