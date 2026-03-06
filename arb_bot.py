@@ -5,7 +5,7 @@
 ║  2.  Max/Min Odds Filter              10.  CLV Benchmark + Settlement ║
 ║  3.  Alert Cooldown + Multi-chat      11.  Manual Settle (/settle)    ║
 ║  4.  P&L Tracker + /trades command   12.  Sport Rotation              ║
-║  5.  Turso persistent DB (sync+async) 13.  Thread-safe _data_lock     ║
+║  5.  Turso persistent DB (sync+async) 13.  Thread-safe _data_lock     ║ 
 ║  6.  Scanner asyncio.Event wakeup     14.  Dashboard Force Settle UI  ║
 ║  7.  Line Movement (Steam + RLM)      15.  Kelly Criterion stake      ║
 ║  8.  Soccer 3-way Arb (1X2 calc)     16.  Signal TTL + WAL DB        ║
@@ -762,7 +762,11 @@ def save_snapshot():
 # 7/10/11. Line movement tracking
 odds_history:      dict[str, dict]           = defaultdict(dict)  # event+outcome → {bm: odds}
 line_movements:    list[LineMovement]        = []   # ประวัติ line move
-steam_tracker:     dict[str, list]           = defaultdict(list)  # event → [(bm, ts, direction)]
+steam_tracker:     dict[str, list]           = defaultdict(list)  # steam_key → [(bm, ts)]
+steam_pinnacle_tracker: dict[str, float]     = {}   # F1: steam_key → ts of Pinnacle's move (if any)
+
+# F2: Market suspension detection — track which events Pinnacle had odds for last scan
+pinnacle_market_presence: dict[str, float]  = {}   # event_key → last_seen_ts
 
 # 12. CLV tracking — odds ตอนปิด
 closing_odds:      dict[str, dict]           = {}   # event+outcome → {bm: final_odds}
@@ -876,6 +880,8 @@ async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None =
     """
     new_movements: list[tuple[LineMovement, dict]] = []  # (lm, context)
     now = datetime.now(timezone.utc)
+    # F2: track which Pinnacle events are seen THIS scan
+    _pinnacle_seen_this_scan: set[str] = set()
 
     for sport, events in odds_by_sport.items():
         await asyncio.sleep(0)  # yield ให้ event loop ไปทำงานอื่น (Telegram, etc.) ได้ระหว่างสปอร์ต
@@ -905,6 +911,9 @@ async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None =
                                     # 11. Steam: หลายเว็บขยับพร้อมกันภายใน 5 นาที
                                     steam_key = f"{ename}|{outcome}|{direction}"
                                     steam_tracker[steam_key].append((bk, now))
+                                    # F1: record timestamp of Pinnacle's move for this steam key
+                                    if bk == "pinnacle":
+                                        steam_pinnacle_tracker[steam_key] = now.timestamp()
                                     # ลบ entry เก่ากว่า 5 นาที
                                     steam_tracker[steam_key] = [
                                         (b,t) for b,t in steam_tracker[steam_key]
@@ -914,6 +923,8 @@ async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None =
                                     unique_bms = {b for b, _ in steam_tracker[steam_key]}
                                     num_bm_moved = len(unique_bms)
                                     is_steam = num_bm_moved >= 2
+                                    # F1: Pinnacle-led steam — True only if Pinnacle moved within this window
+                                    pinnacle_moved = steam_key in steam_pinnacle_tracker
 
                                     # 10. RLM: odds ขยับ反向กับ public bet
                                     # ถ้า odds ลง (favourite กลายเป็น underdog) = sharp money เดิน
@@ -954,6 +965,7 @@ async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None =
                                         "all_odds": all_odds_for_ctx,
                                         "sharp_odds": sharp_odds_val,
                                         "soft_odds": soft_odds_val,
+                                        "pinnacle_moved": pinnacle_moved,  # F1
                                     }
                                     new_movements.append((lm, ctx))
                                     with _data_lock:
@@ -965,6 +977,31 @@ async def detect_line_movements(odds_by_sport: dict, poly_markets: list | None =
                         if hist_key not in odds_history:
                             odds_history[hist_key] = {}
                         odds_history[hist_key][bk] = new_odds
+
+                    # F2: track Pinnacle market presence per event
+                    if bk == "pinnacle":
+                        _pinnacle_seen_this_scan.add(ename)
+                        pinnacle_market_presence[ename] = now.timestamp()
+
+    # F2: detect Pinnacle market suspensions — event had Pinnacle last scan but not this scan
+    _suspension_alerts: list[str] = []
+    _now_ts = now.timestamp()
+    for _ev_name, _last_ts in list(pinnacle_market_presence.items()):
+        if _ev_name not in _pinnacle_seen_this_scan and (_now_ts - _last_ts) < 600:
+            # Pinnacle was seen within last 10 min but not now — likely suspended
+            _suspension_alerts.append(_ev_name)
+            pinnacle_market_presence[_ev_name] = 0  # reset so we don't re-alert
+    if _suspension_alerts and _app:
+        _susp_msg = (
+            "⚠️ *Pinnacle Market Suspension Detected*\n"
+            "────────────────────\n"
+            + "\n".join(f"• `{md_escape(e)}`" for e in _suspension_alerts[:5])
+            + "\n⚠️ Sharp money หนักหรือมีข่าวลับ — _skip events เหล่านี้ เพื่อความปลอดภัย_"
+        )
+        try:
+            await _app.bot.send_message(chat_id=CHAT_ID, text=_susp_msg, parse_mode="Markdown")
+        except Exception as _se:
+            log.warning(f"[F2/Suspension] alert failed: {_se}")
 
     # ส่ง Telegram alert สำหรับ line movements
     if new_movements and _app:
@@ -991,11 +1028,21 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
 
         # จัดเกรดสัญญาณ — ส่ง liquidity จาก ctx ถ้ามี
         liquidity_usd = ctx.get("liquidity_usd", 0)
+        pinnacle_moved = ctx.get("pinnacle_moved", False)  # F1
         grade, grade_emoji, reasons = grade_signal(
             lm, liquidity_usd=liquidity_usd,
             commence_time=commence_time,
             num_bm_moved=num_bm_moved,
+            pinnacle_moved=pinnacle_moved,
         )
+
+        # F4: EV% = (true_prob × soft_odds - 1) × 100
+        _sharp_odds_ev = ctx.get("sharp_odds", 0.0)
+        _soft_odds_ev  = ctx.get("soft_odds", float(lm.odds_after))
+        _ev_pct: Optional[float] = None
+        if _sharp_odds_ev > 1.0 and _soft_odds_ev > 1.0:
+            _true_prob = 1.0 / _sharp_odds_ev
+            _ev_pct = round((_true_prob * _soft_odds_ev - 1.0) * 100, 2)
 
         # Header ตามประเภท
         tags = []
@@ -1043,6 +1090,11 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
         msg += f"\n📋 *วิเคราะห์สัญญาณ:*\n"
         for reason in reasons:
             msg += f"  {reason}\n"
+
+        # F4: EV% line — แสดงเฉพาะเมื่อมี Pinnacle reference
+        if _ev_pct is not None:
+            _ev_icon = "✅" if _ev_pct > 0 else "⚠️"
+            msg += f"\n{_ev_icon} *EV: {_ev_pct:+.2f}%* (Pinnacle `{_sharp_odds_ev:.3f}` vs soft `{_soft_odds_ev:.3f}`)\n"
 
         # คำแนะนำสำหรับ Grade A/B
         # สร้าง lm_sid ไว้เสมอ สำหรับปุ่ม Log Trade
@@ -1216,12 +1268,13 @@ def classify_move_time(move_ts: str, commence_time: str = "") -> tuple[str, str,
 
 
 def grade_signal(lm: LineMovement, liquidity_usd: float = 0,
-                 commence_time: str = "", num_bm_moved: int = 1) -> tuple[str, str, list[str]]:
+                 commence_time: str = "", num_bm_moved: int = 1,
+                 pinnacle_moved: bool = False) -> tuple[str, str, list[str]]:
     """
     จัดเกรดสัญญาณ RLM/Steam
     Returns: (grade, grade_emoji, reasons)
 
-    Grade A: RLM + (Steam หรือ High Liquidity) + จังหวะดี
+    Grade A: RLM + (Steam หรือ High Liquidity) + Pinnacle-led + จังหวะดี
     Grade B: RLM หรือ Steam อย่างเดียว + liquidity พอใช้
     Grade C: Line Move ธรรมดา
     """
@@ -1233,10 +1286,14 @@ def grade_signal(lm: LineMovement, liquidity_usd: float = 0,
         score += 3.0
         reasons.append("🔄 RLM — Pinnacle odds ลง (Sharp money)")
 
-    # Steam = +2 คะแนน
+    # Steam = +2 คะแนน; F1: Pinnacle-led steam = +3, soft-led = +1 (penalized)
     if lm.is_steam:
-        score += 2.0
-        reasons.append(f"🌊 Steam Move — {num_bm_moved} เว็บขยับพร้อมกัน")
+        if pinnacle_moved:
+            score += 3.0
+            reasons.append(f"🌊📍 Pinnacle-led Steam — {num_bm_moved} เว็บขยับตาม Pinnacle (สัญญาณแข็ง)")
+        else:
+            score += 1.0
+            reasons.append(f"🌊 Steam Move — {num_bm_moved} เว็บขยับ (⚠️ Pinnacle ยังไม่ขยับ — อาจเป็น noise)")
 
     # Liquidity
     if liquidity_usd >= RLM_MIN_LIQUIDITY_USD:
@@ -2542,13 +2599,26 @@ async def send_alert(opp: ArbOpportunity):
             f"   {md_escape(str(opp.leg1.outcome))} → ฿{int(w1):,} *(+฿{int(w1-tt):,})*\n"
             f"   {md_escape(str(opp.leg2.outcome))} → ฿{int(w2):,} *(+฿{int(w2-tt):,})*"
         )
+    # F4: EV score — for arb, EV = guaranteed profit_pct; also show CLV estimate if Pinnacle data available
+    _arb_ev_line = ""
+    with _data_lock:
+        _pin_leg1 = closing_odds.get(f"{opp.event}|{opp.leg1.outcome}", {}).get("pinnacle")
+        _pin_leg2 = closing_odds.get(f"{opp.event}|{opp.leg2.outcome}", {}).get("pinnacle")
+    if _pin_leg1 and _pin_leg2 and float(_pin_leg1) > 1 and float(_pin_leg2) > 1:
+        _clv1_est = round((float(opp.leg1.odds) / float(_pin_leg1) - 1) * 100, 1)
+        _clv2_est = round((float(opp.leg2.odds) / float(_pin_leg2) - 1) * 100, 1)
+        _arb_ev_line = f"\U0001f4c8 *EV: +{float(opp.profit_pct)*100:.2f}%* (guaranteed) | CLV est: leg1 {_clv1_est:+.1f}% / leg2 {_clv2_est:+.1f}%\n"
+    else:
+        _arb_ev_line = f"\U0001f4c8 *EV: +{float(opp.profit_pct)*100:.2f}%* (guaranteed arb edge)\n"
+
     msg = (
         f"{urgent_prefix}"
         f"{emoji} *{arb_type} — {opp.profit_pct:.2%}* _(หลัง fee)_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{commence_line}  {urgency_note}\n"
-        f"🏆 {md_escape(opp.event)}\n"
-        f"💵 ทุน: *฿{int(tt):,}* {'_(เป็น Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
+        f"\U0001f3c6 {md_escape(opp.event)}\n"
+        f"{_arb_ev_line}"
+        f"\U0001f4b5 ทุน: *\u0e3f{int(tt):,}* {'_(\u0e40\u0e1b\u0e47\u0e19 Kelly)_' if USE_KELLY else ''}  |  Credits: {api_remaining}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"```\n"
         f"{'\u0e0a\u0e48\u0e2d\u0e07\u0e17\u0e32\u0e07':<12} {'\u0e1d\u0e31\u0e48\u0e07':<15} {'Odds':>5} {'\u0e27\u0e32\u0e07':>8} {'\u0e44\u0e14\u0e49':>8}\n"
