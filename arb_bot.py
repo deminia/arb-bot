@@ -155,6 +155,8 @@ KALSHI_API_SECRET = _s("KALSHI_API_SECRET", "")  # reserved for signed/private e
 USE_KALSHI        = bool(KALSHI_API_KEY)  # secret optional for read-only endpoints
 CLOUDBET_API_KEY  = _s("CLOUDBET_API_KEY",  "")  # JWT bearer token for Cloudbet API
 STAKE_API_KEY     = _s("STAKE_API_KEY",     "")  # Bearer token for Stake.com API
+USE_CLOUDBET      = bool(CLOUDBET_API_KEY)
+USE_STAKE         = bool(STAKE_API_KEY)
 SEEN_TTL_SEC      = int(os.getenv("SEEN_TTL_SEC", str(4 * 3600)))  # default 4h
 # C1/C2 fix: build effective extra bookmakers list — always include cloudbet/stake
 # if their API keys are set, even if EXTRA_BOOKMAKERS env is not configured
@@ -1420,11 +1422,10 @@ def build_betting_links(event_name: str, outcome: str, sport: str,
     # Kalshi
     links.append(f"  🔵 [Kalshi](https://kalshi.com/sports){_odds_tag('kalshi')}")
 
-    # Stake.com + Cloudbet (ถ้ามี key หรือตั้ง EXTRA_BOOKMAKERS)
-    extra = EXTRA_BOOKMAKERS_EFFECTIVE
-    if "stake" in extra:
+    # C7 fix: ใช้ USE_STAKE / USE_CLOUDBET — EXTRA_BOOKMAKERS อาจว่างเป็นเมื่อใช้ native API
+    if USE_STAKE:
         links.append(f"  ⚫ [Stake.com](https://stake.com/sports){_odds_tag('stake')}")
-    if "cloudbet" in extra:
+    if USE_CLOUDBET:
         links.append(f"  ☁️ [Cloudbet](https://www.cloudbet.com/en/sports){_odds_tag('cloudbet')}")
 
     return "\n".join(links)
@@ -1756,6 +1757,151 @@ async def async_fetch_kalshi(session: aiohttp.ClientSession) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  CLOUDBET NATIVE API FETCH
+# ══════════════════════════════════════════════════════════════════
+# C6b: เพิ่ม basketball_ncaab, cricket_test_match, cricket_odi ที่ขาดไป
+_CLOUDBET_SPORT_MAP: dict[str, str] = {
+    "basketball_nba":            "basketball",
+    "basketball_euroleague":     "basketball",
+    "basketball_ncaab":          "basketball",   # C6b fix
+    "americanfootball_nfl":      "american-football",
+    "soccer_epl":                "soccer",
+    "soccer_uefa_champs_league": "soccer",
+    "soccer_spain_la_liga":      "soccer",
+    "soccer_germany_bundesliga": "soccer",
+    "soccer_italy_serie_a":      "soccer",
+    "soccer_france_ligue_one":   "soccer",
+    "soccer_fifa_world_cup":     "soccer",
+    "baseball_mlb":              "baseball",
+    "icehockey_nhl":             "ice-hockey",
+    "cricket_test_match":        "cricket",      # C6b fix
+    "cricket_odi":               "cricket",      # C6b fix
+    "tennis_atp_wimbledon":      "tennis",
+    "tennis_wta":                "tennis",
+    "mma_mixed_martial_arts":    "mma",
+}
+
+
+def _parse_cloudbet_event(ev: dict, sport_key: str) -> Optional[dict]:
+    """แปลง Cloudbet v3 event → Odds-API-compatible dict
+    C5: รองรับ outcomes ทั้ง dict และ list (Cloudbet v3 ส่งต่างกันต่าม market)
+    """
+    try:
+        home = ev.get("home", {}).get("name", "") or ev.get("home_team", "")
+        away = ev.get("away", {}).get("name", "") or ev.get("away_team", "")
+        if not home or not away:
+            return None
+        commence = ev.get("cutoff", "") or ev.get("start_time", "")
+
+        # ดึง h2h market
+        markets_raw = ev.get("markets", {})
+        # markets อาจเป็น dict (key=market_type) หรือ list
+        if isinstance(markets_raw, list):
+            markets_iter = {m.get("key", m.get("type", "")): m for m in markets_raw}.values()
+        else:
+            markets_iter = markets_raw.values()
+
+        h2h_outcomes: list[dict] = []
+        for mkt in markets_iter:
+            mtype = mkt.get("key", mkt.get("type", ""))
+            if mtype not in ("GAME_LINES_MONEY_LINE", "GAME_MONEY_LINE", "MATCH_ODDS", "1X2", "h2h"):
+                continue
+            # C5: outcomes อาจเป็น dict (name→price) หรือ list [{name,price}]
+            outcomes_raw = mkt.get("outcomes", mkt.get("selections", {}))
+            if isinstance(outcomes_raw, list):
+                for o in outcomes_raw:
+                    name  = o.get("name", o.get("label", ""))
+                    price = float(o.get("price", o.get("odds", 0)) or 0)
+                    if name and price > 1.0:
+                        h2h_outcomes.append({"name": name, "price": price})
+            elif isinstance(outcomes_raw, dict):
+                for name, val in outcomes_raw.items():
+                    price = float(val) if isinstance(val, (int, float, str)) else float(val.get("price", 0) or 0)
+                    if name and price > 1.0:
+                        h2h_outcomes.append({"name": name, "price": price})
+            if h2h_outcomes:
+                break
+
+        if not h2h_outcomes:
+            return None
+
+        return {
+            "home_team":  home,
+            "away_team":  away,
+            "commence_time": commence,
+            "last_update":   commence,   # C3b fix: ใส่ field นี้เพื่อกัน is_stale()
+            "sport_key":  sport_key,
+            "bookmakers": [{
+                "key":     "cloudbet",
+                "title":   "Cloudbet",
+                "markets": [{"key": "h2h", "outcomes": h2h_outcomes}],
+            }],
+        }
+    except Exception as _e:
+        log.debug(f"[Cloudbet/parse] {_e}")
+        return None
+
+
+async def async_fetch_cloudbet(session: aiohttp.ClientSession, sports: list[str]) -> list[dict]:
+    """ดึง odds จาก Cloudbet native API v3
+    C4: group sports by cb_sport ก่อน → เรียก /sports/soccer ครั้งเดียวสำหรับทุก soccer leagues
+    C5: _parse_cloudbet_event รองรับ outcomes ทั้ง dict และ list
+    C6b: _CLOUDBET_SPORT_MAP มีครบทุก sport
+    """
+    if not USE_CLOUDBET:
+        return []
+    # C4: group sports by Cloudbet sport slug — ไม่ fetch ซ้ำ
+    cb_sport_to_keys: dict[str, list[str]] = {}
+    for sk in sports:
+        cb = _CLOUDBET_SPORT_MAP.get(sk)
+        if cb:
+            cb_sport_to_keys.setdefault(cb, []).append(sk)
+    if not cb_sport_to_keys:
+        return []
+
+    _cb_headers = {"X-API-Key": CLOUDBET_API_KEY, "Accept": "application/json"}
+    all_events: list[dict] = []
+    for cb_sport, sport_keys in cb_sport_to_keys.items():
+        try:
+            url = f"https://sports-api.cloudbet.com/pub/v3/odds/sports/{cb_sport}"
+            for attempt in range(3):
+                try:
+                    async with session.get(url, headers=_cb_headers,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as _r:
+                        status = _r.status
+                        if status == 200:
+                            data = await _r.json(content_type=None)
+                            break
+                        if status in (429, 502, 503) and attempt < 2:
+                            await asyncio.sleep(1.5 ** attempt)
+                            continue
+                        data = None
+                        break
+                except Exception as _re:
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 ** attempt)
+                    else:
+                        raise _re
+            if status != 200 or not isinstance(data, dict):
+                log.debug(f"[Cloudbet] {cb_sport} status={status}")
+                continue
+            competitions = data.get("sport", {}).get("competitions", [])
+            if not competitions:
+                competitions = data.get("competitions", [])
+            for comp in competitions:
+                for ev in comp.get("events", []):
+                    # ลองทุก sport_key ที่ map มา cb_sport เดียวกัน
+                    parsed = _parse_cloudbet_event(ev, sport_keys[0])
+                    if parsed:
+                        all_events.append(parsed)
+        except Exception as _e:
+            log.warning(f"[Cloudbet] fetch {cb_sport}: {_e}")
+
+    log.info(f"[Cloudbet] native API events={len(all_events)}")
+    return all_events
+
+
+# ══════════════════════════════════════════════════════════════════
 #  STAKE.COM + CLOUDBET FETCH (ผ่าน The Odds API — ถ้ามี)
 # ══════════════════════════════════════════════════════════════════
 async def async_fetch_extra_books(session: aiohttp.ClientSession, sport_key: str) -> list[dict]:
@@ -1806,6 +1952,28 @@ async def _fetch_odds_sem(session: aiohttp.ClientSession, sport: str) -> list[di
     async with sem:
         return await async_fetch_odds(session, sport)
 
+def _merge_extra_events(odds_by_sport: dict, extra_events_by_sport: dict[str, list]) -> None:
+    """Q4/C4: merge extra/native bookmaker events into odds_by_sport by fuzzy name match"""
+    for s, extra_events in extra_events_by_sport.items():
+        if not extra_events: continue
+        std_events = odds_by_sport.get(s, [])
+        for ev in extra_events:
+            ev_name = f"{ev.get('home_team','')} vs {ev.get('away_team','')}"
+            merged = False
+            for std_ev in std_events:
+                std_name = f"{std_ev.get('home_team','')} vs {std_ev.get('away_team','')}"
+                if fuzzy_match(ev_name, std_name, 0.80):
+                    existing_bms = {bm["key"] for bm in std_ev.get("bookmakers", [])}
+                    for bm in ev.get("bookmakers", []):
+                        if bm["key"] not in existing_bms:
+                            std_ev.setdefault("bookmakers", []).append(bm)
+                    merged = True
+                    break
+            if not merged:
+                std_events.append(ev)
+        odds_by_sport[s] = std_events
+
+
 async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
     # F5: _ODDS_API_SEM สร้างใน post_init() แล้ว — lazy-init ออก
     async with aiohttp.ClientSession() as session:
@@ -1814,33 +1982,29 @@ async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
             *[_fetch_odds_sem(session, s) for s in sports],
             async_fetch_polymarket(session),
             async_fetch_kalshi(session),
-            # J2: ใช้ _fetch_extra_books_sem (ผ่าน semaphore + quota) — ใช้ EXTRA_BOOKMAKERS_EFFECTIVE
+            # J2: Odds API extra books (stake via Odds API) — ใช้ EXTRA_BOOKMAKERS_EFFECTIVE
             *([_fetch_extra_books_sem(session, s) for s in sports] if EXTRA_BOOKMAKERS_EFFECTIVE else []),
+            # C4: Cloudbet native API — 1 call per unique cb_sport (ไม่ซ้ำตาม league)
+            async_fetch_cloudbet(session, sports),
         )
     odds_by_sport = {s: results[i] for i, s in enumerate(sports)}
-    poly_markets  = results[n]       # Polymarket
-    kalshi_markets = results[n + 1]  # Kalshi
+    poly_markets   = results[n]       # Polymarket
+    kalshi_markets = results[n + 1]   # Kalshi
+    n_extra = len(sports) if EXTRA_BOOKMAKERS_EFFECTIVE else 0
+    cloudbet_events: list[dict] = results[n + 2 + n_extra]  # C4: native Cloudbet
 
-    # Q4: Merge extra bookmaker events into odds_by_sport — fuzzy match ชื่อทีม
+    # Q4: Merge Odds-API extra books
     if EXTRA_BOOKMAKERS_EFFECTIVE:
-        for i, s in enumerate(sports):
-            extra_events = results[n + 2 + i]
-            if not extra_events: continue
-            std_events = odds_by_sport[s]
-            for ev in extra_events:
-                ev_name = f"{ev.get('home_team','')} vs {ev.get('away_team','')}"
-                merged = False
-                for std_ev in std_events:
-                    std_name = f"{std_ev.get('home_team','')} vs {std_ev.get('away_team','')}"
-                    if fuzzy_match(ev_name, std_name, 0.80):
-                        existing_bms = {bm["key"] for bm in std_ev.get("bookmakers", [])}
-                        for bm in ev.get("bookmakers", []):
-                            if bm["key"] not in existing_bms:
-                                std_ev.setdefault("bookmakers", []).append(bm)
-                        merged = True
-                        break
-                if not merged:
-                    std_events.append(ev)
+        extra_by_sport = {sports[i]: results[n + 2 + i] for i in range(len(sports))}
+        _merge_extra_events(odds_by_sport, extra_by_sport)
+
+    # C4: Merge native Cloudbet events
+    if cloudbet_events:
+        cb_by_sport: dict[str, list] = {}
+        for ev in cloudbet_events:
+            sk = ev.get("sport_key", sports[0])
+            cb_by_sport.setdefault(sk, []).append(ev)
+        _merge_extra_events(odds_by_sport, cb_by_sport)
 
     # Combine Polymarket + Kalshi into single alt-markets list
     all_alt_markets = list(poly_markets) + list(kalshi_markets)
