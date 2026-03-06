@@ -4773,24 +4773,15 @@ async def scanner_loop():
                             break
             log.info(f"[Pending] expired {len(expired)} signal(s)")
             # S1: split-brain guard — ถ้า writes halted ห้าม fallback SQLite
-            if _db_write_halted:
-                pass  # skip persist entirely — Turso halted, SQLite would cause split-brain
-            elif _turso_ok:
-                async def _expire_turso(_sids=list(expired)):
+            # C3: ใช้ turso_exec เสมอ — มัน route ไป SQLite เองถ้า _turso_ok=False
+            #     ไม่ใช้ sqlite3.connect() โดยตรงเพราะ turso_exec มี fallback ครบแล้ว
+            if not _db_write_halted:
+                async def _expire_db(_sids=list(expired)):
                     for _sid in _sids:
                         try:
                             await turso_exec("UPDATE opportunity_log SET status='expired' WHERE id=?", (_sid,))
                         except Exception: pass
-                asyncio.get_running_loop().create_task(_expire_turso())
-            else:
-                # SQLite-only mode (Turso never configured)
-                try:
-                    with sqlite3.connect(DB_PATH, timeout=2) as _con:
-                        for _sid in expired:
-                            _con.execute("UPDATE opportunity_log SET status='expired' WHERE id=?", (_sid,))
-                        _con.commit()
-                except Exception as _qe:
-                    log.debug(f"[Pending] expire DB update failed: {_qe}")
+                asyncio.get_running_loop().create_task(_expire_db())
         # v10-1: รอแบบ ถ้า apply_runtime_config เปลี่ยน interval/auto_scan จะปลุก event นี้เพื่อตื่นทันที
         _scan_wakeup.clear()
         try:
