@@ -168,6 +168,9 @@ _extra_set = {b.strip().lower() for b in _extra_env.split(",") if b.strip()}
 for _b in _extra_auto:
     if _b not in _extra_set: _extra_set.add(_b)
 EXTRA_BOOKMAKERS_EFFECTIVE = ",".join(sorted(_extra_set)) if _extra_set else ""
+# C10: Odds API extra path — exclude cloudbet (uses native API), keep only stake etc.
+_EXTRA_ODDS_API_BMS = ",".join(b for b in EXTRA_BOOKMAKERS_EFFECTIVE.split(",")
+                               if b and b != "cloudbet") if EXTRA_BOOKMAKERS_EFFECTIVE else ""
 
 # 6. Commission แบบ dynamic (อ่านจาก env ได้)
 COMMISSION = {
@@ -1906,7 +1909,7 @@ async def async_fetch_extra_books(session: aiohttp.ClientSession, sport_key: str
     C2/C3b: ใช้ EXTRA_BOOKMAKERS_EFFECTIVE — รวม cloudbet/stake อัตโนมัติเมื่อมี API key
     J2: อ่าน x-requests-remaining และเรียก update_quota()
     """
-    extra = EXTRA_BOOKMAKERS_EFFECTIVE or _s("EXTRA_BOOKMAKERS", "")
+    extra = _EXTRA_ODDS_API_BMS  # C10: cloudbet excluded — uses native API
     if not extra:
         return []
     try:
@@ -1979,19 +1982,19 @@ async def fetch_all_async(sports: list[str]) -> tuple[dict, list]:
             *[_fetch_odds_sem(session, s) for s in sports],
             async_fetch_polymarket(session),
             async_fetch_kalshi(session),
-            # J2: Odds API extra books (stake via Odds API) — ใช้ EXTRA_BOOKMAKERS_EFFECTIVE
-            *([_fetch_extra_books_sem(session, s) for s in sports] if EXTRA_BOOKMAKERS_EFFECTIVE else []),
+            # J2: Odds API extra books (stake) — C10: กรอง cloudbet ออก เพราะใช้ native API แล้ว
+            *([_fetch_extra_books_sem(session, s) for s in sports] if _EXTRA_ODDS_API_BMS else []),
             # C4: Cloudbet native API — 1 call per unique cb_sport (ไม่ซ้ำตาม league)
             async_fetch_cloudbet(session, sports),
         )
     odds_by_sport = {s: results[i] for i, s in enumerate(sports)}
     poly_markets   = results[n]       # Polymarket
     kalshi_markets = results[n + 1]   # Kalshi
-    n_extra = len(sports) if EXTRA_BOOKMAKERS_EFFECTIVE else 0
+    n_extra = len(sports) if _EXTRA_ODDS_API_BMS else 0
     cloudbet_events: list[dict] = results[n + 2 + n_extra]  # C4: native Cloudbet
 
-    # Q4: Merge Odds-API extra books
-    if EXTRA_BOOKMAKERS_EFFECTIVE:
+    # Q4: Merge Odds-API extra books (stake only — cloudbet via native)
+    if _EXTRA_ODDS_API_BMS:
         extra_by_sport = {sports[i]: results[n + 2 + i] for i in range(len(sports))}
         _merge_extra_events(odds_by_sport, extra_by_sport)
 
@@ -2893,6 +2896,22 @@ async def refetch_valuebet_odds(vb: "ValueBetSignal") -> tuple[float, bool]:
         bookmakers_norm = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
         use_extra = bm_key_norm not in bookmakers_norm
 
+        # C8: Cloudbet native API path — bypass Odds API entirely
+        if bm_key_norm == "cloudbet" and USE_CLOUDBET:
+            cache_key = f"{vb.sport}__cloudbet_native"
+            cached_ts, cached_events = _refetch_cache.get(cache_key, (0, []))
+            if time.time() - cached_ts < 15 and cached_events:
+                events = cached_events
+            else:
+                async with aiohttp.ClientSession() as session:
+                    events = await async_fetch_cloudbet(session, [vb.sport])
+                    log.debug(f"[VBGuard] refetch Cloudbet via native API for {vb.sport}")
+                _refetch_cache[cache_key] = (time.time(), events)
+            result = _search_events(events, bm_key_norm)
+            if result is not None:
+                return result, True
+            return vb.soft_odds, False
+
         cache_key = f"{vb.sport}{'__extra' if use_extra else ''}"
         cached_ts, cached_events = _refetch_cache.get(cache_key, (0, []))
         if time.time() - cached_ts < 15 and cached_events:
@@ -2972,8 +2991,35 @@ async def execute_both(opp: ArbOpportunity) -> str:
                 log.warning(f"[SlippageGuard] {label} CLOB failed: {_e}")
                 return leg.odds, False
         # 2) Sportsbook (standard or extra) — Odds API feed
-        _is_extra = norm_bm_key(leg.bookmaker) not in _bookmakers_norm_ex
+        _bm_norm_leg = norm_bm_key(leg.bookmaker)
+        _is_extra = _bm_norm_leg not in _bookmakers_norm_ex
         _bm_key   = leg.raw.get("bm_key", "") if leg.raw else ""
+        # C8: Cloudbet native API path for _refetch_leg
+        if _bm_norm_leg == "cloudbet" and USE_CLOUDBET:
+            _ck_cb = f"{sport}__cloudbet_native"
+            _cts_cb, _cev_cb = _refetch_cache.get(_ck_cb, (0, []))
+            try:
+                if time.time() - _cts_cb < 15 and _cev_cb:
+                    _events_cb = _cev_cb
+                else:
+                    async with aiohttp.ClientSession() as _sc:
+                        _events_cb = await async_fetch_cloudbet(_sc, [sport])
+                    _refetch_cache[_ck_cb] = (time.time(), _events_cb)
+            except Exception as _ece:
+                log.warning(f"[SlippageGuard] {label} Cloudbet native fetch failed: {_ece}")
+                return leg.odds, False
+            for _ev in _events_cb:
+                _en = f"{_ev.get('home_team','')} vs {_ev.get('away_team','')}"
+                if not fuzzy_match(_en, opp.event, 0.7): continue
+                for _bm2 in _ev.get("bookmakers", []):
+                    if norm_bm_key(_bm2.get("key","")) != "cloudbet": continue
+                    for _mkt in _bm2.get("markets", []):
+                        if _mkt.get("key") != "h2h": continue
+                        for _out in _mkt.get("outcomes", []):
+                            if fuzzy_match(_out.get("name",""), leg.outcome, 0.8):
+                                _p = Decimal(str(_out.get("price", leg.odds)))
+                                return apply_slippage(_p, "cloudbet"), True
+            return leg.odds, False
         _ck = f"{sport}{'__extra' if _is_extra else ''}"
         now_ts = time.time()
         _cts, _cev = _refetch_cache.get(_ck, (0, []))
@@ -4250,12 +4296,14 @@ async def watch_closing_lines():
                 async with aiohttp.ClientSession() as session:
                     for key, info in to_fetch:
                         sport  = info["sport"]
-                        # L6: fetch both standard + extra feeds for closing lines
+                        # L6: fetch standard + extra (Odds API stake) + Cloudbet native for closing lines
                         std_ev   = await _fetch_odds_sem(session, sport)
-                        extra_ev = await _fetch_extra_books_sem(session, sport) if EXTRA_BOOKMAKERS_EFFECTIVE else []
-                        # R2: fuzzy merge extra events (same logic as fetch_all_async)
+                        extra_ev = await _fetch_extra_books_sem(session, sport) if _EXTRA_ODDS_API_BMS else []
+                        # C9: fetch Cloudbet native for CLV
+                        cb_ev    = await async_fetch_cloudbet(session, [sport]) if USE_CLOUDBET else []
+                        # R2: fuzzy merge extra + cloudbet events
                         events = list(std_ev)
-                        for _ex_ev in extra_ev:
+                        for _ex_ev in (extra_ev + cb_ev):
                             _ex_name = f"{_ex_ev.get('home_team','')} vs {_ex_ev.get('away_team','')}"
                             _merged = False
                             for _st_ev in events:
