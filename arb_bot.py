@@ -2950,8 +2950,6 @@ async def execute_both(opp: ArbOpportunity) -> str:
     # P1: unified per-leg refetch helper — routes ตาม source (polymarket/kalshi/extra/std)
     # fail-closed: คืน (price, found=False) ถ้าหาไม่เจอ — caller ต้อง abort
     _bookmakers_norm_ex = [norm_bm_key(b) for b in BOOKMAKERS.split(",") if b.strip()]
-    # C2 fix: use EXTRA_BOOKMAKERS_EFFECTIVE so cloudbet/stake are always included
-    _extra_norm_ex      = [norm_bm_key(b) for b in EXTRA_BOOKMAKERS_EFFECTIVE.split(",") if b.strip()]
     async def _refetch_leg(leg, sport: str, label: str) -> tuple[Decimal, bool]:
         _bm  = leg.bookmaker.lower()
         _tok = leg.raw.get("token_id", "") if leg.raw else ""
@@ -4474,21 +4472,33 @@ def parse_winner(event: dict, sport: str = "") -> Optional[str]:
             log.warning(f"[Settle] MMA scores schema unknown: {scores} — needs manual review")
             return "MANUAL_REVIEW"
 
-    # Tennis — scores เป็น sets (e.g. "6-4 7-5") ไม่ใช่ integer
+    # Tennis — scores อาจเป็น sets string ("6-4 7-5") หรือ integer ("2" = sets won)
     if "tennis" in sport_lower:
         try:
-            # นับ sets ที่ชนะ
             set_wins = {}
             for s in scores:
                 name = s.get("name","")
                 score_str = str(s.get("score","0"))
-                # รูปแบบ "6-4 7-5" → นับ sets
+                # S1: รูปแบบ "6-4 7-5" → นับ sets ที่ชนะ
                 sets_won = sum(1 for pair in score_str.split() if "-" in pair
                                and int(pair.split("-")[0]) > int(pair.split("-")[1]))
                 set_wins[name] = sets_won
-            if set_wins:
+            # S1: ถ้า sets_won=0 ทั้งคู่ แสดงว่า schema เป็น integer (e.g. score="2") → fallthrough
+            if set_wins and max(set_wins.values()) > 0:
                 winner = max(set_wins, key=set_wins.get)
-                log.info(f"[Settle] Tennis result: {winner} sets={set_wins}")
+                log.info(f"[Settle] Tennis result (sets): {winner} sets={set_wins}")
+                return winner
+            # S1: integer schema — ใช้ค่าตัวเลขโดยตรง
+            int_wins = {}
+            for s in scores:
+                name = s.get("name","")
+                try:
+                    int_wins[name] = float(s.get("score", 0))
+                except (ValueError, TypeError):
+                    int_wins[name] = 0.0
+            if int_wins and max(int_wins.values()) > 0:
+                winner = max(int_wins, key=int_wins.get)
+                log.info(f"[Settle] Tennis result (int): {winner} scores={int_wins}")
                 return winner
         except Exception:
             log.warning(f"[Settle] Tennis scores schema unknown: {scores} — needs manual review")
