@@ -1202,18 +1202,25 @@ def update_clv(event: str, outcome: str, bookmaker: str, final_odds: Decimal):
         closing_odds[key][norm_bm_key(bookmaker)] = final_odds
 
 
-def calc_clv(trade: TradeRecord) -> tuple[Optional[float], Optional[float], Optional[float]]:
+def calc_clv(trade: TradeRecord,
+             closing_snap: Optional[dict] = None
+             ) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
     CLV = (odds_got / closing_odds - 1) × 100%
     L2: ใช้ Pinnacle closing line เป็น benchmark กลาง — ไม่ใช้ per-book lookup
     ทำให้ CLV comparable ข้าม book (รวม alt markets ที่ไม่มี closing data ผ่าน Odds API)
+    I6: closing_snap — pass pre-snapshotted closing_odds to avoid per-call lock
     Returns: (clv_leg1, clv_leg2, clv_leg3)  — clv_leg3 = None for 2-way trades
     """
     def _clv(event, outcome, odds_got):
         key = f"{event}|{outcome}"
-        # S3: snapshot under lock to avoid race with update_clv (dashboard thread vs asyncio)
-        with _data_lock:
-            bm_data = dict(closing_odds.get(key, {}))
+        if closing_snap is not None:
+            # I6: use pre-snapshotted dict — no lock needed
+            bm_data = closing_snap.get(key, {})
+        else:
+            # S3: snapshot under lock to avoid race with update_clv (dashboard thread vs asyncio)
+            with _data_lock:
+                bm_data = dict(closing_odds.get(key, {}))
         # M4: strict Pinnacle benchmark — ถ้าไม่มี Pinnacle closing line → None
         co = bm_data.get("pinnacle")
         if co and co > 0:
@@ -4842,6 +4849,7 @@ def calc_stats_cached() -> dict:
 def calc_stats() -> dict:
     """คำนวณสถิติทั้งหมดสำหรับ /api/stats"""
     # v10-12: snapshot ด้วย lock ก่อนประมวลผล
+    # I6/C6: snapshot closing_odds here once — avoids per-call re-lock inside calc_clv
     with _data_lock:
         confirmed    = [t for t in trade_records if t.status == "confirmed"]
         rejected     = [t for t in trade_records if t.status == "rejected"]
@@ -4849,6 +4857,7 @@ def calc_stats() -> dict:
         steam_moves  = [m for m in line_movements if m.is_steam]
         lm_snap      = list(line_movements)
         tr_snap      = list(trade_records[-30:])
+        closing_snap = {k: dict(v) for k, v in closing_odds.items()}  # I6: shallow copy under lock
 
     # ── Win Rate ──────────────────────────────────────────────────
 
@@ -4937,7 +4946,7 @@ def calc_stats() -> dict:
     # ── CLV Summary ───────────────────────────────────────────────
     clv_values = []
     for t in confirmed:
-        c1, c2, c3 = calc_clv(t)
+        c1, c2, c3 = calc_clv(t, closing_snap)
         if c1 is not None: clv_values.append(c1)
         if c2 is not None: clv_values.append(c2)
         if c3 is not None: clv_values.append(c3)
@@ -4955,7 +4964,7 @@ def calc_stats() -> dict:
     # ── Trade records สำหรับ table ────────────────────────────────
     trade_list = []
     for t in tr_snap:  # C6: ใช้ tr_snap (snapshot ใน lock) ไม่ใช่ trade_records โดยตรง
-        c1, c2, c3 = calc_clv(t)
+        c1, c2, c3 = calc_clv(t, closing_snap)  # I6: pass snapshot — no per-call lock
         trade_list.append({
             "signal_id": t.signal_id, "event": t.event, "sport": t.sport,
             "leg1_bm": t.leg1_bm, "leg2_bm": t.leg2_bm,
