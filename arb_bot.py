@@ -121,7 +121,7 @@ _SPORTS_DEFAULT = (
     "mma_mixed_martial_arts"
 )
 SPORTS     = [s.strip() for s in _s("SPORTS",_SPORTS_DEFAULT).split(",") if s.strip()]
-BOOKMAKERS      = _s("BOOKMAKERS","pinnacle,onexbet,dafabet")
+BOOKMAKERS      = _s("BOOKMAKERS","pinnacle,onexbet")
 SIGNAL_TTL_SEC  = _i("SIGNAL_TTL_SEC", 900)   # F7: constant — อ่านครั้งเดียวตอน startup
 
 SPORT_EMOJI = {
@@ -425,8 +425,6 @@ def norm_bm_key(name: str) -> str:
     s = (name or "").lower().strip()
     if s in ("1xbet", "onexbet", "1x bet"):
         return "onexbet"
-    if s in ("dafabet",):
-        return "dafabet"
     if s in ("stake", "stake.com"):
         return "stake"
     if s in ("cloudbet",):
@@ -1127,7 +1125,7 @@ async def send_line_move_alerts(movements: list[tuple[LineMovement, dict]]):
 
             # Dynamic Kelly Payout Calculator
             # R2/B9: เฉพาะ soft books เท่านั้น — Pinnacle ไม่แสดง Kelly section แต่ยัง send alert
-            _soft_books = {"onexbet", "1xbet", "dafabet", "stake", "cloudbet", "betway", "unibet", "bwin"}
+            _soft_books = {"onexbet", "1xbet", "stake", "cloudbet", "betway", "unibet", "bwin"}
             _bm_key_norm = norm_bm_key(ctx.get("bm_key", lm.bookmaker))
             sharp_ctx = ctx.get("sharp_odds", 0.0)
             true_odds = sharp_ctx if sharp_ctx > 1.0 else float(lm.odds_before)
@@ -1360,30 +1358,30 @@ def sport_to_path(sport_key: str) -> dict:
     """
     s = sport_key.lower()
     if "basketball" in s:
-        return {"pinnacle": "basketball", "1xbet": "basketball", "dafabet": "sports/basketball",
+        return {"pinnacle": "basketball", "1xbet": "basketball",
                 "stake": "basketball", "cloudbet": "basketball"}
     if "soccer" in s:
-        return {"pinnacle": "soccer", "1xbet": "football", "dafabet": "sports/football",
+        return {"pinnacle": "soccer", "1xbet": "football",
                 "stake": "soccer", "cloudbet": "soccer"}
     if "americanfootball" in s:
-        return {"pinnacle": "american-football", "1xbet": "american-football", "dafabet": "sports/american-football",
+        return {"pinnacle": "american-football", "1xbet": "american-football",
                 "stake": "american-football", "cloudbet": "american-football"}
     if "baseball" in s:
-        return {"pinnacle": "baseball", "1xbet": "baseball", "dafabet": "sports/baseball",
+        return {"pinnacle": "baseball", "1xbet": "baseball",
                 "stake": "baseball", "cloudbet": "baseball"}
     if "icehockey" in s:
-        return {"pinnacle": "ice-hockey", "1xbet": "ice-hockey", "dafabet": "sports/ice-hockey",
+        return {"pinnacle": "ice-hockey", "1xbet": "ice-hockey",
                 "stake": "ice-hockey", "cloudbet": "ice-hockey"}
     if "cricket" in s:
-        return {"pinnacle": "cricket", "1xbet": "cricket", "dafabet": "sports/cricket",
+        return {"pinnacle": "cricket", "1xbet": "cricket",
                 "stake": "cricket", "cloudbet": "cricket"}
     if "tennis" in s:
-        return {"pinnacle": "tennis", "1xbet": "tennis", "dafabet": "sports/tennis",
+        return {"pinnacle": "tennis", "1xbet": "tennis",
                 "stake": "tennis", "cloudbet": "tennis"}
     if "mma" in s or "martial" in s:
-        return {"pinnacle": "mixed-martial-arts", "1xbet": "mixed-martial-arts", "dafabet": "sports/mma",
+        return {"pinnacle": "mixed-martial-arts", "1xbet": "mixed-martial-arts",
                 "stake": "mma", "cloudbet": "mma"}
-    return {"pinnacle": "sports", "1xbet": "sports", "dafabet": "sports",
+    return {"pinnacle": "sports", "1xbet": "sports",
             "stake": "sports", "cloudbet": "sports"}
 
 
@@ -1405,11 +1403,10 @@ def build_betting_links(event_name: str, outcome: str, sport: str,
 
     links.append(f"  🔵 [Pinnacle](https://www.pinnacle.com/en/{sp['pinnacle']}){_odds_tag('pinnacle')}")
     links.append(f"  🟠 [1xBet](https://1xbet.com/en/line/{sp['1xbet']}){_odds_tag('onexbet')}")
-    links.append(f"  🟢 [Dafabet](https://www.dafabet.com/en/{sp['dafabet']}){_odds_tag('dafabet')}")
 
     # เว็บอื่นที่มีใน all_odds แต่ไม่ได้ hardcode ไว้
     if all_odds:
-        known = {"pinnacle", "onexbet", "1xbet", "dafabet", "polymarket", "kalshi"}
+        known = {"pinnacle", "onexbet", "1xbet", "polymarket", "kalshi"}
         for bm, o in sorted(all_odds.items()):
             if bm not in known:
                 links.append(f"  📌 {bm.title()} — `{float(o):.3f}`")
@@ -1437,7 +1434,7 @@ def build_betting_links(event_name: str, outcome: str, sport: str,
 async def async_fetch_odds(session: aiohttp.ClientSession, sport_key: str) -> list[dict]:
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
-        "apiKey": ODDS_API_KEY, "regions": "eu,uk,au",
+        "apiKey": ODDS_API_KEY, "regions": "eu,uk,au,us",
         "markets": "h2h", "oddsFormat": "decimal",
         "bookmakers": BOOKMAKERS,
     }
@@ -1859,7 +1856,7 @@ async def async_fetch_cloudbet(session: aiohttp.ClientSession, sports: list[str]
     if not cb_sport_to_keys:
         return []
 
-    _cb_headers = {"X-API-Key": CLOUDBET_API_KEY, "Accept": "application/json"}
+    _cb_headers = {"Authorization": f"Bearer {CLOUDBET_API_KEY}", "Accept": "application/json"}
     all_events: list[dict] = []
     for cb_sport, sport_keys in cb_sport_to_keys.items():
         try:
@@ -3218,9 +3215,6 @@ async def execute_both(opp: ArbOpportunity) -> str:
             path = sp["1xbet"]
             link = f"https://1xbet.com/en/line/{path}/{eid}" if eid else f"https://1xbet.com/en/line/{path}"
             return f"  🔗 [เปิด 1xBet]({link})\n  2. เลือก *{leg.outcome}* @ {show_odds}\n  3. วาง ฿{int(stake)}{cap_note}"
-        elif "dafabet" in bk:
-            path = sp["dafabet"]
-            return f"  🔗 [เปิด Dafabet](https://www.dafabet.com/en/{path})\n  2. ค้นหา *{leg.outcome}*\n  3. วาง ฿{int(stake)}{cap_note}"
         return f"  1. เปิด {leg.bookmaker}\n  2. เลือก *{leg.outcome}* @ {show_odds}\n  3. วาง ฿{int(stake)}{cap_note}"
 
     if is_3way:
@@ -3382,8 +3376,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 link = f"https://www.pinnacle.com/en/{sp['pinnacle']}"
             elif "1xbet" in bm_lower or "onexbet" in bm_lower:
                 link = f"https://1xbet.com/en/line/{sp['1xbet']}"
-            elif "dafabet" in bm_lower:
-                link = f"https://www.dafabet.com/en/{sp['dafabet']}"
             # J4: stake.com / cloudbet — เพิ่ม mapping แทน fallback Pinnacle
             elif "stake" in bm_lower:
                 link = f"https://stake.com/sports/{sp.get('stake', sp.get('pinnacle', 'soccer'))}"
