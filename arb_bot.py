@@ -2537,7 +2537,7 @@ def scan_all(odds_by_sport: dict, poly_markets: list) -> list[ArbOpportunity]:
                 # ══ Soccer 3-way branch: ตรวจเฉพาะ Home/Draw/Away ครบครัน ══
                 # เพิ่ม 2-way arb สำหรับ soccer ด้วย — ถ้า Draw ไม่ครบ
                 home_key = next((k for k in best if k.lower() not in ("draw",) and fuzzy_match(k, home, 0.6)), None)
-                away_key = next((k for k in best if k.lower() not in ("draw", home_key) and fuzzy_match(k, away, 0.6)), None)
+                away_key = next((k for k in best if k.lower() not in ("draw", home_key.lower() if home_key else "") and fuzzy_match(k, away, 0.6)), None)
                 draw_key = "Draw" if "Draw" in best else None
 
                 if home_key and away_key and draw_key:
